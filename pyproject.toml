@@ -120,6 +120,7 @@ ignore = [
     "D213",    # Conflicts with D212 (multi-line summary first line)
     "E501",    # Line length handled by the formatter
     "ISC001",  # Disabled to avoid conflict with the formatter
+    "PLR0911", # Too many return statements (decision-heavy ML code)
     "PLR0913", # Too many arguments (common in ML configs)
     "PLR0912", # Too many branches
     "PLR0915", # Too many statements
@@ -127,6 +128,14 @@ ignore = [
     "S101",    # Use of assert (fine in research/tests)
     "FBT001",  # Boolean positional arg (common in torch/HF APIs)
     "FBT002",  # Boolean default positional arg
+    # ML / research-code idioms
+    "G004",    # Logging f-strings: idiomatic and readable; lazy %-formatting is a micro-optimisation here
+    "G003",    # Logging string concatenation: same rationale as G004
+    "N803",    # Argument names follow linear-algebra conventions (X, W, Q, ...)
+    "N806",    # Local variable names follow linear-algebra conventions (W, U, S, V, D, Q, ...)
+    "N812",    # Conventional aliases (e.g. `import torch.nn.functional as F`)
+    "RUF002",  # Ambiguous Unicode in docstrings: intentional typography (em-dash, non-breaking hyphen)
+    "PLC0415", # Imports inside functions: used deliberately for heavy/optional ML deps
 ]
 unfixable = [
     "ERA001",  # Don't auto-delete commented-out code; surface it for review
@@ -140,6 +149,9 @@ unfixable = [
     "S607",    # start-process with partial path: fine for tooling
 ]
 "src/cli*.py" = ["T201"]
+"src/gguf_export.py" = [
+    "S603",    # subprocess invokes vetted llama.cpp binaries with constructed args
+]
 "utils/test_*.py" = ["S", "D", "PLR", "ARG"]
 "**/__init__.py" = ["F401", "D"]
 

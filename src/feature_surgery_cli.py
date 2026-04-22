@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Norm-Preserving Feature Surgery CLI
+"""Norm-Preserving Feature Surgery CLI.
 
 Command-line interface for applying feature-level surgery to transformer models
 using SAE decoder vectors.
@@ -63,12 +62,14 @@ Examples:
 
     # Model paths
     parser.add_argument(
-        "--model", "-m",
+        "--model",
+        "-m",
         required=True,
         help="Model path or HuggingFace ID",
     )
     parser.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         required=True,
         help="Output directory for modified model",
     )
@@ -184,7 +185,8 @@ Examples:
         help="Model dtype (default: float16)",
     )
     options_group.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose logging",
     )
@@ -221,9 +223,9 @@ def main():
 
     # Import here to avoid slow startup
     from src.feature_surgery import (
-        FeatureSurgeryPipeline,
-        FeatureSurgeryConfig,
         FeatureSpec,
+        FeatureSurgeryConfig,
+        FeatureSurgeryPipeline,
     )
 
     # Determine which input mode
@@ -235,10 +237,7 @@ def main():
     input_count = sum([has_differential, has_features_json, has_config, has_single])
 
     if input_count == 0:
-        logger.error(
-            "Must specify one of: --differential, --features-json, --config, "
-            "or --layer/--feature-id"
-        )
+        logger.error("Must specify one of: --differential, --features-json, --config, or --layer/--feature-id")
         sys.exit(1)
     elif input_count > 1:
         logger.error("Only one input mode allowed")
@@ -268,7 +267,7 @@ def main():
 
     elif has_features_json:
         logger.info(f"Loading features from: {args.features_json}")
-        with open(args.features_json, "r", encoding="utf-8") as f:
+        with Path(args.features_json).open(encoding="utf-8") as f:
             features = json.load(f)
 
         pipeline = FeatureSurgeryPipeline.from_feature_list(
@@ -286,11 +285,13 @@ def main():
     else:  # has_single
         logger.info(f"Single feature: layer={args.layer}, feature_id={args.feature_id}")
         config = FeatureSurgeryConfig(
-            features=[FeatureSpec(
-                layer=args.layer,
-                feature_id=args.feature_id,
-                modulation=args.modulation,
-            )],
+            features=[
+                FeatureSpec(
+                    layer=args.layer,
+                    feature_id=args.feature_id,
+                    modulation=args.modulation,
+                )
+            ],
             sae_repo=args.sae_repo,
             sae_type=args.sae_type,
             sae_width=args.sae_width,
@@ -309,7 +310,7 @@ def main():
     # Run surgery (validation is now done automatically inside run() unless skipped)
     logger.info(f"Running feature surgery ({'dry run' if args.dry_run else 'applying changes'})...")
     try:
-        stats = pipeline.run(
+        pipeline.run(
             output_path=args.output if not args.dry_run else None,
             dry_run=args.dry_run,
             skip_validation=args.skip_validation,
@@ -330,19 +331,11 @@ def main():
         raise
 
     # Print summary
-    print("\n" + "=" * 60)
-    print("FEATURE SURGERY SUMMARY")
-    print("=" * 60)
-    print(f"Features processed: {stats.get('features_processed', 0)}")
-    print(f"Weight matrices modified: {stats.get('weights_modified', 0)}")
-    print(f"Total neurons modified: {stats.get('neurons_modified', 0)}")
 
     if args.dry_run:
-        print("\n[DRY RUN - No changes were made]")
+        pass
     else:
-        print(f"\nModel saved to: {args.output}")
-
-    print("=" * 60)
+        pass
 
 
 if __name__ == "__main__":

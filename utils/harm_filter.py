@@ -16,12 +16,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 import numpy as np
-
 
 _KEYWORD_PATTERNS: list[str] = [
     r"child(?:ren)?",
@@ -106,7 +105,7 @@ class HarmFilter:
         self.semantic_threshold = semantic_threshold
         self.embedder_name = embedder_name
         self._embedder = None
-        self._anchor_emb: Optional[np.ndarray] = None
+        self._anchor_emb: np.ndarray | None = None
         self.drops: list[FilterDrop] = []
         self.semantic_scores: list[float] = []
 
@@ -116,12 +115,10 @@ class HarmFilter:
         from sentence_transformers import SentenceTransformer
 
         self._embedder = SentenceTransformer(self.embedder_name)
-        anchors = self._embedder.encode(
-            _SEMANTIC_ANCHORS, normalize_embeddings=True, convert_to_numpy=True
-        )
+        anchors = self._embedder.encode(_SEMANTIC_ANCHORS, normalize_embeddings=True, convert_to_numpy=True)
         self._anchor_emb = anchors  # (n_anchors, dim)
 
-    def _keyword_hit(self, text: str) -> Optional[str]:
+    def _keyword_hit(self, text: str) -> str | None:
         m = _KEYWORD_RE.search(text)
         return m.group(0) if m else None
 
@@ -157,7 +154,10 @@ class HarmFilter:
         self._load_embedder()
         prompts = [r["Prompt"] for _, r in needs_semantic]
         emb = self._embedder.encode(
-            prompts, normalize_embeddings=True, convert_to_numpy=True, batch_size=64,
+            prompts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            batch_size=64,
             show_progress_bar=True,
         )
         sims = emb @ self._anchor_emb.T  # (n, n_anchors)
@@ -166,7 +166,7 @@ class HarmFilter:
         self.semantic_scores.extend(max_sims.tolist())
 
         keep_mask = [True] * len(kept)
-        for (kept_idx, row), top_sim, anchor_idx in zip(needs_semantic, max_sims, max_idx):
+        for (kept_idx, row), top_sim, anchor_idx in zip(needs_semantic, max_sims, max_idx, strict=False):
             if top_sim >= self.semantic_threshold:
                 keep_mask[kept_idx] = False
                 self.drops.append(
@@ -179,7 +179,7 @@ class HarmFilter:
                     )
                 )
 
-        return [r for r, keep in zip(kept, keep_mask) if keep]
+        return [r for r, keep in zip(kept, keep_mask, strict=False) if keep]
 
     def write_audit_log(self, drops_path: Path, histogram_path: Path) -> None:
         """Write per-drop JSONL and a semantic-score histogram for calibration."""
@@ -212,10 +212,8 @@ class HarmFilter:
                 "min": float(scores.min()),
                 "bins": [
                     {"lo": float(lo), "hi": float(hi), "count": int(c)}
-                    for lo, hi, c in zip(bin_edges[:-1], bin_edges[1:], counts)
+                    for lo, hi, c in zip(bin_edges[:-1], bin_edges[1:], counts, strict=False)
                 ],
             }
             histogram_path.parent.mkdir(parents=True, exist_ok=True)
-            histogram_path.write_text(
-                json.dumps(histogram, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
+            histogram_path.write_text(json.dumps(histogram, indent=2, ensure_ascii=False), encoding="utf-8")

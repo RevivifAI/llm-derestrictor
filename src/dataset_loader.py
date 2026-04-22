@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Iterable
 from functools import lru_cache
-from typing import Iterable, Optional
 
 from dotenv import load_dotenv
 
@@ -24,14 +24,12 @@ VALID_SPLITS: tuple[str, ...] = ("harmful", "harmless", "preservation")
 
 def _validate_split(split: str) -> str:
     if split not in VALID_SPLITS:
-        raise ValueError(
-            f"Unknown split {split!r}; expected one of {VALID_SPLITS}."
-        )
+        raise ValueError(f"Unknown split {split!r}; expected one of {VALID_SPLITS}.")
     return split
 
 
 @lru_cache(maxsize=8)
-def _load_dataset_cached(split: str, revision: Optional[str]):
+def _load_dataset_cached(split: str, revision: str | None):
     from datasets import load_dataset
 
     token = os.environ.get("HF_TOKEN")
@@ -40,9 +38,9 @@ def _load_dataset_cached(split: str, revision: Optional[str]):
 
 def load_split(
     split: str,
-    n: Optional[int] = None,
+    n: int | None = None,
     seed: int = 0,
-    revision: Optional[str] = None,
+    revision: str | None = None,
 ) -> list[str]:
     """Return the ``Prompt`` column of a split as a list of strings.
 
@@ -56,7 +54,7 @@ def load_split(
     ds = _load_dataset_cached(split, revision)
     prompts = list(ds["Prompt"])
     if n is not None and n < len(prompts):
-        rng = random.Random(seed)
+        rng = random.Random(seed)  # noqa: S311 - non-cryptographic sampling seeded for reproducibility
         prompts = rng.sample(prompts, n)
     return prompts
 
@@ -77,6 +75,7 @@ def refresh_cache(splits: Iterable[str] = VALID_SPLITS) -> None:
         )
 
 
-def split_size(split: str, revision: Optional[str] = None) -> int:
+def split_size(split: str, revision: str | None = None) -> int:
+    """Return the total number of rows available in a dataset split."""
     _validate_split(split)
     return len(_load_dataset_cached(split, revision))

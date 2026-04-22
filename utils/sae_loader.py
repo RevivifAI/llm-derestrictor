@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""
-SAE Loader Utility
+"""SAE Loader Utility.
 
 Handles loading of GemmaScope Sparse Autoencoders from HuggingFace Hub
 with caching and dimension validation.
 """
 
 import logging
-import os
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
+from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
-import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +27,12 @@ class SAEConfig:
     l0: str = "small"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float32
-    cache_dir: Optional[str] = None
+    cache_dir: str | None = None
     local_files_only: bool = True  # Use cached files only, don't download
 
 
 class JumpReLUSAE(nn.Module):
-    """
-    JumpReLU Sparse Autoencoder.
+    """JumpReLU Sparse Autoencoder.
 
     Adapted from Google DeepMind's Gemma Scope implementation.
     Uses a threshold-based activation with ReLU.
@@ -62,8 +58,7 @@ class JumpReLUSAE(nn.Module):
         """Encode input activations to sparse latent space."""
         pre_acts = input_acts @ self.w_enc + self.b_enc
         mask = pre_acts > self.threshold
-        acts = mask * torch.nn.functional.relu(pre_acts)
-        return acts
+        return mask * torch.nn.functional.relu(pre_acts)
 
     def encode_pre_relu(self, input_acts: torch.Tensor) -> torch.Tensor:
         """Get pre-activation values before thresholding and ReLU."""
@@ -93,8 +88,7 @@ class JumpReLUSAE(nn.Module):
 
 
 class SAELoader:
-    """
-    Load GemmaScope SAEs from HuggingFace Hub with caching.
+    """Load GemmaScope SAEs from HuggingFace Hub with caching.
 
     Supports lazy loading of individual layers and maintains a cache
     to avoid reloading the same SAE multiple times.
@@ -103,7 +97,7 @@ class SAELoader:
     # Known SAE repositories and their layer configurations
     # GemmaScope 2 SAEs are trained on Gemma 3 models (not Gemma 2!)
     # Note: d_model is inferred from loaded weights, these are just for reference
-    KNOWN_REPOS = {
+    KNOWN_REPOS: ClassVar[dict[str, dict]] = {
         # GemmaScope 1 (Gemma 2 models)
         "google/gemma-scope-2b-it": {
             "layers": list(range(26)),
@@ -133,7 +127,7 @@ class SAELoader:
     }
 
     # Width string to dimension mapping
-    WIDTH_MAP = {
+    WIDTH_MAP: ClassVar[dict[str, int]] = {
         "16k": 16384,
         "32k": 32768,
         "65k": 65536,
@@ -142,16 +136,15 @@ class SAELoader:
     }
 
     def __init__(self, config: SAEConfig):
-        """
-        Initialize the SAE loader.
+        """Initialize the SAE loader.
 
         Args:
             config: SAE configuration
         """
         self.config = config
         self._cache: dict[int, JumpReLUSAE] = {}
-        self._available_layers: Optional[list[int]] = None
-        self._d_model: Optional[int] = None  # Inferred from loaded weights
+        self._available_layers: list[int] | None = None
+        self._d_model: int | None = None  # Inferred from loaded weights
 
         # Get repo info if known
         if config.repo_id in self.KNOWN_REPOS:
@@ -168,7 +161,7 @@ class SAELoader:
         return self._available_layers
 
     @property
-    def d_model(self) -> Optional[int]:
+    def d_model(self) -> int | None:
         """Expected model hidden dimension."""
         return self._d_model
 
@@ -178,8 +171,7 @@ class SAELoader:
         return self.WIDTH_MAP.get(self.config.width, 16384)
 
     def _get_sae_path(self, layer: int) -> str:
-        """
-        Construct the path to SAE weights within the repo.
+        """Construct the path to SAE weights within the repo.
 
         GemmaScope path pattern:
         {sae_type}/layer_{layer}_width_{width}_l0_{l0}/params.safetensors
@@ -190,12 +182,10 @@ class SAELoader:
 
         # Handle different path formats
         # Standard format: resid_post_all/layer_0_width_16k_l0_small/params.safetensors
-        path = f"{sae_type}/layer_{layer}_width_{width}_l0_{l0}/params.safetensors"
-        return path
+        return f"{sae_type}/layer_{layer}_width_{width}_l0_{l0}/params.safetensors"
 
     def load_sae(self, layer: int) -> JumpReLUSAE:
-        """
-        Load SAE for a specific layer.
+        """Load SAE for a specific layer.
 
         Uses caching to avoid reloading the same SAE.
 
@@ -228,8 +218,7 @@ class SAELoader:
                     f"Original error: {e}"
                 ) from e
             raise RuntimeError(
-                f"Failed to download SAE for layer {layer}: {e}\n"
-                f"Repo: {self.config.repo_id}, Path: {sae_path}"
+                f"Failed to download SAE for layer {layer}: {e}\nRepo: {self.config.repo_id}, Path: {sae_path}"
             ) from e
 
         # Load weights
@@ -240,14 +229,13 @@ class SAELoader:
             d_in, d_sae = state_dict["w_enc"].shape
         elif "W_enc" in state_dict:
             d_in, d_sae = state_dict["W_enc"].shape
+        # Try to infer from decoder
+        elif "w_dec" in state_dict:
+            d_sae, d_in = state_dict["w_dec"].shape
+        elif "W_dec" in state_dict:
+            d_sae, d_in = state_dict["W_dec"].shape
         else:
-            # Try to infer from decoder
-            if "w_dec" in state_dict:
-                d_sae, d_in = state_dict["w_dec"].shape
-            elif "W_dec" in state_dict:
-                d_sae, d_in = state_dict["W_dec"].shape
-            else:
-                raise ValueError(f"Cannot infer SAE dimensions from state dict keys: {state_dict.keys()}")
+            raise ValueError(f"Cannot infer SAE dimensions from state dict keys: {state_dict.keys()}")
 
         # Store d_model for validation
         if self._d_model is None:
@@ -268,8 +256,7 @@ class SAELoader:
         return sae
 
     def get_decoder_vector(self, layer: int, feature_id: int) -> torch.Tensor:
-        """
-        Get decoder vector for a specific feature.
+        """Get decoder vector for a specific feature.
 
         Args:
             layer: SAE layer index
@@ -281,19 +268,12 @@ class SAELoader:
         sae = self.load_sae(layer)
 
         if feature_id < 0 or feature_id >= sae.num_features:
-            raise ValueError(
-                f"Feature ID {feature_id} out of range [0, {sae.num_features})"
-            )
+            raise ValueError(f"Feature ID {feature_id} out of range [0, {sae.num_features})")
 
         return sae.get_decoder_vector(feature_id)
 
-    def validate_model_compatibility(
-        self,
-        model_hidden_dim: int,
-        strict: bool = True
-    ) -> bool:
-        """
-        Check if SAE dimensions match the target model.
+    def validate_model_compatibility(self, model_hidden_dim: int, strict: bool = True) -> bool:
+        """Check if SAE dimensions match the target model.
 
         Args:
             model_hidden_dim: Target model's hidden dimension
@@ -312,15 +292,11 @@ class SAELoader:
                 return True
 
         if self._d_model != model_hidden_dim:
-            msg = (
-                f"SAE dimension mismatch: SAE d_model={self._d_model}, "
-                f"target model hidden_dim={model_hidden_dim}"
-            )
+            msg = f"SAE dimension mismatch: SAE d_model={self._d_model}, target model hidden_dim={model_hidden_dim}"
             if strict:
                 raise ValueError(msg)
-            else:
-                logger.warning(msg)
-                return False
+            logger.warning(msg)
+            return False
 
         return True
 
@@ -331,8 +307,7 @@ class SAELoader:
             torch.cuda.empty_cache()
 
     def preload_layers(self, layers: list[int]):
-        """
-        Preload SAEs for specified layers.
+        """Preload SAEs for specified layers.
 
         Args:
             layers: List of layer indices to preload
@@ -347,11 +322,10 @@ def get_sae_loader(
     width: str = "16k",
     l0: str = "small",
     sae_type: str = "resid_post_all",
-    device: str = None,
+    device: str | None = None,
     local_files_only: bool = True,
 ) -> SAELoader:
-    """
-    Convenience function to create an SAE loader.
+    """Convenience function to create an SAE loader.
 
     Args:
         repo_id: HuggingFace repo ID

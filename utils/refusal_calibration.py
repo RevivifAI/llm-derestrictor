@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Refusal threshold calibration script.
+"""Refusal threshold calibration script.
 
 Takes a prompt file containing prompts that SHOULD be refused by a base model,
 generates responses, computes log-likelihood scores for refusal anchors, and
@@ -22,10 +21,9 @@ The output includes:
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -47,8 +45,8 @@ class CalibrationConfig:
     dtype: str = "auto"
     device: str = "cuda"
     extract_residuals: bool = False
-    residual_layers: Optional[list[int]] = None  # None = all layers
-    limit: Optional[int] = None
+    residual_layers: list[int] | None = None  # None = all layers
+    limit: int | None = None
     refusal_anchors: tuple[str, ...] = (
         "I cannot",
         "I can't",
@@ -70,7 +68,7 @@ class PromptResult:
     anchor_scores: dict[str, float]  # anchor -> log prob
     max_score: float
     best_anchor: str
-    residual_norms: Optional[list[float]] = None  # Per-layer L2 norms if extracted
+    residual_norms: list[float] | None = None  # Per-layer L2 norms if extracted
 
 
 @dataclass
@@ -88,7 +86,7 @@ class CalibrationResult:
 class ResidualExtractor:
     """Extract hidden state residuals during forward pass."""
 
-    def __init__(self, model, layer_indices: Optional[list[int]] = None):
+    def __init__(self, model, layer_indices: list[int] | None = None):
         self.model = model
         self.layer_indices = layer_indices
         self.residuals = {}
@@ -99,14 +97,20 @@ class ResidualExtractor:
         # Try common layer access patterns
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             return self.model.model.layers
-        if hasattr(self.model, "model") and hasattr(self.model.model, "model"):
-            # VL models: model.model.model.layers
-            if hasattr(self.model.model.model, "layers"):
-                return self.model.model.model.layers
-        # Mistral3 VL: model.model.language_model.layers
-        if hasattr(self.model, "model") and hasattr(self.model.model, "language_model"):
-            if hasattr(self.model.model.language_model, "layers"):
-                return self.model.model.language_model.layers
+        # VL models: layers live under model.model.model.layers.
+        if (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "model")
+            and hasattr(self.model.model.model, "layers")
+        ):
+            return self.model.model.model.layers
+        # Mistral3 VL: layers live under model.model.language_model.layers.
+        if (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "language_model")
+            and hasattr(self.model.model.language_model, "layers")
+        ):
+            return self.model.model.language_model.layers
         if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
             return self.model.transformer.h  # GPT-2 style
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
@@ -127,14 +131,12 @@ class ResidualExtractor:
             indices = [i if i >= 0 else num_layers + i for i in self.layer_indices]
 
         def make_hook(layer_idx):
-            def hook(module, input, output):
+            def hook(module, input, output):  # noqa: ARG001 - torch forward-hook signature
                 # Output is typically (hidden_states, ...) or just hidden_states
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                else:
-                    hidden = output
+                hidden = output[0] if isinstance(output, tuple) else output
                 # Store the last token's hidden state (generation context)
                 self.residuals[layer_idx] = hidden[:, -1, :].detach().cpu()
+
             return hook
 
         for idx in indices:
@@ -176,10 +178,7 @@ class RefusalCalibrator:
         """Load model and tokenizer."""
         # Determine dtype
         if self.config.dtype == "auto":
-            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            else:
-                dtype = torch.float32
+            dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
         elif self.config.dtype == "bfloat16":
             dtype = torch.bfloat16
         elif self.config.dtype == "float16":
@@ -210,7 +209,7 @@ class RefusalCalibrator:
 
         prompts = load_split(self.config.split)
         if self.config.limit:
-            prompts = prompts[:self.config.limit]
+            prompts = prompts[: self.config.limit]
 
         print(f"Loaded {len(prompts)} prompts from RevivifAI/derestriction/{self.config.split}")
         return prompts
@@ -219,14 +218,10 @@ class RefusalCalibrator:
         """Format prompt with chat template."""
         if hasattr(self.tokenizer, "apply_chat_template"):
             messages = [{"role": "user", "content": prompt}]
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         return prompt
 
-    def compute_anchor_log_prob(
-        self, formatted_prompt: str, anchor: str
-    ) -> float:
+    def compute_anchor_log_prob(self, formatted_prompt: str, anchor: str) -> float:
         """Compute log probability of an anchor following the prompt."""
         # Tokenize anchor to know how many tokens to score
         anchor_tokens = self.tokenizer.encode(anchor, add_special_tokens=False)
@@ -238,9 +233,7 @@ class RefusalCalibrator:
         # Full sequence: prompt + anchor
         full_text = formatted_prompt + anchor
 
-        inputs = self.tokenizer(
-            full_text, return_tensors="pt", truncation=True
-        ).to(self.model.device)
+        inputs = self.tokenizer(full_text, return_tensors="pt", truncation=True).to(self.model.device)
 
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -248,21 +241,17 @@ class RefusalCalibrator:
 
         # Get log probs for anchor positions
         # Anchor tokens are at the end, score positions -(anchor_len+1):-1
-        end_logits = logits[:, -(anchor_len + 1):-1, :]
+        end_logits = logits[:, -(anchor_len + 1) : -1, :]
         log_probs = F.log_softmax(end_logits, dim=-1)
 
         # Get target token IDs
         target_ids = inputs.input_ids[:, -anchor_len:]
 
         # Gather log probs for target tokens
-        token_log_probs = log_probs.gather(
-            2, target_ids.unsqueeze(-1)
-        ).squeeze(-1)
+        token_log_probs = log_probs.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)
 
         # Average across tokens
-        avg_log_prob = token_log_probs.mean().item()
-
-        return avg_log_prob
+        return token_log_probs.mean().item()
 
     def generate_response(self, prompt: str) -> str:
         """Generate a response for the prompt."""
@@ -270,9 +259,7 @@ class RefusalCalibrator:
 
         formatted = self.format_prompt(prompt)
 
-        inputs = self.tokenizer(
-            formatted, return_tensors="pt", truncation=True
-        ).to(self.model.device)
+        inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True).to(self.model.device)
 
         # Use GenerationConfig to avoid warnings about mixing config and kwargs
         gen_config = GenerationConfig(
@@ -288,14 +275,12 @@ class RefusalCalibrator:
             )
 
         # Decode only the new tokens
-        new_tokens = outputs[0, inputs.input_ids.shape[1]:]
+        new_tokens = outputs[0, inputs.input_ids.shape[1] :]
         response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
         return response.strip()
 
-    def process_prompt(
-        self, prompt: str, extractor: Optional[ResidualExtractor] = None
-    ) -> PromptResult:
+    def process_prompt(self, prompt: str, extractor: ResidualExtractor | None = None) -> PromptResult:
         """Process a single prompt."""
         formatted = self.format_prompt(prompt)
 
@@ -316,9 +301,7 @@ class RefusalCalibrator:
         residual_norms = None
         if extractor and self.config.extract_residuals:
             # Do a forward pass to capture residuals
-            inputs = self.tokenizer(
-                formatted, return_tensors="pt", truncation=True
-            ).to(self.model.device)
+            inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True).to(self.model.device)
 
             with torch.no_grad():
                 _ = self.model(**inputs)
@@ -421,9 +404,7 @@ class RefusalCalibrator:
         # Setup residual extraction if requested
         extractor = None
         if self.config.extract_residuals:
-            extractor = ResidualExtractor(
-                self.model, self.config.residual_layers
-            )
+            extractor = ResidualExtractor(self.model, self.config.residual_layers)
             extractor.register_hooks()
             print(f"Residual extraction enabled for {len(extractor.hooks)} layers")
 
@@ -437,14 +418,16 @@ class RefusalCalibrator:
                 results.append(result)
             except Exception as e:
                 print(f"\nError processing prompt: {e}")
-                results.append(PromptResult(
-                    prompt=prompt,
-                    generated_response=f"ERROR: {e}",
-                    anchor_scores={},
-                    max_score=float("-inf"),
-                    best_anchor="",
-                    residual_norms=None,
-                ))
+                results.append(
+                    PromptResult(
+                        prompt=prompt,
+                        generated_response=f"ERROR: {e}",
+                        anchor_scores={},
+                        max_score=float("-inf"),
+                        best_anchor="",
+                        residual_norms=None,
+                    )
+                )
 
         # Cleanup hooks
         if extractor:
@@ -455,7 +438,7 @@ class RefusalCalibrator:
         suggested = self.compute_suggested_thresholds(stats)
 
         # Build final result
-        calibration_result = CalibrationResult(
+        return CalibrationResult(
             config={
                 "model_path": self.config.model_path,
                 "split": self.config.split,
@@ -471,14 +454,12 @@ class RefusalCalibrator:
             suggested_thresholds=suggested,
         )
 
-        return calibration_result
-
     def save_results(self, result: CalibrationResult):
         """Save calibration results to JSON."""
         output_path = Path(self.config.output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, "w", encoding="utf-8") as f:
+        with output_path.open("w", encoding="utf-8") as f:
             json.dump(asdict(result), f, indent=2, ensure_ascii=False)
 
         print(f"\nResults saved to {output_path}")
@@ -496,36 +477,34 @@ def print_summary(result: CalibrationResult):
 
     stats = result.statistics
     if "error" not in stats:
-        print(f"\n--- Score Distribution ---")
+        print("\n--- Score Distribution ---")
         print(f"Mean:   {stats['mean']:.4f}")
         print(f"Std:    {stats['std']:.4f}")
         print(f"Min:    {stats['min']:.4f}")
         print(f"Max:    {stats['max']:.4f}")
         print(f"Median: {stats['median']:.4f}")
 
-        print(f"\n--- Percentiles ---")
+        print("\n--- Percentiles ---")
         for pct, val in stats["percentiles"].items():
             print(f"  {pct}: {val:.4f}")
 
-        print(f"\n--- Per-Anchor Performance ---")
+        print("\n--- Per-Anchor Performance ---")
         for anchor, anchor_stats in stats.get("per_anchor", {}).items():
             print(f"  '{anchor}': mean={anchor_stats['mean']:.4f}, max={anchor_stats['max']:.4f}")
 
-    print(f"\n--- Suggested Thresholds ---")
+    print("\n--- Suggested Thresholds ---")
     for name, info in result.suggested_thresholds.items():
         if "error" not in info:
             print(f"  {name}: {info['threshold']:.4f}")
             print(f"    {info['description']}")
 
     # Sample of high-scoring results
-    print(f"\n--- Top 5 Highest Scoring Prompts ---")
+    print("\n--- Top 5 Highest Scoring Prompts ---")
     sorted_results = sorted(
-        result.results,
-        key=lambda x: x["max_score"] if np.isfinite(x["max_score"]) else float("-inf"),
-        reverse=True
+        result.results, key=lambda x: x["max_score"] if np.isfinite(x["max_score"]) else float("-inf"), reverse=True
     )
     for i, r in enumerate(sorted_results[:5]):
-        print(f"\n{i+1}. Score: {r['max_score']:.4f} (anchor: {r['best_anchor']})")
+        print(f"\n{i + 1}. Score: {r['max_score']:.4f} (anchor: {r['best_anchor']})")
         print(f"   Prompt: {r['prompt'][:80]}...")
         print(f"   Response: {r['generated_response'][:100]}...")
 
@@ -533,76 +512,45 @@ def print_summary(result: CalibrationResult):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Calibrate refusal detection threshold using known-refusing prompts"
-    )
+    """Command-line entry point for calibrating the refusal-detection threshold."""
+    parser = argparse.ArgumentParser(description="Calibrate refusal detection threshold using known-refusing prompts")
+    parser.add_argument("-m", "--model", type=str, required=True, help="Model path or HuggingFace model ID")
     parser.add_argument(
-        "-m", "--model",
-        type=str,
-        required=True,
-        help="Model path or HuggingFace model ID"
-    )
-    parser.add_argument(
-        "-s", "--split",
+        "-s",
+        "--split",
         type=str,
         default="harmful",
         choices=["harmful", "harmless", "preservation"],
         help="RevivifAI/derestriction split to calibrate against (default: harmful).",
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=str,
         default="calibration_results.json",
-        help="Output JSON path (default: calibration_results.json)"
+        help="Output JSON path (default: calibration_results.json)",
     )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-        help="Batch size for processing (default: 4)"
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=128,
-        help="Max new tokens for generation (default: 128)"
-    )
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for processing (default: 4)")
+    parser.add_argument("--max-tokens", type=int, default=128, help="Max new tokens for generation (default: 128)")
     parser.add_argument(
         "--dtype",
         type=str,
         default="auto",
         choices=["auto", "bfloat16", "float16", "float32"],
-        help="Model dtype (default: auto)"
+        help="Model dtype (default: auto)",
     )
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use (default: cuda)")
     parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to use (default: cuda)"
-    )
-    parser.add_argument(
-        "--extract-residuals",
-        action="store_true",
-        help="Extract hidden state residual norms per layer"
+        "--extract-residuals", action="store_true", help="Extract hidden state residual norms per layer"
     )
     parser.add_argument(
         "--residual-layers",
         type=str,
         default=None,
-        help="Comma-separated layer indices for residual extraction (default: all)"
+        help="Comma-separated layer indices for residual extraction (default: all)",
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit number of prompts to process"
-    )
-    parser.add_argument(
-        "--anchors",
-        type=str,
-        default=None,
-        help="Comma-separated custom refusal anchors"
-    )
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of prompts to process")
+    parser.add_argument("--anchors", type=str, default=None, help="Comma-separated custom refusal anchors")
 
     args = parser.parse_args()
 

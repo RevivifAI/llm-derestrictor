@@ -18,15 +18,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
 import string
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional
 
 from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
@@ -52,8 +51,7 @@ def normalize_prompt(text: str) -> str:
     if text is None:
         return ""
     text = str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def dedup_key(text: str) -> str:
@@ -74,13 +72,15 @@ def is_ascii_english(text: str) -> bool:
 
 @dataclass
 class SourceSpec:
+    """Specification for a single upstream dataset source feeding the build."""
+
     name: str  # value written into the Source column
     dataset_id: str
-    config: Optional[str]
+    config: str | None
     split: str
     column: str
-    filter_fn: Optional[Callable[[dict], bool]] = None
-    cap: Optional[int] = None  # hard cap on raw rows taken from this source
+    filter_fn: Callable[[dict], bool] | None = None
+    cap: int | None = None  # hard cap on raw rows taken from this source
 
 
 def _iter_rows(spec: SourceSpec) -> list[dict]:
@@ -235,6 +235,10 @@ PRESERVATION_SOURCES: list[SourceSpec] = [
 
 
 def dedup(rows: list[dict], seen: set[str]) -> list[dict]:
+    """Return ``rows`` without entries whose dedup key is already in ``seen``.
+
+    Updates ``seen`` in place with the keys of the emitted rows.
+    """
     out: list[dict] = []
     for r in rows:
         k = dedup_key(r["Prompt"])
@@ -250,7 +254,7 @@ def sample_to_target(
     target: int,
     rng: random.Random,
     split_name: str,
-    budgets: Optional[dict[str, int]] = None,
+    budgets: dict[str, int] | None = None,
 ) -> list[dict]:
     """Sample exactly `target` rows, honoring per-source budgets when given.
 
@@ -260,8 +264,7 @@ def sample_to_target(
     """
     if len(rows) < target:
         raise RuntimeError(
-            f"{split_name}: pool has {len(rows)} rows, need {target}. "
-            "Add more sources or loosen filters."
+            f"{split_name}: pool has {len(rows)} rows, need {target}. Add more sources or loosen filters."
         )
 
     if not budgets:
@@ -297,7 +300,8 @@ def sample_to_target(
 
 
 def build() -> dict[str, Dataset]:
-    rng = random.Random(SEED)
+    """Build the full derestriction dataset and write splits to ``BUILD_DIR``."""
+    rng = random.Random(SEED)  # noqa: S311 - non-cryptographic sampling seeded for reproducibility
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---- harmful ---------------------------------------------------------
@@ -321,9 +325,7 @@ def build() -> dict[str, Dataset]:
     seen_keys: set[str] = set()
     harmful_dedup = dedup(harmful_filtered, seen_keys)
     print(f"  after dedup: {len(harmful_dedup)}")
-    harmful_rows = sample_to_target(
-        harmful_dedup, TARGET_PER_SPLIT, rng, "harmful"
-    )
+    harmful_rows = sample_to_target(harmful_dedup, TARGET_PER_SPLIT, rng, "harmful")
 
     # ---- harmless --------------------------------------------------------
     print("\n[harmless] gathering pool …", flush=True)
@@ -334,9 +336,7 @@ def build() -> dict[str, Dataset]:
 
     harmless_dedup = dedup(harmless_raw, seen_keys)
     print(f"  after dedup (cross-split): {len(harmless_dedup)}")
-    harmless_rows = sample_to_target(
-        harmless_dedup, TARGET_PER_SPLIT, rng, "harmless"
-    )
+    harmless_rows = sample_to_target(harmless_dedup, TARGET_PER_SPLIT, rng, "harmless")
 
     # ---- preservation ----------------------------------------------------
     print("\n[preservation] gathering pool …", flush=True)
@@ -367,10 +367,7 @@ def build() -> dict[str, Dataset]:
         ds.to_parquet(parquet_path)
         splits[name] = ds
         src_counts = Counter(r["Source"] for r in rows)
-        print(
-            f"\n[{name}] wrote {parquet_path.relative_to(PROJECT_ROOT)} "
-            f"({len(rows)} rows)"
-        )
+        print(f"\n[{name}] wrote {parquet_path.relative_to(PROJECT_ROOT)} ({len(rows)} rows)")
         for src, n in src_counts.most_common():
             print(f"    {n:>5d}  {src}")
 
@@ -389,14 +386,13 @@ def build() -> dict[str, Dataset]:
             )
         },
     }
-    (BUILD_DIR / "summary.json").write_text(
-        json.dumps(summary, indent=2, default=dict), encoding="utf-8"
-    )
+    (BUILD_DIR / "summary.json").write_text(json.dumps(summary, indent=2, default=dict), encoding="utf-8")
 
     return splits
 
 
 def main() -> int:
+    """Command-line entry point for building the derestriction dataset."""
     argparse.ArgumentParser(description=__doc__).parse_args()
     build()
     return 0

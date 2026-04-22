@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Interactive CLI for Abliteration Toolkit
+"""Interactive CLI for Abliteration Toolkit.
 
 A modern terminal interface for removing refusal behavior from language models.
 Supports interactive mode (default) and batch mode for automation.
@@ -17,46 +16,30 @@ if sys.platform == "win32":
     os.environ.setdefault("PYTHONUTF8", "1")
     # Also try to set console output encoding
     try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
         pass
+import contextlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import click
 import questionary
 import torch
 from questionary import Style as QStyle
-from rich.console import Console
-from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
-from utils.refusal_eval import RefusalScanner
-from src.gguf_export import (
-    GGUFExportConfig,
-    QUANT_TYPES,
-    QUANT_ONLY_TYPES,
-    check_tools_available,
-    detect_vision_model,
-    export_to_gguf,
-    export_all_quants,
-    find_llama_cpp_path,
-    has_vision_files,
-)
 from src.cli_components import (
     THEME,
     add_model_path,
     clear_screen,
     console,
-    create_progress_bar,
     display_banner,
     display_comparison_panel,
     display_config_panel,
     display_error,
     display_menu,
-    display_model_list,
     display_results_table,
     display_success,
     display_system_info,
@@ -73,7 +56,6 @@ from src.cli_components import (
     get_model_paths,
     get_versioned_path,
     load_config,
-    print_divider,
     remove_model_path,
     save_config,
     set_default_output_dir,
@@ -86,27 +68,39 @@ from src.config_manager import (
     get_default_settings,
     list_configs,
     load_training_config,
+    sanitize_config_name,
     save_training_config,
     settings_from_abliteration_config,
-    apply_config_to_runtime,
-    sanitize_config_name,
     validate_config_settings,
 )
+from src.gguf_export import (
+    QUANT_ONLY_TYPES,
+    GGUFExportConfig,
+    check_tools_available,
+    detect_vision_model,
+    export_all_quants,
+    export_to_gguf,
+    find_llama_cpp_path,
+    has_vision_files,
+)
+from utils.refusal_eval import RefusalScanner
 
 # Questionary custom style (orange theme)
-custom_style = QStyle([
-    ("qmark", "fg:#ff8c00 bold"),
-    ("question", "fg:#00ffff bold"),
-    ("answer", "fg:#ff8c00 bold"),
-    ("pointer", "fg:#ff8c00 bold"),
-    ("highlighted", "fg:#ff8c00 bold"),
-    ("selected", "fg:#ffa500"),
-    ("separator", "fg:#6c6c6c"),
-    ("instruction", "fg:#6c6c6c"),
-])
+custom_style = QStyle(
+    [
+        ("qmark", "fg:#ff8c00 bold"),
+        ("question", "fg:#00ffff bold"),
+        ("answer", "fg:#ff8c00 bold"),
+        ("pointer", "fg:#ff8c00 bold"),
+        ("highlighted", "fg:#ff8c00 bold"),
+        ("selected", "fg:#ffa500"),
+        ("separator", "fg:#6c6c6c"),
+        ("instruction", "fg:#6c6c6c"),
+    ]
+)
 
 
-def select_model(title: str = "Select a model", allow_manual: bool = True) -> Optional[str]:
+def select_model(title: str = "Select a model", allow_manual: bool = True) -> str | None:
     """Interactive model selection."""
     models = find_models()
 
@@ -117,21 +111,27 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> Op
     choices = []
     for model in models:
         prefix = "[A] " if model["is_abliterated"] else "    "
-        choices.append(questionary.Choice(
-            title=f"{prefix}{model['name']}",
-            value=model["path"],
-        ))
+        choices.append(
+            questionary.Choice(
+                title=f"{prefix}{model['name']}",
+                value=model["path"],
+            )
+        )
 
     if allow_manual:
-        choices.append(questionary.Choice(
-            title="[M] Enter path manually...",
-            value="__manual__",
-        ))
+        choices.append(
+            questionary.Choice(
+                title="[M] Enter path manually...",
+                value="__manual__",
+            )
+        )
 
-    choices.append(questionary.Choice(
-        title="[B] Back",
-        value="__back__",
-    ))
+    choices.append(
+        questionary.Choice(
+            title="[B] Back",
+            value="__back__",
+        )
+    )
 
     selected = questionary.select(
         title,
@@ -143,16 +143,15 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> Op
         return None
 
     if selected == "__manual__":
-        path = questionary.path(
+        return questionary.path(
             "Enter model path:",
             style=custom_style,
         ).ask()
-        return path
 
     return selected
 
 
-def get_abliteration_config() -> Optional[dict]:
+def get_abliteration_config() -> dict | None:
     """Interactive configuration for abliteration."""
     config = {}
     loaded_settings = None
@@ -189,6 +188,7 @@ def get_abliteration_config() -> Optional[dict]:
 
     # Detect architecture immediately after model selection
     from src.abliterate import detect_hybrid_architecture
+
     hybrid_info = detect_hybrid_architecture(model_path)
 
     if hybrid_info.is_hybrid:
@@ -229,17 +229,21 @@ def get_abliteration_config() -> Optional[dict]:
     # Manual configuration - Advanced options
     console.print(f"\n[bold {THEME['primary']}]Step 3: Configuration[/bold {THEME['primary']}]\n")
 
-    config["num_prompts"] = int(questionary.text(
-        "Number of prompts to use:",
-        default=str(get_default_num_prompts()),
-        style=custom_style,
-    ).ask())
+    config["num_prompts"] = int(
+        questionary.text(
+            "Number of prompts to use:",
+            default=str(get_default_num_prompts()),
+            style=custom_style,
+        ).ask()
+    )
 
-    config["direction_multiplier"] = float(questionary.text(
-        "Direction multiplier (ablation strength):",
-        default=str(get_default_direction_multiplier()),
-        style=custom_style,
-    ).ask())
+    config["direction_multiplier"] = float(
+        questionary.text(
+            "Direction multiplier (ablation strength):",
+            default=str(get_default_direction_multiplier()),
+            style=custom_style,
+        ).ask()
+    )
 
     config["norm_preservation"] = questionary.confirm(
         "Enable norm preservation? (recommended)",
@@ -302,20 +306,26 @@ def get_abliteration_config() -> Optional[dict]:
     # Build preset choices based on detected architecture
     preset_choices = []
     if hybrid_info.is_hybrid:
-        preset_choices.append(questionary.Choice(
-            "Recommended for hybrid model (hybrid-aware + null-space + winsorization)",
-            value="hybrid_recommended",
-        ))
-        preset_choices.append(questionary.Choice(
-            "Hybrid + biprojection (best NatInt preservation for hybrid models)",
-            value="hybrid_biprojection",
-        ))
+        preset_choices.append(
+            questionary.Choice(
+                "Recommended for hybrid model (hybrid-aware + null-space + winsorization)",
+                value="hybrid_recommended",
+            )
+        )
+        preset_choices.append(
+            questionary.Choice(
+                "Hybrid + biprojection (best NatInt preservation for hybrid models)",
+                value="hybrid_biprojection",
+            )
+        )
 
-    preset_choices.extend([
-        questionary.Choice("Baseline (no advanced options)", value="baseline"),
-        questionary.Choice("Recommended standard (winsorize + null-space)", value="standard_recommended"),
-        questionary.Choice("Custom (configure each option manually)", value="custom"),
-    ])
+    preset_choices.extend(
+        [
+            questionary.Choice("Baseline (no advanced options)", value="baseline"),
+            questionary.Choice("Recommended standard (winsorize + null-space)", value="standard_recommended"),
+            questionary.Choice("Custom (configure each option manually)", value="custom"),
+        ]
+    )
 
     preset = questionary.select(
         "Select configuration preset:",
@@ -354,25 +364,39 @@ def get_abliteration_config() -> Optional[dict]:
 
     # For presets that enable null-space, prompt for rank ratio
     if preset in ("hybrid_recommended", "hybrid_biprojection", "standard_recommended"):
-        config["null_space_rank_ratio"] = float(questionary.text(
-            "Null-space SVD rank ratio (0.1-0.99, lower = more aggressive):",
-            default="0.95",
-            style=custom_style,
-        ).ask())
+        config["null_space_rank_ratio"] = float(
+            questionary.text(
+                "Null-space SVD rank ratio (0.1-0.99, lower = more aggressive):",
+                default="0.95",
+                style=custom_style,
+            ).ask()
+        )
 
         # Print summary
         console.print(f"\n[{THEME['success']}]Applied preset settings:[/{THEME['success']}]")
         console.print(f"[{THEME['muted']}]  → Winsorization enabled (0.995)[/{THEME['muted']}]")
-        console.print(f"[{THEME['muted']}]  → Null-space constraints enabled (rank ratio {config['null_space_rank_ratio']})[/{THEME['muted']}]")
+        console.print(
+            f"[{THEME['muted']}]  → Null-space constraints enabled (rank ratio {config['null_space_rank_ratio']})[/{THEME['muted']}]"
+        )
         if config.get("hybrid_strategy") == "auto" and hybrid_info.is_hybrid:
-            console.print(f"[{THEME['muted']}]  → Hybrid-aware extraction (full attn + pre-full-attn layers)[/{THEME['muted']}]")
-            console.print(f"[{THEME['muted']}]  → Full attention layers: {config['hybrid_full_attn_weight']}x weight[/{THEME['muted']}]")
-            console.print(f"[{THEME['muted']}]  → Linear attention layers: {config['hybrid_linear_attn_weight']}x weight[/{THEME['muted']}]")
-            console.print(f"[{THEME['muted']}]  → Skipping in_proj_a, in_proj_b (recurrent dynamics)[/{THEME['muted']}]")
+            console.print(
+                f"[{THEME['muted']}]  → Hybrid-aware extraction (full attn + pre-full-attn layers)[/{THEME['muted']}]"
+            )
+            console.print(
+                f"[{THEME['muted']}]  → Full attention layers: {config['hybrid_full_attn_weight']}x weight[/{THEME['muted']}]"
+            )
+            console.print(
+                f"[{THEME['muted']}]  → Linear attention layers: {config['hybrid_linear_attn_weight']}x weight[/{THEME['muted']}]"
+            )
+            console.print(
+                f"[{THEME['muted']}]  → Skipping in_proj_a, in_proj_b (recurrent dynamics)[/{THEME['muted']}]"
+            )
         if config.get("use_biprojection"):
             console.print(f"[{THEME['muted']}]  → Biprojection with per-neuron norm[/{THEME['muted']}]")
             console.print(f"[{THEME['muted']}]  → Targeting o_proj, down_proj only[/{THEME['muted']}]")
-            console.print(f"[{THEME['muted']}]  → Harmless boundary clamping ({config['harmless_clamp_ratio']})[/{THEME['muted']}]")
+            console.print(
+                f"[{THEME['muted']}]  → Harmless boundary clamping ({config['harmless_clamp_ratio']})[/{THEME['muted']}]"
+            )
 
     elif preset == "baseline":
         if hybrid_info.is_hybrid:
@@ -392,11 +416,13 @@ def get_abliteration_config() -> Optional[dict]:
         ).ask()
 
         if config["use_winsorization"]:
-            config["winsorize_percentile"] = float(questionary.text(
-                "Winsorize percentile (0.99-0.999):",
-                default="0.995",
-                style=custom_style,
-            ).ask())
+            config["winsorize_percentile"] = float(
+                questionary.text(
+                    "Winsorize percentile (0.99-0.999):",
+                    default="0.995",
+                    style=custom_style,
+                ).ask()
+            )
 
         # Null-space constraints (preserves model capabilities)
         config["use_null_space"] = questionary.confirm(
@@ -406,11 +432,13 @@ def get_abliteration_config() -> Optional[dict]:
         ).ask()
 
         if config["use_null_space"]:
-            config["null_space_rank_ratio"] = float(questionary.text(
-                "Null-space SVD rank ratio (0.9-0.99):",
-                default="0.95",
-                style=custom_style,
-            ).ask())
+            config["null_space_rank_ratio"] = float(
+                questionary.text(
+                    "Null-space SVD rank ratio (0.9-0.99):",
+                    default="0.95",
+                    style=custom_style,
+                ).ask()
+            )
 
         # Layer targeting options
         console.print(f"\n[bold {THEME['secondary']}]Layer Targeting[/bold {THEME['secondary']}]")
@@ -430,8 +458,12 @@ def get_abliteration_config() -> Optional[dict]:
         # Explain how strength control works with dynamic targeting
         strength_question = "How would you like to control per-layer ablation strength?"
         if config["dynamic_layer_targeting"]:
-            console.print(f"\n[{THEME['muted']}]With dynamic targeting, each layer uses its own direction.[/{THEME['muted']}]")
-            console.print(f"[{THEME['muted']}]Strength control scales how much each layer's direction is applied.[/{THEME['muted']}]")
+            console.print(
+                f"\n[{THEME['muted']}]With dynamic targeting, each layer uses its own direction.[/{THEME['muted']}]"
+            )
+            console.print(
+                f"[{THEME['muted']}]Strength control scales how much each layer's direction is applied.[/{THEME['muted']}]"
+            )
 
         layer_targeting_choice = questionary.select(
             strength_question,
@@ -452,7 +484,9 @@ def get_abliteration_config() -> Optional[dict]:
 
         if layer_targeting_choice == "adaptive":
             if config["dynamic_layer_targeting"]:
-                console.print(f"[{THEME['muted']}]  → Per-layer directions + Gaussian strength weighting[/{THEME['muted']}]")
+                console.print(
+                    f"[{THEME['muted']}]  → Per-layer directions + Gaussian strength weighting[/{THEME['muted']}]"
+                )
             config["use_adaptive_weighting"] = True
 
         elif layer_targeting_choice == "target_map":
@@ -464,6 +498,7 @@ def get_abliteration_config() -> Optional[dict]:
             if config["layer_target_map_path"]:
                 # Load and validate the target map
                 from src.abliterate import load_layer_target_map
+
                 try:
                     target_map = load_layer_target_map(config["layer_target_map_path"])
 
@@ -513,17 +548,21 @@ def get_abliteration_config() -> Optional[dict]:
                 ).ask()
 
                 if configure_hybrid:
-                    config["hybrid_full_attn_weight"] = float(questionary.text(
-                        "Full attention layer weight (0.0-2.0):",
-                        default="1.0",
-                        style=custom_style,
-                    ).ask())
+                    config["hybrid_full_attn_weight"] = float(
+                        questionary.text(
+                            "Full attention layer weight (0.0-2.0):",
+                            default="1.0",
+                            style=custom_style,
+                        ).ask()
+                    )
 
-                    config["hybrid_linear_attn_weight"] = float(questionary.text(
-                        "Linear attention layer weight (0.0-1.0):",
-                        default="0.4",
-                        style=custom_style,
-                    ).ask())
+                    config["hybrid_linear_attn_weight"] = float(
+                        questionary.text(
+                            "Linear attention layer weight (0.0-1.0):",
+                            default="0.4",
+                            style=custom_style,
+                        ).ask()
+                    )
 
                 config["hybrid_skip_recurrent_proj"] = questionary.confirm(
                     "Skip recurrent dynamics projections (in_proj_a, in_proj_b)? (recommended)",
@@ -537,17 +576,27 @@ def get_abliteration_config() -> Optional[dict]:
                     style=custom_style,
                 ).ask()
 
-                console.print(f"[{THEME['muted']}]  → Full attention layers weighted at {config['hybrid_full_attn_weight']}x[/{THEME['muted']}]")
-                console.print(f"[{THEME['muted']}]  → Linear attention layers weighted at {config['hybrid_linear_attn_weight']}x[/{THEME['muted']}]")
+                console.print(
+                    f"[{THEME['muted']}]  → Full attention layers weighted at {config['hybrid_full_attn_weight']}x[/{THEME['muted']}]"
+                )
+                console.print(
+                    f"[{THEME['muted']}]  → Linear attention layers weighted at {config['hybrid_linear_attn_weight']}x[/{THEME['muted']}]"
+                )
                 if config["hybrid_skip_recurrent_proj"]:
-                    console.print(f"[{THEME['muted']}]  → Skipping in_proj_a, in_proj_b (recurrent dynamics)[/{THEME['muted']}]")
+                    console.print(
+                        f"[{THEME['muted']}]  → Skipping in_proj_a, in_proj_b (recurrent dynamics)[/{THEME['muted']}]"
+                    )
                 if config["hybrid_skip_state_proj"]:
-                    console.print(f"[{THEME['muted']}]  → Skipping in_proj_qkv, in_proj_z (state projections)[/{THEME['muted']}]")
+                    console.print(
+                        f"[{THEME['muted']}]  → Skipping in_proj_qkv, in_proj_z (state projections)[/{THEME['muted']}]"
+                    )
         else:
             console.print(f"[{THEME['muted']}]No hybrid architecture detected (standard model)[/{THEME['muted']}]")
 
         # Biprojection options
-        console.print(f"\n[bold {THEME['secondary']}]Biprojection (improved NatInt preservation)[/bold {THEME['secondary']}]")
+        console.print(
+            f"\n[bold {THEME['secondary']}]Biprojection (improved NatInt preservation)[/bold {THEME['secondary']}]"
+        )
 
         config["use_biprojection"] = questionary.confirm(
             "Enable biprojection mode? (measure at high-quality layers, apply broadly)",
@@ -592,11 +641,13 @@ def get_abliteration_config() -> Optional[dict]:
             ).ask()
 
             if config["use_harmless_boundary"]:
-                config["harmless_clamp_ratio"] = float(questionary.text(
-                    "Harmless clamp ratio (0.0-1.0):",
-                    default="0.1",
-                    style=custom_style,
-                ).ask())
+                config["harmless_clamp_ratio"] = float(
+                    questionary.text(
+                        "Harmless clamp ratio (0.0-1.0):",
+                        default="0.1",
+                        style=custom_style,
+                    ).ask()
+                )
 
             # Advanced biprojection settings
             configure_biprojection_advanced = questionary.confirm(
@@ -606,23 +657,29 @@ def get_abliteration_config() -> Optional[dict]:
             ).ask()
 
             if configure_biprojection_advanced:
-                config["num_measurement_layers"] = int(questionary.text(
-                    "Number of measurement layers (top quality):",
-                    default="2",
-                    style=custom_style,
-                ).ask())
+                config["num_measurement_layers"] = int(
+                    questionary.text(
+                        "Number of measurement layers (top quality):",
+                        default="2",
+                        style=custom_style,
+                    ).ask()
+                )
 
-                intervention_start = float(questionary.text(
-                    "Intervention range start (0.0-1.0, fraction of depth):",
-                    default="0.25",
-                    style=custom_style,
-                ).ask())
+                intervention_start = float(
+                    questionary.text(
+                        "Intervention range start (0.0-1.0, fraction of depth):",
+                        default="0.25",
+                        style=custom_style,
+                    ).ask()
+                )
 
-                intervention_end = float(questionary.text(
-                    "Intervention range end (0.0-1.0, fraction of depth):",
-                    default="0.95",
-                    style=custom_style,
-                ).ask())
+                intervention_end = float(
+                    questionary.text(
+                        "Intervention range end (0.0-1.0, fraction of depth):",
+                        default="0.95",
+                        style=custom_style,
+                    ).ask()
+                )
 
                 config["intervention_range"] = (intervention_start, intervention_end)
         else:
@@ -791,7 +848,9 @@ def run_abliteration(config: dict) -> bool:
                 kl_reference_prompts = load_reference_prompts(
                     num_prompts=abl_config.kl_num_reference_prompts,
                 )
-                console.print(f"[{THEME['muted']}]Loaded {len(kl_reference_prompts)} reference prompts for KL monitoring[/{THEME['muted']}]")
+                console.print(
+                    f"[{THEME['muted']}]Loaded {len(kl_reference_prompts)} reference prompts for KL monitoring[/{THEME['muted']}]"
+                )
 
                 kl_mon_config = KLMonitorConfig(
                     num_reference_prompts=abl_config.kl_num_reference_prompts,
@@ -848,11 +907,13 @@ def run_abliteration(config: dict) -> bool:
 
             # Save model (handles FP8 dequantized models specially)
             from src.abliterate import save_model_safe
+
             save_model_safe(model, tokenizer, output_path)
             directions.save(str(output_path / "refusal_directions.pt"))
 
             # Preserve original model config fields that transformers might not save
-            from src.abliterate import is_vision_model, copy_vision_files, preserve_model_config, make_json_serializable
+            from src.abliterate import copy_vision_files, is_vision_model, make_json_serializable, preserve_model_config
+
             source_path = Path(config["model_path"])
             preserve_model_config(source_path, output_path)
 
@@ -869,8 +930,7 @@ def run_abliteration(config: dict) -> bool:
 
             # Save config
             effective_multiplier = (
-                auto_tune_result.best_multiplier if auto_tune_result is not None
-                else config["direction_multiplier"]
+                auto_tune_result.best_multiplier if auto_tune_result is not None else config["direction_multiplier"]
             )
             config_save = {
                 "model_path": config["model_path"],
@@ -899,7 +959,7 @@ def run_abliteration(config: dict) -> bool:
                     "num_iterations": auto_tune_result.num_iterations,
                 }
 
-            with open(output_path / "abliteration_config.json", "w", encoding="utf-8") as f:
+            with (output_path / "abliteration_config.json").open("w", encoding="utf-8") as f:
                 json.dump(make_json_serializable(config_save), f, indent=2)
 
             # Save KL divergence report
@@ -921,6 +981,7 @@ def run_abliteration(config: dict) -> bool:
 
     except Exception as e:
         import traceback
+
         error_msg = str(e) if str(e) else repr(e)
         display_error(f"Abliteration failed: {error_msg}")
         console.print(f"[dim]{traceback.format_exc()}[/dim]")
@@ -946,22 +1007,24 @@ def run_test_model():
     ).ask()
 
     if test_type == "quick":
-        from utils.test_abliteration import test_single_model, DEFAULT_TEST_PROMPTS
+        from utils.test_abliteration import DEFAULT_TEST_PROMPTS, test_single_model
+
         results = test_single_model(model_path, DEFAULT_TEST_PROMPTS)
 
         # Display results
-        table_data = []
-        for r in results:
-            table_data.append({
+        table_data = [
+            {
                 "prompt": r["prompt"][:40] + "..." if len(r["prompt"]) > 40 else r["prompt"],
                 "refused": "[red]Yes[/red]" if r["refused"] else "[green]No[/green]",
                 "response": r["response"][:60] + "..." if len(r["response"]) > 60 else r["response"],
-            })
+            }
+            for r in results
+        ]
 
         display_results_table(
             table_data,
             [("Prompt", THEME["primary"]), ("Refused", ""), ("Response", THEME["muted"])],
-            title="Test Results"
+            title="Test Results",
         )
 
         refusal_rate = sum(1 for r in results if r["refused"]) / len(results)
@@ -974,8 +1037,8 @@ def run_test_model():
         ).ask()
 
         if prompt:
-            from utils.test_abliteration import load_model, generate_response
             from utils.refusal_detector import LogLikelihoodRefusalDetector
+            from utils.test_abliteration import generate_response, load_model
 
             with console.status("Loading model..."):
                 model, tokenizer = load_model(model_path)
@@ -986,18 +1049,21 @@ def run_test_model():
                 response = generate_response(model, tokenizer, prompt)
 
             from rich.panel import Panel
+
             status = "[red]REFUSED[/red]" if refused else "[green]OK[/green]"
-            console.print(Panel(
-                response,
-                title=f"[bold]Response[/bold] {status}",
-                border_style="red" if refused else "green",
-            ))
+            console.print(
+                Panel(
+                    response,
+                    title=f"[bold]Response[/bold] {status}",
+                    border_style="red" if refused else "green",
+                )
+            )
 
     elif test_type == "eval":
         run_evaluation(model_path)
 
 
-def run_evaluation(model_path: str = None):
+def run_evaluation(model_path: str | None = None):
     """Run refusal rate evaluation using log-probability based detection."""
     console.print(f"\n[bold {THEME['primary']}]Refusal Rate Evaluation[/bold {THEME['primary']}]\n")
 
@@ -1017,11 +1083,13 @@ def run_evaluation(model_path: str = None):
 
     limit = int(limit_str) if limit_str and limit_str.strip() else None
 
-    batch_size = int(questionary.text(
-        "Batch size:",
-        default="8",
-        style=custom_style,
-    ).ask())
+    batch_size = int(
+        questionary.text(
+            "Batch size:",
+            default="8",
+            style=custom_style,
+        ).ask()
+    )
 
     # Dtype selection
     dtype = questionary.select(
@@ -1047,11 +1115,13 @@ def run_evaluation(model_path: str = None):
     debug = False
 
     if show_advanced:
-        threshold = float(questionary.text(
-            "Refusal threshold (log prob, higher = more sensitive):",
-            default="-7.0",
-            style=custom_style,
-        ).ask())
+        threshold = float(
+            questionary.text(
+                "Refusal threshold (log prob, higher = more sensitive):",
+                default="-7.0",
+                style=custom_style,
+            ).ask()
+        )
 
         debug = questionary.confirm(
             "Enable debug output?",
@@ -1067,6 +1137,7 @@ def run_evaluation(model_path: str = None):
 
     # Display configuration
     from rich.panel import Panel
+
     config_text = (
         f"Model: [{THEME['primary']}]{model_path}[/{THEME['primary']}]\n"
         f"Prompts: [{THEME['muted']}]RevivifAI/derestriction / {prompts_split}[/{THEME['muted']}]\n"
@@ -1075,7 +1146,7 @@ def run_evaluation(model_path: str = None):
         f"Dtype: [{THEME['accent']}]{dtype}[/{THEME['accent']}]\n"
         f"Threshold: [{THEME['accent']}]{threshold}[/{THEME['accent']}]"
     )
-    console.print(Panel(config_text, title="[bold]Evaluation Configuration[/bold]", border_style=THEME['primary']))
+    console.print(Panel(config_text, title="[bold]Evaluation Configuration[/bold]", border_style=THEME["primary"]))
     console.print()
 
     # Confirm
@@ -1091,7 +1162,9 @@ def run_evaluation(model_path: str = None):
     try:
         # Create scanner and run evaluation
         console.print()
-        with console.status(f"[bold {THEME['primary']}]Loading model and running evaluation...[/bold {THEME['primary']}]"):
+        with console.status(
+            f"[bold {THEME['primary']}]Loading model and running evaluation...[/bold {THEME['primary']}]"
+        ):
             scanner = RefusalScanner(
                 model_name=model_path,
                 device="cuda" if torch.cuda.is_available() else "cpu",
@@ -1121,15 +1194,17 @@ def run_evaluation(model_path: str = None):
 
         # Load results and display summary
         import pandas as pd
+
         df = pd.read_csv(output_file)
 
         total = len(df)
-        refusals = df['is_refusal'].sum()
+        refusals = df["is_refusal"].sum()
         refusal_rate = refusals / total if total > 0 else 0
 
         # Display results table
         console.print()
         from rich.table import Table
+
         table = Table(title="Evaluation Results", show_header=True)
         table.add_column("Metric", style=THEME["primary"])
         table.add_column("Value", justify="right")
@@ -1143,7 +1218,7 @@ def run_evaluation(model_path: str = None):
         console.print(table)
 
         # Show score distribution
-        if 'refusal_score' in df.columns:
+        if "refusal_score" in df.columns:
             console.print(f"\n[bold {THEME['secondary']}]Score Statistics[/bold {THEME['secondary']}]")
             console.print(f"  Mean score:   [{THEME['accent']}]{df['refusal_score'].mean():.4f}[/{THEME['accent']}]")
             console.print(f"  Median score: [{THEME['accent']}]{df['refusal_score'].median():.4f}[/{THEME['accent']}]")
@@ -1171,16 +1246,17 @@ def run_evaluation(model_path: str = None):
             sample_table.add_column("Score", justify="right")
 
             for idx, row in df.head(10).iterrows():
-                prompt_display = row['prompt'][:47] + "..." if len(row['prompt']) > 50 else row['prompt']
-                refused_display = "[red]Yes[/red]" if row['is_refusal'] else "[green]No[/green]"
-                score_display = f"{row['refusal_score']:.4f}" if pd.notna(row['refusal_score']) else "N/A"
+                prompt_display = row["prompt"][:47] + "..." if len(row["prompt"]) > 50 else row["prompt"]
+                refused_display = "[red]Yes[/red]" if row["is_refusal"] else "[green]No[/green]"
+                score_display = f"{row['refusal_score']:.4f}" if pd.notna(row["refusal_score"]) else "N/A"
                 sample_table.add_row(str(idx + 1), prompt_display, refused_display, score_display)
 
             console.print(sample_table)
 
     except Exception as e:
-        display_error(f"Evaluation failed: {str(e)}")
+        display_error(f"Evaluation failed: {e!s}")
         import traceback
+
         if debug:
             traceback.print_exc()
 
@@ -1208,8 +1284,8 @@ def run_compare_models():
     if not prompt:
         return
 
-    from utils.test_abliteration import load_model, generate_response
     from utils.refusal_detector import LogLikelihoodRefusalDetector
+    from utils.test_abliteration import generate_response, load_model
 
     with console.status("Loading original model..."):
         orig_model, orig_tokenizer = load_model(original_path)
@@ -1304,7 +1380,9 @@ def run_gguf_export():
     if tools_status["quantize_exe"]:
         console.print(f"[{THEME['muted']}]Quantize tool: {tools_status['quantize_exe']}[/{THEME['muted']}]")
     else:
-        console.print(f"[{THEME['warning']}]Quantize tool not found - only F16/F32 export available[/{THEME['warning']}]")
+        console.print(
+            f"[{THEME['warning']}]Quantize tool not found - only F16/F32 export available[/{THEME['warning']}]"
+        )
     console.print()
 
     # Select model
@@ -1317,15 +1395,21 @@ def run_gguf_export():
     original_model_path = None  # For mmproj conversion if needed
 
     if is_vl_model:
-        console.print(f"[{THEME['accent']}]Detected Vision-Language model[/{THEME['accent']}]" +
-                      (f" ({vl_arch})" if vl_arch else ""))
+        console.print(
+            f"[{THEME['accent']}]Detected Vision-Language model[/{THEME['accent']}]"
+            + (f" ({vl_arch})" if vl_arch else "")
+        )
 
         # Check if this model has vision files for mmproj
         if has_vision_files(Path(model_path)):
             console.print(f"[{THEME['muted']}]mmproj file will be created for vision encoder[/{THEME['muted']}]")
         else:
-            console.print(f"[{THEME['warning']}]Vision encoder files not found in this model directory[/{THEME['warning']}]")
-            console.print(f"[{THEME['muted']}]This appears to be an abliterated model without the original vision files.[/{THEME['muted']}]")
+            console.print(
+                f"[{THEME['warning']}]Vision encoder files not found in this model directory[/{THEME['warning']}]"
+            )
+            console.print(
+                f"[{THEME['muted']}]This appears to be an abliterated model without the original vision files.[/{THEME['muted']}]"
+            )
             console.print()
 
             # Ask for original model path
@@ -1345,13 +1429,17 @@ def run_gguf_export():
                     if has_vision_files(Path(original_model_path)):
                         console.print(f"[{THEME['success']}]Found vision files in original model[/{THEME['success']}]")
                     else:
-                        console.print(f"[{THEME['warning']}]Original model also missing vision files[/{THEME['warning']}]")
+                        console.print(
+                            f"[{THEME['warning']}]Original model also missing vision files[/{THEME['warning']}]"
+                        )
                         original_model_path = None
                 else:
                     original_model_path = None
 
             if not original_model_path:
-                console.print(f"[{THEME['muted']}]Continuing without mmproj - vision features will not work[/{THEME['muted']}]")
+                console.print(
+                    f"[{THEME['muted']}]Continuing without mmproj - vision features will not work[/{THEME['muted']}]"
+                )
 
         console.print()
 
@@ -1370,10 +1458,7 @@ def run_gguf_export():
 
     # If quantize tool available, add "Export all" option
     if tools_status["can_quantize"]:
-        quant_choices.insert(0, questionary.Choice(
-            "★ Export ALL quant types (Q2_K through Q8_0 + F16)",
-            value="ALL"
-        ))
+        quant_choices.insert(0, questionary.Choice("★ Export ALL quant types (Q2_K through Q8_0 + F16)", value="ALL"))
 
     # If quantize tool not available, only offer F16/F32
     if not tools_status["can_quantize"]:
@@ -1431,12 +1516,14 @@ def run_gguf_export():
         model_name = custom_name
 
     # Confirm
-    console.print(f"\n[bold]Export Configuration:[/bold]")
+    console.print("\n[bold]Export Configuration:[/bold]")
     console.print(f"  Model: [{THEME['primary']}]{model_path}[/{THEME['primary']}]")
     console.print(f"  Output: [{THEME['primary']}]{output_dir}[/{THEME['primary']}]")
     if export_all:
         console.print(f"  Format: [{THEME['accent']}]ALL quant types[/{THEME['accent']}]")
-        console.print(f"  Types: [{THEME['muted']}]{', '.join(QUANT_ONLY_TYPES)}{' + F16' if keep_f16 else ''}[/{THEME['muted']}]")
+        console.print(
+            f"  Types: [{THEME['muted']}]{', '.join(QUANT_ONLY_TYPES)}{' + F16' if keep_f16 else ''}[/{THEME['muted']}]"
+        )
     else:
         console.print(f"  Format: [{THEME['accent']}]{quant_type}[/{THEME['accent']}]")
     console.print(f"  Name: [{THEME['primary']}]{model_name}[/{THEME['primary']}]")
@@ -1488,17 +1575,21 @@ def run_gguf_export():
         console.print()
         if success:
             display_success(message)
-            console.print(f"\n[bold]Created files:[/bold]")
+            console.print("\n[bold]Created files:[/bold]")
             for path in output_paths:
                 if path.exists():
                     size_gb = path.stat().st_size / (1024**3)
-                    console.print(f"  [{THEME['muted']}]{path.name}[/{THEME['muted']}] - [{THEME['accent']}]{size_gb:.2f} GB[/{THEME['accent']}]")
+                    console.print(
+                        f"  [{THEME['muted']}]{path.name}[/{THEME['muted']}] - [{THEME['accent']}]{size_gb:.2f} GB[/{THEME['accent']}]"
+                    )
 
             # Check for mmproj file for VL models
             if is_vl_model:
                 for f in output_dir.glob("*mmproj*.gguf"):
                     size_mb = f.stat().st_size / (1024**2)
-                    console.print(f"  [{THEME['muted']}]{f.name}[/{THEME['muted']}] - [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}] (mmproj)")
+                    console.print(
+                        f"  [{THEME['muted']}]{f.name}[/{THEME['muted']}] - [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}] (mmproj)"
+                    )
                     break
         else:
             display_error(message)
@@ -1552,8 +1643,12 @@ def run_gguf_export():
                         break
 
                 if not mmproj_found:
-                    console.print(f"  [{THEME['warning']}]mmproj not found - vision features may not work[/{THEME['warning']}]")
-                    console.print(f"  [{THEME['muted']}]You may need to manually convert the vision encoder[/{THEME['muted']}]")
+                    console.print(
+                        f"  [{THEME['warning']}]mmproj not found - vision features may not work[/{THEME['warning']}]"
+                    )
+                    console.print(
+                        f"  [{THEME['muted']}]You may need to manually convert the vision encoder[/{THEME['muted']}]"
+                    )
         else:
             display_error(message)
 
@@ -1584,7 +1679,7 @@ def run_config_management():
         if action == "back" or action is None:
             break
 
-        elif action == "create":
+        if action == "create":
             _create_training_config()
 
         elif action == "view":
@@ -1623,11 +1718,14 @@ def _create_training_config():
             return
 
     # Get description
-    description = questionary.text(
-        "Description (optional):",
-        default="",
-        style=custom_style,
-    ).ask() or ""
+    description = (
+        questionary.text(
+            "Description (optional):",
+            default="",
+            style=custom_style,
+        ).ask()
+        or ""
+    )
 
     # Collect settings via questionnaire
     settings = _collect_config_settings()
@@ -1642,7 +1740,7 @@ def _create_training_config():
         display_error(message)
 
 
-def _collect_config_settings() -> Optional[dict]:
+def _collect_config_settings() -> dict | None:
     """Collect abliteration settings via questionnaire. Returns None if cancelled."""
     settings = get_default_settings()
 
@@ -1737,10 +1835,8 @@ def _collect_config_settings() -> Optional[dict]:
                 default=str(settings["winsorize_percentile"]),
                 style=custom_style,
             ).ask()
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 settings["winsorize_percentile"] = float(percentile)
-            except (ValueError, TypeError):
-                pass
 
         # Magnitude clipping
         settings["use_magnitude_clipping"] = questionary.confirm(
@@ -1757,10 +1853,8 @@ def _collect_config_settings() -> Optional[dict]:
                 default=str(settings["magnitude_clip_percentile"]),
                 style=custom_style,
             ).ask()
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 settings["magnitude_clip_percentile"] = float(percentile)
-            except (ValueError, TypeError):
-                pass
 
         # Null-space constraints
         settings["use_null_space"] = questionary.confirm(
@@ -1777,10 +1871,8 @@ def _collect_config_settings() -> Optional[dict]:
                 default=str(settings["null_space_rank_ratio"]),
                 style=custom_style,
             ).ask()
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 settings["null_space_rank_ratio"] = float(ratio)
-            except (ValueError, TypeError):
-                pass
 
         # Adaptive weighting
         settings["use_adaptive_weighting"] = questionary.confirm(
@@ -1836,10 +1928,8 @@ def _collect_config_settings() -> Optional[dict]:
                     default=str(settings["harmless_clamp_ratio"]),
                     style=custom_style,
                 ).ask()
-                try:
+                with contextlib.suppress(ValueError, TypeError):
                     settings["harmless_clamp_ratio"] = float(ratio)
-                except (ValueError, TypeError):
-                    pass
 
     # Validate settings
     is_valid, errors = validate_config_settings(settings)
@@ -1864,10 +1954,7 @@ def _view_training_configs():
     display_training_config_list(configs)
 
     # Offer to view details
-    choices = [
-        questionary.Choice(f"{c['name']}", value=c["filename"])
-        for c in configs if "error" not in c
-    ]
+    choices = [questionary.Choice(f"{c['name']}", value=c["filename"]) for c in configs if "error" not in c]
     choices.append(questionary.Choice("Back", value="back"))
 
     selected = questionary.select(
@@ -1892,10 +1979,7 @@ def _edit_training_config():
         return
 
     # Select config to edit
-    choices = [
-        questionary.Choice(f"{c['name']}", value=c["filename"])
-        for c in configs if "error" not in c
-    ]
+    choices = [questionary.Choice(f"{c['name']}", value=c["filename"]) for c in configs if "error" not in c]
     choices.append(questionary.Choice("Back", value="back"))
 
     console.print()
@@ -1967,10 +2051,7 @@ def _delete_training_config():
         return
 
     # Select config to delete
-    choices = [
-        questionary.Choice(f"{c['name']}", value=c["filename"])
-        for c in configs
-    ]
+    choices = [questionary.Choice(f"{c['name']}", value=c["filename"]) for c in configs]
     choices.append(questionary.Choice("Back", value="back"))
 
     console.print()
@@ -2010,7 +2091,7 @@ def _delete_training_config():
         console.print(f"[{THEME['muted']}]Deletion cancelled (name didn't match).[/{THEME['muted']}]")
 
 
-def _select_training_config_for_abliteration() -> Optional[dict]:
+def _select_training_config_for_abliteration() -> dict | None:
     """Select a training config to use for abliteration. Returns config settings or None."""
     configs = list_configs()
 
@@ -2024,7 +2105,8 @@ def _select_training_config_for_abliteration() -> Optional[dict]:
     # Select config
     choices = [
         questionary.Choice(f"{c['name']} - {c.get('description', '')[:30]}", value=c["filename"])
-        for c in configs if "error" not in c
+        for c in configs
+        if "error" not in c
     ]
     choices.append(questionary.Choice("Back (configure manually)", value="back"))
 
@@ -2087,7 +2169,7 @@ def _prompt_save_config_after_abliteration(config: dict) -> None:
         if name and name.strip():
             name = name.strip()
             break
-        elif name is None:
+        if name is None:
             # User cancelled (Ctrl+C or Esc)
             return
 
@@ -2096,11 +2178,14 @@ def _prompt_save_config_after_abliteration(config: dict) -> None:
         return
 
     # Get description
-    description = questionary.text(
-        "Description (optional):",
-        default="",
-        style=custom_style,
-    ).ask() or ""
+    description = (
+        questionary.text(
+            "Description (optional):",
+            default="",
+            style=custom_style,
+        ).ask()
+        or ""
+    )
 
     # Extract saveable settings
     settings = settings_from_abliteration_config(config)
@@ -2154,7 +2239,7 @@ def run_settings():
         if action == "back" or action is None:
             break
 
-        elif action == "model_paths":
+        if action == "model_paths":
             _manage_model_paths()
 
         elif action == "output_dir":
@@ -2182,6 +2267,7 @@ def run_settings():
             ).ask()
             if confirm:
                 from src.cli_components import get_default_config
+
                 save_config(get_default_config())
                 display_success("Settings reset to defaults!")
 
@@ -2200,6 +2286,7 @@ def _manage_model_paths():
 
         # Display current paths
         from rich.table import Table
+
         table = Table(show_header=True, header_style=f"bold {THEME['primary']}")
         table.add_column("#", style="dim", width=4)
         table.add_column("Path", style=THEME["primary"])
@@ -2226,7 +2313,7 @@ def _manage_model_paths():
         if action == "back" or action is None:
             break
 
-        elif action == "add":
+        if action == "add":
             new_path = questionary.path(
                 "Enter directory path:",
                 only_directories=True,
@@ -2269,7 +2356,7 @@ def _manage_output_dir():
     console.print(f"[{THEME['muted']}]Abliterated models will be saved here by default.[/{THEME['muted']}]")
 
     exists = Path(current_dir).exists()
-    status = f"[green]exists[/green]" if exists else f"[yellow]will be created[/yellow]"
+    status = "[green]exists[/green]" if exists else "[yellow]will be created[/yellow]"
     console.print(f"Status: {status}\n")
 
     change = questionary.confirm(
@@ -2311,7 +2398,7 @@ def _manage_eval_results_dir():
     console.print(f"Current directory: [{THEME['primary']}]{current_dir}[/{THEME['primary']}]")
 
     exists = Path(current_dir).exists()
-    status = f"[green]exists[/green]" if exists else f"[yellow]will be created[/yellow]"
+    status = "[green]exists[/green]" if exists else "[yellow]will be created[/yellow]"
     console.print(f"Status: {status}\n")
 
     change = questionary.confirm(
@@ -2339,9 +2426,7 @@ def _manage_prompts():
     from src.dataset_loader import DATASET_ID, VALID_SPLITS, refresh_cache
 
     console.print(f"\n[bold {THEME['primary']}]Prompts Dataset[/bold {THEME['primary']}]\n")
-    console.print(
-        f"Source: [{THEME['primary']}]https://huggingface.co/datasets/{DATASET_ID}[/{THEME['primary']}]"
-    )
+    console.print(f"Source: [{THEME['primary']}]https://huggingface.co/datasets/{DATASET_ID}[/{THEME['primary']}]")
     console.print(
         f"[{THEME['muted']}]Prompts load lazily from the HuggingFace Hub and are "
         f"cached under ~/.cache/huggingface/datasets.[/{THEME['muted']}]\n"
@@ -2383,10 +2468,7 @@ def _manage_prompts():
         return
 
     if action == "refresh":
-        console.print(
-            f"\n[{THEME['muted']}]Re-downloading all three splits of "
-            f"{DATASET_ID}…[/{THEME['muted']}]"
-        )
+        console.print(f"\n[{THEME['muted']}]Re-downloading all three splits of {DATASET_ID}…[/{THEME['muted']}]")
         try:
             refresh_cache()
             display_success("Dataset cache refreshed.")
@@ -2404,7 +2486,7 @@ def _manage_llama_cpp_path():
     if current_path:
         console.print(f"Current path: [{THEME['primary']}]{current_path}[/{THEME['primary']}]")
         exists = Path(current_path).exists()
-        status = f"[green]exists[/green]" if exists else f"[red]not found[/red]"
+        status = "[green]exists[/green]" if exists else "[red]not found[/red]"
         console.print(f"Status: {status}")
     else:
         console.print(f"[{THEME['muted']}]No path configured (will search common locations)[/{THEME['muted']}]")
@@ -2416,12 +2498,12 @@ def _manage_llama_cpp_path():
     if tools_status["can_convert"]:
         console.print(f"[green]✓[/green] Convert script found: {tools_status['convert_script']}")
     else:
-        console.print(f"[red]✗[/red] Convert script not found")
+        console.print("[red]✗[/red] Convert script not found")
 
     if tools_status["can_quantize"]:
         console.print(f"[green]✓[/green] Quantize tool found: {tools_status['quantize_exe']}")
     else:
-        console.print(f"[yellow]![/yellow] Quantize tool not found (only F16/F32 export available)")
+        console.print("[yellow]![/yellow] Quantize tool not found (only F16/F32 export available)")
 
     console.print()
 
@@ -2439,7 +2521,7 @@ def _manage_llama_cpp_path():
     if action == "back" or action is None:
         return
 
-    elif action == "set":
+    if action == "set":
         new_path = questionary.path(
             "Enter path to llama.cpp directory:",
             default=current_path or "",
@@ -2489,14 +2571,16 @@ def run_first_time_setup():
 
     from rich.panel import Panel
 
-    console.print(Panel(
-        "[bold]Welcome to the Abliteration Toolkit![/bold]\n\n"
-        "This appears to be your first time running the CLI.\n"
-        "Let's set up your configuration.",
-        title="[bold cyan]First-Time Setup[/bold cyan]",
-        border_style="cyan",
-        padding=(1, 2),
-    ))
+    console.print(
+        Panel(
+            "[bold]Welcome to the Abliteration Toolkit![/bold]\n\n"
+            "This appears to be your first time running the CLI.\n"
+            "Let's set up your configuration.",
+            title="[bold cyan]First-Time Setup[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
     console.print()
 
     # Ask about model directories
@@ -2532,6 +2616,7 @@ def run_first_time_setup():
 
     # Build initial config
     from src.cli_components import get_default_config
+
     config = get_default_config()
 
     # Prepend custom paths
@@ -2602,7 +2687,9 @@ def run_first_time_setup():
 
     console.print()
     display_success(f"Configuration saved to: {get_config_path()}")
-    console.print(f"\n[{THEME['muted']}]You can modify these settings anytime from the Settings menu.[/{THEME['muted']}]\n")
+    console.print(
+        f"\n[{THEME['muted']}]You can modify these settings anytime from the Settings menu.[/{THEME['muted']}]\n"
+    )
 
     questionary.press_any_key_to_continue(
         "Press any key to continue to the main menu...",
@@ -2630,7 +2717,7 @@ def main_menu():
                 ("5", "Export to GGUF", "Quantize for llama.cpp"),
                 ("6", "Manage Configs", "Create, edit, delete training configs"),
                 ("7", "Settings", "Configure options"),
-            ]
+            ],
         )
 
         choice = questionary.text(
@@ -2687,60 +2774,128 @@ def main_menu():
 @click.command()
 @click.option("--batch", is_flag=True, help="Run in batch mode (non-interactive)")
 @click.option("--model_path", "-m", type=str, help="Path to input model")
-@click.option("--output_path", "-o", type=str, help="Path for output model (uses config default_output_dir if not specified)")
+@click.option(
+    "--output_path", "-o", type=str, help="Path for output model (uses config default_output_dir if not specified)"
+)
 @click.option("--num_prompts", type=int, default=None, help="Number of prompts to use (default: from config)")
 @click.option("--direction_multiplier", type=float, default=None, help="Ablation strength (default: from config)")
 @click.option("--no_norm_preservation", is_flag=True, help="Disable norm preservation")
 @click.option("--no_filter_prompts", is_flag=True, help="Don't filter prompts by refusal")
 @click.option("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
-@click.option("--dtype", type=click.Choice(["float16", "bfloat16", "float32"]), default=None, help="Precision (default: from config)")
+@click.option(
+    "--dtype",
+    type=click.Choice(["float16", "bfloat16", "float32"]),
+    default=None,
+    help="Precision (default: from config)",
+)
 # Advanced options
 @click.option("--winsorize/--no-winsorize", default=False, help="Enable Winsorization (clips outliers)")
 @click.option("--winsorize-percentile", type=float, default=0.995, help="Winsorize percentile (0.99-0.999)")
 @click.option("--null-space/--no-null-space", default=False, help="Enable null-space constraints")
 @click.option("--null-space-rank-ratio", type=float, default=0.95, help="Null-space SVD rank ratio (0.9-0.99)")
 @click.option("--adaptive-weighting/--no-adaptive-weighting", default=False, help="Enable adaptive layer weighting")
-
-@click.option("--projected/--no-projected", default=True, help="Orthogonalize refusal against harmless direction (recommended)")
+@click.option(
+    "--projected/--no-projected", default=True, help="Orthogonalize refusal against harmless direction (recommended)"
+)
 @click.option("--biprojection/--no-biprojection", default=False, help="Enable biprojection mode")
 @click.option("--per-neuron-norm/--frobenius-norm", default=False, help="Use per-neuron norm preservation")
 @click.option("--target-layers", type=str, default=None, help="Comma-separated layer types (e.g., 'o_proj,down_proj')")
-@click.option("--harmless-boundary/--no-harmless-boundary", default=False, help="Clamp ablation to preserve harmless direction")
+@click.option(
+    "--harmless-boundary/--no-harmless-boundary", default=False, help="Clamp ablation to preserve harmless direction"
+)
 @click.option("--harmless-clamp-ratio", type=float, default=0.1, help="Harmless boundary clamp ratio (0.0-1.0)")
 @click.option("--num-measurement-layers", type=int, default=2, help="Number of high-quality layers for biprojection")
 @click.option("--intervention-start", type=float, default=0.25, help="Intervention range start (0.0-1.0)")
 @click.option("--intervention-end", type=float, default=0.95, help="Intervention range end (0.0-1.0)")
-@click.option("--layer-target-map", type=str, default=None, help="Path to layer_target_map.json for data-driven layer targeting")
-@click.option("--unmapped-layer-behavior", type=click.Choice(["skip", "default"]), default="skip", help="How to handle layers not in target map")
+@click.option(
+    "--layer-target-map", type=str, default=None, help="Path to layer_target_map.json for data-driven layer targeting"
+)
+@click.option(
+    "--unmapped-layer-behavior",
+    type=click.Choice(["skip", "default"]),
+    default="skip",
+    help="How to handle layers not in target map",
+)
 # Dynamic layer targeting
-@click.option("--dynamic-layer-targeting/--no-dynamic-layer-targeting", default=False, help="Extract from ALL layers, apply per-layer directions and null-space projectors")
+@click.option(
+    "--dynamic-layer-targeting/--no-dynamic-layer-targeting",
+    default=False,
+    help="Extract from ALL layers, apply per-layer directions and null-space projectors",
+)
 # Hybrid architecture
-@click.option("--hybrid-strategy", type=click.Choice(["auto", "uniform"]), default="auto", help="Hybrid architecture strategy: auto (recommended) or uniform (legacy)")
-@click.option("--hybrid-full-attn-weight", type=float, default=1.0, help="Ablation weight for full attention layers (0.0-2.0)")
-@click.option("--hybrid-linear-attn-weight", type=float, default=0.4, help="Ablation weight for linear attention layers (0.0-1.0)")
-@click.option("--hybrid-skip-recurrent/--no-hybrid-skip-recurrent", default=True, help="Skip in_proj_a/in_proj_b (recurrent dynamics) during ablation")
-@click.option("--hybrid-skip-state/--no-hybrid-skip-state", default=False, help="Also skip in_proj_qkv/in_proj_z (more conservative)")
+@click.option(
+    "--hybrid-strategy",
+    type=click.Choice(["auto", "uniform"]),
+    default="auto",
+    help="Hybrid architecture strategy: auto (recommended) or uniform (legacy)",
+)
+@click.option(
+    "--hybrid-full-attn-weight", type=float, default=1.0, help="Ablation weight for full attention layers (0.0-2.0)"
+)
+@click.option(
+    "--hybrid-linear-attn-weight", type=float, default=0.4, help="Ablation weight for linear attention layers (0.0-1.0)"
+)
+@click.option(
+    "--hybrid-skip-recurrent/--no-hybrid-skip-recurrent",
+    default=True,
+    help="Skip in_proj_a/in_proj_b (recurrent dynamics) during ablation",
+)
+@click.option(
+    "--hybrid-skip-state/--no-hybrid-skip-state",
+    default=False,
+    help="Also skip in_proj_qkv/in_proj_z (more conservative)",
+)
 # KL divergence monitoring
 @click.option("--kl-monitor/--no-kl-monitor", default=False, help="Report KL divergence after abliteration")
 @click.option("--kl-num-prompts", type=int, default=50, help="Number of reference prompts for KL (preservation split)")
 @click.option("--kl-top-k", type=int, default=200, help="Top-k tokens for KL approximation")
-@click.option("--kl-auto-tune/--no-kl-auto-tune", default=False, help="Binary search for best multiplier within KL budget")
+@click.option(
+    "--kl-auto-tune/--no-kl-auto-tune", default=False, help="Binary search for best multiplier within KL budget"
+)
 @click.option("--kl-threshold", type=float, default=0.5, help="Max mean KL divergence (nats) for auto-tune")
 @click.option("--kl-search-min", type=float, default=0.1, help="Auto-tune search range minimum")
 @click.option("--kl-search-max", type=float, default=2.0, help="Auto-tune search range maximum")
-def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
-        no_norm_preservation, no_filter_prompts, device, dtype,
-        winsorize, winsorize_percentile, null_space,
-        null_space_rank_ratio, adaptive_weighting,
-        projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
-        harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end,
-        layer_target_map, unmapped_layer_behavior, dynamic_layer_targeting,
-        hybrid_strategy, hybrid_full_attn_weight, hybrid_linear_attn_weight,
-        hybrid_skip_recurrent, hybrid_skip_state,
-        kl_monitor, kl_num_prompts, kl_top_k,
-        kl_auto_tune, kl_threshold, kl_search_min, kl_search_max):
-    """
-    Abliteration Toolkit - Remove refusal behavior from language models.
+def cli(
+    batch,
+    model_path,
+    output_path,
+    num_prompts,
+    direction_multiplier,
+    no_norm_preservation,
+    no_filter_prompts,
+    device,
+    dtype,
+    winsorize,
+    winsorize_percentile,
+    null_space,
+    null_space_rank_ratio,
+    adaptive_weighting,
+    projected,
+    biprojection,
+    per_neuron_norm,
+    target_layers,
+    harmless_boundary,
+    harmless_clamp_ratio,
+    num_measurement_layers,
+    intervention_start,
+    intervention_end,
+    layer_target_map,
+    unmapped_layer_behavior,
+    dynamic_layer_targeting,
+    hybrid_strategy,
+    hybrid_full_attn_weight,
+    hybrid_linear_attn_weight,
+    hybrid_skip_recurrent,
+    hybrid_skip_state,
+    kl_monitor,
+    kl_num_prompts,
+    kl_top_k,
+    kl_auto_tune,
+    kl_threshold,
+    kl_search_min,
+    kl_search_max,
+):
+    r"""Abliteration Toolkit - Remove refusal behavior from language models.
 
     Run without arguments for interactive mode, or use --batch for automation.
 
@@ -2784,7 +2939,9 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
 
         # Use config defaults for any unspecified values
         effective_num_prompts = num_prompts if num_prompts is not None else get_default_num_prompts()
-        effective_multiplier = direction_multiplier if direction_multiplier is not None else get_default_direction_multiplier()
+        effective_multiplier = (
+            direction_multiplier if direction_multiplier is not None else get_default_direction_multiplier()
+        )
         effective_dtype = dtype if dtype is not None else get_default_dtype()
 
         # Construct output path from config if not specified
@@ -2807,6 +2964,7 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
 
         if layer_target_map:
             from src.abliterate import load_layer_target_map
+
             try:
                 target_map_data = load_layer_target_map(layer_target_map)
                 per_layer_multipliers = target_map_data["per_layer_multipliers"]
@@ -2815,7 +2973,9 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
 
                 # Layer target map overrides adaptive weighting
                 if adaptive_weighting:
-                    console.print(f"[{THEME['warning']}]Warning: --layer-target-map overrides --adaptive-weighting[/{THEME['warning']}]")
+                    console.print(
+                        f"[{THEME['warning']}]Warning: --layer-target-map overrides --adaptive-weighting[/{THEME['warning']}]"
+                    )
 
             except Exception as e:
                 console.print(f"[red]Error loading layer target map: {e}[/red]")

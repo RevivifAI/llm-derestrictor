@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Abliteration Parameter Search
+"""Abliteration Parameter Search.
 
 Iteratively searches for optimal abliteration parameters by:
 1. Establishing baseline scores on the original model
@@ -12,15 +11,12 @@ Iteratively searches for optimal abliteration parameters by:
 import argparse
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -43,19 +39,15 @@ class SearchConfig:
 
     base_model_path: str
     output_dir: str
-    baseline_scores_path: Optional[str] = None  # Pre-computed baseline scores JSON
+    baseline_scores_path: str | None = None  # Pre-computed baseline scores JSON
 
     # Search space
-    direction_multipliers: list[float] = field(
-        default_factory=lambda: [0.5, 0.7, 0.8, 0.9, 1.0]
-    )
+    direction_multipliers: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.8, 0.9, 1.0])
     num_prompts_list: list[int] = field(default_factory=lambda: [25, 50, 100])
     prompt_sets: list[str] = field(default_factory=list)  # List of prompt file prefixes
 
     # Evaluation settings
-    eval_tasks: list[str] = field(
-        default_factory=lambda: ["hellaswag", "arc_easy", "winogrande"]
-    )
+    eval_tasks: list[str] = field(default_factory=lambda: ["hellaswag", "arc_easy", "winogrande"])
     eval_limit: int = 500  # Samples per task for quick eval
     full_eval_limit: int = 0  # 0 = no limit (full eval for best candidates)
 
@@ -106,12 +98,11 @@ def run_lm_eval(
     model_path: str,
     tasks: list[str],
     limit: int = 0,
-    output_path: Optional[str] = None,
+    output_path: str | None = None,
     device: str = "cuda",
     dtype: str = "float16",
 ) -> dict[str, float]:
-    """
-    Run lm-evaluation-harness on a model and return scores.
+    """Run lm-evaluation-harness on a model and return scores.
 
     Returns:
         Dictionary mapping task names to their primary metric scores.
@@ -150,8 +141,7 @@ def run_lm_eval(
         )
 
         # Parse scores from output
-        scores = parse_lm_eval_output(result.stdout)
-        return scores
+        return parse_lm_eval_output(result.stdout)
 
     except subprocess.CalledProcessError as e:
         logger.error(f"lm_eval failed: {e.stderr}")
@@ -198,8 +188,7 @@ def test_refusal_rate(
     device: str = "cuda",
     dtype: str = "float16",
 ) -> tuple[float, list[dict]]:
-    """
-    Test a model's refusal rate on a set of prompts.
+    """Test a model's refusal rate on a set of prompts.
 
     Returns:
         Tuple of (refusal_rate, list of result dicts)
@@ -251,9 +240,7 @@ def test_refusal_rate(
         for prompt in test_prompts:
             if hasattr(tokenizer, "apply_chat_template"):
                 messages = [{"role": "user", "content": prompt}]
-                formatted = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             else:
                 formatted = prompt
 
@@ -267,7 +254,7 @@ def test_refusal_rate(
 
             response = tokenizer.decode(outputs[0], skip_special_tokens=True)
             if formatted in response:
-                response = response[len(formatted):]
+                response = response[len(formatted) :]
 
             # Check for refusal
             response_lower = response.lower()
@@ -276,11 +263,13 @@ def test_refusal_rate(
             if is_refusal:
                 refusals += 1
 
-            results.append({
-                "prompt": prompt,
-                "response": response[:500],
-                "refused": is_refusal,
-            })
+            results.append(
+                {
+                    "prompt": prompt,
+                    "response": response[:500],
+                    "refused": is_refusal,
+                }
+            )
 
     # Clean up
     del model
@@ -293,15 +282,14 @@ def test_refusal_rate(
 
 
 def get_baseline_scores(config: SearchConfig) -> tuple[dict[str, float], float]:
-    """
-    Get or compute baseline scores for the original model.
+    """Get or compute baseline scores for the original model.
 
     Returns:
         Tuple of (task_scores dict, baseline_refusal_rate)
     """
     if config.baseline_scores_path and Path(config.baseline_scores_path).exists():
         logger.info(f"Loading baseline scores from {config.baseline_scores_path}")
-        with open(config.baseline_scores_path, encoding="utf-8") as f:
+        with Path(config.baseline_scores_path).open(encoding="utf-8") as f:
             data = json.load(f)
         return data["scores"], data["refusal_rate"]
 
@@ -327,7 +315,7 @@ def get_baseline_scores(config: SearchConfig) -> tuple[dict[str, float], float]:
     # Save for future use
     baseline_path = Path(config.output_dir) / "baseline_scores.json"
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(baseline_path, "w", encoding="utf-8") as f:
+    with baseline_path.open("w", encoding="utf-8") as f:
         json.dump({"scores": scores, "refusal_rate": refusal_rate}, f, indent=2)
     logger.info(f"Saved baseline scores to {baseline_path}")
 
@@ -368,8 +356,7 @@ def run_single_abliteration(
 
 
 def search_parameters(config: SearchConfig) -> list[EvalResult]:
-    """
-    Search for optimal abliteration parameters.
+    """Search for optimal abliteration parameters.
 
     Returns:
         List of EvalResult objects sorted by quality (best first).
@@ -393,13 +380,14 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
     results = []
 
     # Generate parameter combinations
-    param_combinations = []
-    for mult in config.direction_multipliers:
-        for num_prompts in config.num_prompts_list:
-            param_combinations.append({
-                "direction_multiplier": mult,
-                "num_prompts": num_prompts,
-            })
+    param_combinations = [
+        {
+            "direction_multiplier": mult,
+            "num_prompts": num_prompts,
+        }
+        for mult in config.direction_multipliers
+        for num_prompts in config.num_prompts_list
+    ]
 
     logger.info(f"Testing {len(param_combinations)} parameter combinations...")
 
@@ -410,7 +398,7 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
         logger.info("=" * 60)
 
         # Create unique output path for this trial
-        trial_name = f"trial_{i+1}_mult{params['direction_multiplier']}_n{params['num_prompts']}"
+        trial_name = f"trial_{i + 1}_mult{params['direction_multiplier']}_n{params['num_prompts']}"
         trial_path = output_dir / trial_name
 
         try:
@@ -453,10 +441,7 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
                 refusal_reduction = 0.0 if refusal_rate == 0 else -1.0
 
             # Check if this trial passes thresholds
-            passed = (
-                acc_delta >= -config.max_acc_delta
-                and refusal_reduction >= config.min_refusal_reduction
-            )
+            passed = acc_delta >= -config.max_acc_delta and refusal_reduction >= config.min_refusal_reduction
 
             result = EvalResult(
                 params=params,
@@ -479,17 +464,21 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
 
             # Save trial results
             trial_results_path = trial_path / "search_results.json"
-            with open(trial_results_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "params": params,
-                    "scores": scores,
-                    "mean_score": mean_score,
-                    "refusal_rate": refusal_rate,
-                    "acc_delta": acc_delta,
-                    "refusal_reduction": refusal_reduction,
-                    "passed": passed,
-                    "refusal_test_results": refusal_results,
-                }, f, indent=2)
+            with trial_results_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "params": params,
+                        "scores": scores,
+                        "mean_score": mean_score,
+                        "refusal_rate": refusal_rate,
+                        "acc_delta": acc_delta,
+                        "refusal_reduction": refusal_reduction,
+                        "passed": passed,
+                        "refusal_test_results": refusal_results,
+                    },
+                    f,
+                    indent=2,
+                )
 
             # Clean up failed trials to save disk space (optional)
             if not passed and config.full_eval_limit > 0:
@@ -498,17 +487,19 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
 
         except Exception as e:
             logger.error(f"Trial {i + 1} failed with error: {e}")
-            results.append(EvalResult(
-                params=params,
-                scores={},
-                mean_score=0.0,
-                refusal_rate=1.0,
-                acc_delta=-1.0,
-                refusal_reduction=-1.0,
-                passed=False,
-                model_path="",
-                timestamp=datetime.now().isoformat(),
-            ))
+            results.append(
+                EvalResult(
+                    params=params,
+                    scores={},
+                    mean_score=0.0,
+                    refusal_rate=1.0,
+                    acc_delta=-1.0,
+                    refusal_reduction=-1.0,
+                    passed=False,
+                    model_path="",
+                    timestamp=datetime.now().isoformat(),
+                )
+            )
 
     # Sort results by quality
     # Prioritize: passed > refusal_reduction > acc_delta (less negative is better)
@@ -530,7 +521,7 @@ def print_summary(results: list[EvalResult], config: SearchConfig):
     print(f"Passed: {len(passed)}")
     print(f"Failed: {len(failed)}")
 
-    print(f"\nThresholds:")
+    print("\nThresholds:")
     print(f"  Max accuracy delta: {config.max_acc_delta:.1%}")
     print(f"  Min refusal reduction: {config.min_refusal_reduction:.1%}")
 
@@ -576,6 +567,7 @@ def print_summary(results: list[EvalResult], config: SearchConfig):
 
 
 def main():
+    """Command-line entry point for grid-searching abliteration parameters."""
     parser = argparse.ArgumentParser(
         description="Search for optimal abliteration parameters",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -695,7 +687,7 @@ Examples:
 
     # Save all results
     results_path = Path(config.output_dir) / "all_results.json"
-    with open(results_path, "w", encoding="utf-8") as f:
+    with results_path.open("w", encoding="utf-8") as f:
         json.dump(
             [
                 {

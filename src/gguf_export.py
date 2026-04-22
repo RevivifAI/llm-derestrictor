@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-GGUF Export Module
+"""GGUF Export Module.
 
 Handles conversion of HuggingFace models to GGUF format and quantization.
 Requires llama.cpp tools: convert_hf_to_gguf.py and llama-quantize
@@ -8,17 +7,19 @@ Supports Vision-Language (VL) models with mmproj export.
 """
 
 import json
+import logging
 import os
 import shutil
+import struct
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Callable
 
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
+logger = logging.getLogger(__name__)
 
 # Vision model architecture identifiers
 VL_ARCHITECTURES = [
@@ -47,33 +48,36 @@ VL_NAME_KEYWORDS = ["vl", "vision", "llava", "visual", "minicpm-v", "internvl", 
 @dataclass
 class GGUFExportConfig:
     """Configuration for GGUF export."""
+
     model_path: Path
     output_dir: Path
     quant_type: str = "F16"
-    llama_cpp_path: Optional[Path] = None
-    model_name: Optional[str] = None
+    llama_cpp_path: Path | None = None
+    model_name: str | None = None
     # VL model options
-    is_vision_model: Optional[bool] = None  # Auto-detect if None
+    is_vision_model: bool | None = None  # Auto-detect if None
     export_mmproj: bool = True  # Export mmproj for VL models
     mmproj_quant_type: str = "f16"  # Quantization for mmproj (usually f16)
-    original_model_path: Optional[Path] = None  # Original model path for mmproj (if abliterated)
+    original_model_path: Path | None = None  # Original model path for mmproj (if abliterated)
 
 
 @dataclass
 class GGUFTools:
     """Paths to GGUF conversion tools."""
+
     convert_script: Path
-    quantize_exe: Optional[Path] = None
-    mmproj_script: Optional[Path] = None  # For VL model vision encoder
+    quantize_exe: Path | None = None
+    mmproj_script: Path | None = None  # For VL model vision encoder
 
 
 @dataclass
 class GGUFExportResult:
     """Result of GGUF export operation."""
+
     success: bool
     message: str
-    model_path: Optional[Path] = None
-    mmproj_path: Optional[Path] = None
+    model_path: Path | None = None
+    mmproj_path: Path | None = None
     is_vision_model: bool = False
 
 
@@ -95,63 +99,84 @@ QUANT_TYPES = {
 }
 
 # Types that require conversion first (to F16), then quantization
-QUANT_ONLY_TYPES = ["Q8_0", "Q6_K_XL", "Q6_K", "Q5_K_KM", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q3_K_M", "Q3_K_S", "Q2_K"]
+QUANT_ONLY_TYPES = [
+    "Q8_0",
+    "Q6_K_XL",
+    "Q6_K",
+    "Q5_K_KM",
+    "Q5_K_M",
+    "Q5_K_S",
+    "Q4_K_M",
+    "Q4_K_S",
+    "Q3_K_M",
+    "Q3_K_S",
+    "Q2_K",
+]
 
 
 def _has_vision_weights(model_path: Path) -> bool:
-    """
-    Check if a model has actual vision encoder weights in its files.
+    """Check if a model has actual vision encoder weights in its files.
+
     This is the definitive test for VL capability.
     """
     # Check safetensors index for vision-related weight names
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
+            with index_path.open(encoding="utf-8") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
             # Look for vision encoder weight prefixes
             vision_prefixes = [
-                "vision_tower", "vision_model", "visual_encoder",
-                "vision_encoder", "image_encoder", "vit.", "visual.",
-                "model.vision_tower", "model.vision_model",
+                "vision_tower",
+                "vision_model",
+                "visual_encoder",
+                "vision_encoder",
+                "image_encoder",
+                "vit.",
+                "visual.",
+                "model.vision_tower",
+                "model.vision_model",
             ]
-            for weight_name in weight_map.keys():
+            for weight_name in weight_map:
                 weight_lower = weight_name.lower()
                 if any(prefix in weight_lower for prefix in vision_prefixes):
                     return True
-        except:
-            pass
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("Failed to inspect safetensors index at %s: %s", index_path, exc)
 
     # Check single safetensors file
     single_safetensors = model_path / "model.safetensors"
     if single_safetensors.exists():
         try:
             # Read header only (first 8 bytes = header size, then JSON header)
-            import struct
-            with open(single_safetensors, "rb") as f:
+            with single_safetensors.open("rb") as f:
                 header_size = struct.unpack("<Q", f.read(8))[0]
                 header_json = f.read(header_size).decode("utf-8")
                 header = json.loads(header_json)
                 vision_prefixes = [
-                    "vision_tower", "vision_model", "visual_encoder",
-                    "vision_encoder", "image_encoder", "vit.", "visual.",
+                    "vision_tower",
+                    "vision_model",
+                    "visual_encoder",
+                    "vision_encoder",
+                    "image_encoder",
+                    "vit.",
+                    "visual.",
                 ]
-                for weight_name in header.keys():
+                for weight_name in header:
                     if weight_name == "__metadata__":
                         continue
                     weight_lower = weight_name.lower()
                     if any(prefix in weight_lower for prefix in vision_prefixes):
                         return True
-        except:
-            pass
+        except (OSError, struct.error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.debug("Failed to inspect safetensors header at %s: %s", single_safetensors, exc)
 
     return False
 
 
-def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
-    """
-    Detect if a model is a Vision-Language (VL) model.
+def detect_vision_model(model_path: Path) -> tuple[bool, str | None]:
+    """Detect if a model is a Vision-Language (VL) model.
 
     Uses a two-stage approach:
     1. First checks if architecture/config/name suggests VL capability
@@ -180,7 +205,7 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
                 break
     else:
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with config_path.open(encoding="utf-8") as f:
                 config = json.load(f)
 
             # Check architectures field
@@ -200,11 +225,10 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
                     is_vl_architecture = True
 
             # Check for vision_config in config
-            if not is_vl_architecture:
-                if "vision_config" in config or "visual" in config:
-                    is_vl_architecture = True
+            if not is_vl_architecture and ("vision_config" in config or "visual" in config):
+                is_vl_architecture = True
 
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
         # Fall back to name-based detection
@@ -220,16 +244,14 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
     if is_vl_architecture:
         if _has_vision_weights(model_path):
             return True, arch_name
-        else:
-            # Architecture suggests VL but no vision weights found
-            return False, None
+        # Architecture suggests VL but no vision weights found
+        return False, None
 
     return False, None
 
 
 def has_vision_files(model_path: Path) -> bool:
-    """
-    Check if a model directory has the vision encoder files needed for mmproj export.
+    """Check if a model directory has the vision encoder files needed for mmproj export.
 
     Args:
         model_path: Path to the model directory
@@ -242,16 +264,12 @@ def has_vision_files(model_path: Path) -> bool:
         "preprocessor_config.json",
     ]
 
-    for f in required_files:
-        if not (model_path / f).exists():
-            return False
-
-    return True
+    return all((model_path / f).exists() for f in required_files)
 
 
-def find_llama_cpp_path() -> Optional[Path]:
-    """
-    Attempt to find the llama.cpp installation directory.
+def find_llama_cpp_path() -> Path | None:
+    """Attempt to find the llama.cpp installation directory.
+
     Checks common locations and environment variables.
     """
     # Check environment variable first
@@ -284,10 +302,8 @@ def find_llama_cpp_path() -> Optional[Path]:
     return None
 
 
-def find_convert_script(llama_cpp_path: Optional[Path] = None) -> Optional[Path]:
-    """
-    Find the convert_hf_to_gguf.py script.
-    """
+def find_convert_script(llama_cpp_path: Path | None = None) -> Path | None:
+    """Find the convert_hf_to_gguf.py script."""
     # If llama_cpp_path provided, check there first
     if llama_cpp_path:
         script = llama_cpp_path / "convert_hf_to_gguf.py"
@@ -315,10 +331,8 @@ def find_convert_script(llama_cpp_path: Optional[Path] = None) -> Optional[Path]
     return None
 
 
-def find_llama_quantize(llama_cpp_path: Optional[Path] = None) -> Optional[Path]:
-    """
-    Find the llama-quantize executable.
-    """
+def find_llama_quantize(llama_cpp_path: Path | None = None) -> Path | None:
+    """Find the llama-quantize executable."""
     # Check PATH first
     quantize_path = shutil.which("llama-quantize")
     if quantize_path:
@@ -358,9 +372,9 @@ def find_llama_quantize(llama_cpp_path: Optional[Path] = None) -> Optional[Path]
     return None
 
 
-def find_mmproj_script(llama_cpp_path: Optional[Path] = None) -> Optional[Path]:
-    """
-    Find the mmproj/vision encoder conversion script for VL models.
+def find_mmproj_script(llama_cpp_path: Path | None = None) -> Path | None:
+    """Find the mmproj/vision encoder conversion script for VL models.
+
     Different VL model families may use different scripts.
     """
     # The main convert_hf_to_gguf.py now handles most VL models directly
@@ -392,9 +406,9 @@ def find_mmproj_script(llama_cpp_path: Optional[Path] = None) -> Optional[Path]:
     return None
 
 
-def find_gguf_tools(llama_cpp_path: Optional[Path] = None) -> Optional[GGUFTools]:
-    """
-    Find all required GGUF conversion tools.
+def find_gguf_tools(llama_cpp_path: Path | None = None) -> GGUFTools | None:
+    """Find all required GGUF conversion tools.
+
     Returns GGUFTools if convert script found, None otherwise.
     """
     convert_script = find_convert_script(llama_cpp_path)
@@ -417,10 +431,9 @@ def convert_hf_to_gguf(
     convert_script: Path,
     outtype: str = "f16",
     is_vision_model: bool = False,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> bool:
-    """
-    Convert a HuggingFace model to GGUF format.
+    """Convert a HuggingFace model to GGUF format.
 
     Args:
         model_path: Path to the HuggingFace model directory
@@ -435,16 +448,17 @@ def convert_hf_to_gguf(
     """
     # Determine if script needs python interpreter
     cmd = []
-    if convert_script.suffix == ".py":
-        cmd = [sys.executable, str(convert_script)]
-    else:
-        cmd = [str(convert_script)]
+    cmd = [sys.executable, str(convert_script)] if convert_script.suffix == ".py" else [str(convert_script)]
 
-    cmd.extend([
-        str(model_path),
-        "--outfile", str(output_path),
-        "--outtype", outtype,
-    ])
+    cmd.extend(
+        [
+            str(model_path),
+            "--outfile",
+            str(output_path),
+            "--outtype",
+            outtype,
+        ]
+    )
 
     # Add --mmproj flag for vision models to export multimodal projector
     if is_vision_model:
@@ -458,8 +472,8 @@ def convert_hf_to_gguf(
             cmd,
             capture_output=True,
             text=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
 
@@ -492,7 +506,7 @@ def convert_hf_to_gguf(
 
     except Exception as e:
         if progress_callback:
-            progress_callback(f"Exception: {str(e)}")
+            progress_callback(f"Exception: {e!s}")
         return False
 
 
@@ -501,10 +515,9 @@ def quantize_gguf(
     output_gguf: Path,
     quant_type: str,
     quantize_exe: Path,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> bool:
-    """
-    Quantize a GGUF file to a specific quantization type.
+    """Quantize a GGUF file to a specific quantization type.
 
     Args:
         input_gguf: Path to the input F16/F32 GGUF file
@@ -531,8 +544,8 @@ def quantize_gguf(
             cmd,
             capture_output=True,
             text=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
 
@@ -545,7 +558,7 @@ def quantize_gguf(
 
     except Exception as e:
         if progress_callback:
-            progress_callback(f"Exception: {str(e)}")
+            progress_callback(f"Exception: {e!s}")
         return False
 
 
@@ -553,10 +566,9 @@ def convert_vision_encoder(
     model_path: Path,
     output_path: Path,
     convert_script: Path,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> bool:
-    """
-    Convert vision encoder to mmproj GGUF for VL models.
+    """Convert vision encoder to mmproj GGUF for VL models.
 
     Modern llama.cpp's convert_hf_to_gguf.py handles this automatically
     for most VL models, but this function can be used for manual control.
@@ -571,16 +583,17 @@ def convert_vision_encoder(
         True if successful, False otherwise
     """
     cmd = []
-    if convert_script.suffix == ".py":
-        cmd = [sys.executable, str(convert_script)]
-    else:
-        cmd = [str(convert_script)]
+    cmd = [sys.executable, str(convert_script)] if convert_script.suffix == ".py" else [str(convert_script)]
 
-    cmd.extend([
-        str(model_path),
-        "--outfile", str(output_path),
-        "--outtype", "f16",
-    ])
+    cmd.extend(
+        [
+            str(model_path),
+            "--outfile",
+            str(output_path),
+            "--outtype",
+            "f16",
+        ]
+    )
 
     if progress_callback:
         progress_callback(f"Converting vision encoder: {' '.join(cmd)}")
@@ -590,8 +603,8 @@ def convert_vision_encoder(
             cmd,
             capture_output=True,
             text=True,
-            encoding='utf-8',
-            errors='replace',
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
 
@@ -604,17 +617,17 @@ def convert_vision_encoder(
 
     except Exception as e:
         if progress_callback:
-            progress_callback(f"Vision encoder exception: {str(e)}")
+            progress_callback(f"Vision encoder exception: {e!s}")
         return False
 
 
 def export_to_gguf(
     config: GGUFExportConfig,
-    console: Optional[Console] = None,
-    progress_callback: Optional[Callable[[str], None]] = None,
-) -> tuple[bool, str, Optional[Path]]:
-    """
-    Export a HuggingFace model to GGUF format with optional quantization.
+    console: Console | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[bool, str, Path | None]:
+    """Export a HuggingFace model to GGUF format with optional quantization.
+
     Automatically detects and handles Vision-Language (VL) models.
 
     Args:
@@ -626,6 +639,7 @@ def export_to_gguf(
         Tuple of (success, message, output_path)
         For VL models, check for mmproj file at: {output_dir}/{model_name}-mmproj-f16.gguf
     """
+
     def log(msg: str):
         if progress_callback:
             progress_callback(msg)
@@ -646,7 +660,7 @@ def export_to_gguf(
         is_vl_model, vl_architecture = detect_vision_model(config.model_path)
 
     if is_vl_model:
-        log(f"Detected Vision-Language model" + (f" ({vl_architecture})" if vl_architecture else ""))
+        log("Detected Vision-Language model" + (f" ({vl_architecture})" if vl_architecture else ""))
 
     # Check if quantization is needed and tool is available
     needs_quantization = config.quant_type in QUANT_ONLY_TYPES
@@ -677,17 +691,14 @@ def export_to_gguf(
     mmproj_output = config.output_dir / f"mmproj-{model_name}-f16.gguf"
 
     # Determine if we can export mmproj and from which model
-    can_export_mmproj = False
     mmproj_source_path = None
 
     if is_vl_model and config.export_mmproj:
         # Check if main model has vision files
         if has_vision_files(config.model_path):
-            can_export_mmproj = True
             mmproj_source_path = config.model_path
             log("Model has vision files, will export mmproj")
         elif config.original_model_path and has_vision_files(config.original_model_path):
-            can_export_mmproj = True
             mmproj_source_path = config.original_model_path
             log(f"Using original model for mmproj: {config.original_model_path}")
         else:
@@ -708,7 +719,7 @@ def export_to_gguf(
     )
 
     if not success:
-        return False, f"Failed to convert model to GGUF format.", None
+        return False, "Failed to convert model to GGUF format.", None
 
     log(f"Created: {f16_output}")
 
@@ -806,13 +817,13 @@ def export_to_gguf(
 
 def export_all_quants(
     config: GGUFExportConfig,
-    quant_types: Optional[list[str]] = None,
+    quant_types: list[str] | None = None,
     keep_f16: bool = True,
-    console: Optional[Console] = None,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    console: Console | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[bool, str, list[Path]]:
-    """
-    Export a model to all GGUF quantization types.
+    """Export a model to all GGUF quantization types.
+
     Converts to F16 once, then quantizes to each type.
 
     Args:
@@ -825,6 +836,7 @@ def export_all_quants(
     Returns:
         Tuple of (success, message, list of output paths)
     """
+
     def log(msg: str):
         if progress_callback:
             progress_callback(msg)
@@ -936,14 +948,12 @@ def export_all_quants(
     if failed_quants:
         msg = f"Exported {success_count}/{total_count} quants. Failed: {', '.join(failed_quants)}"
         return len(output_paths) > 0, msg, output_paths
-    else:
-        msg = f"Successfully exported {success_count} quant types to {config.output_dir}"
-        return True, msg, output_paths
+    msg = f"Successfully exported {success_count} quant types to {config.output_dir}"
+    return True, msg, output_paths
 
 
-def check_tools_available(llama_cpp_path: Optional[Path] = None) -> dict:
-    """
-    Check which GGUF tools are available.
+def check_tools_available(llama_cpp_path: Path | None = None) -> dict:
+    """Check which GGUF tools are available.
 
     Returns:
         Dictionary with tool availability status

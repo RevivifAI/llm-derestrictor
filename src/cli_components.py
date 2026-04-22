@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Rich CLI Components for Abliteration Toolkit
+"""Rich CLI Components for Abliteration Toolkit.
 
 Reusable UI components for the interactive CLI including:
 - ASCII art banner with gradient colors
@@ -14,13 +13,29 @@ Reusable UI components for the interactive CLI including:
 import json
 import re
 from pathlib import Path
-from typing import Callable, Optional
 
 import psutil
 import torch
-
+from rich.align import Align
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.style import Style
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
 
 # Configuration Management
+
 
 def get_config_dir() -> Path:
     """Get the configuration directory path."""
@@ -70,13 +85,13 @@ def load_config() -> dict:
 
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with config_path.open(encoding="utf-8") as f:
                 user_config = json.load(f)
             # Merge with defaults to ensure all keys exist
             config = get_default_config()
             config.update(user_config)
             return config
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             # Return defaults if file is corrupted
             return get_default_config()
     else:
@@ -89,7 +104,7 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     """Save configuration to file."""
     config_path = get_config_path()
-    with open(config_path, "w", encoding="utf-8") as f:
+    with config_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
 
@@ -167,8 +182,7 @@ def get_default_dtype() -> str:
 
 
 def get_versioned_path(path: Path | str) -> Path:
-    """
-    Get a versioned path if the original path already exists.
+    """Get a versioned path if the original path already exists.
 
     If the path doesn't exist, returns it unchanged.
     If the path exists, appends _v2, _v3, etc. until finding an available name.
@@ -194,7 +208,7 @@ def get_versioned_path(path: Path | str) -> Path:
     parent = path.parent
 
     # Check if the name already has a version suffix
-    version_match = re.match(r'^(.+)_v(\d+)$', base_name)
+    version_match = re.match(r"^(.+)_v(\d+)$", base_name)
     if version_match:
         # Already versioned, increment from that version
         base_name = version_match.group(1)
@@ -218,24 +232,6 @@ def get_versioned_path(path: Path | str) -> Path:
 
 # Rich UI Components
 
-from rich.align import Align
-from rich.console import Console, Group
-from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.style import Style
-from rich.table import Table
-from rich.text import Text
-from rich.theme import Theme
-
 # Theme colors
 THEME = {
     "primary": "cyan",
@@ -248,18 +244,20 @@ THEME = {
 }
 
 # Custom theme for consistent black background
-custom_theme = Theme({
-    "info": "cyan",
-    "warning": "yellow",
-    "error": "red",
-})
+custom_theme = Theme(
+    {
+        "info": "cyan",
+        "warning": "yellow",
+        "error": "red",
+    }
+)
 
 # ASCII Art Banner
 BANNER = r"""
- _______  ______   _       __________________ _______  _______  _______ _________ _______ 
+ _______  ______   _       __________________ _______  _______  _______ _________ _______
 (  ___  )(  ___ \ ( \      \__   __/\__   __/(  ____ \(  ____ )(  ___  )\__   __/(  ____ \
 | (   ) || (   ) )| (         ) (      ) (   | (    \/| (    )|| (   ) |   ) (   | (    \/
-| (___) || (__/ / | |         | |      | |   | (__    | (____)|| (___) |   | |   | (__ 
+| (___) || (__/ / | |         | |      | |   | (__    | (____)|| (___) |   | |   | (__
 |  ___  ||  __ (  | |         | |      | |   |  __)   |     __)|  ___  |   | |   |  __)
 | (   ) || (  \ \ | |         | |      | |   | (      | (\ (   | (   ) |   | |   | (
 | )   ( || )___) )| (____/\___) (___   | |   | (____/\| ) \ \__| )   ( |   | |   | (____/\
@@ -273,7 +271,7 @@ console = Console(theme=custom_theme, force_terminal=True, style="on black")
 BANNER_COLORS = ["#ff8c00", "#ffa500", "#ffb732", "#ffc966", "#ffd700", "#ffdf00", "#ffe135", "#ffd700"]
 
 
-def get_gradient_text(text: str, colors: list[str] = None) -> Text:
+def get_gradient_text(text: str, colors: list[str] | None = None) -> Text:
     """Create gradient-colored text."""
     if colors is None:
         colors = BANNER_COLORS
@@ -332,10 +330,7 @@ def display_system_info():
 
     if info["cuda_available"]:
         table.add_row("GPU", info["cuda_device_name"])
-        table.add_row(
-            "VRAM",
-            f"{info['cuda_memory_used']:.1f} / {info['cuda_memory_total']:.1f} GB"
-        )
+        table.add_row("VRAM", f"{info['cuda_memory_used']:.1f} / {info['cuda_memory_total']:.1f} GB")
     else:
         table.add_row("GPU", "Not available (CPU mode)")
 
@@ -376,7 +371,7 @@ def display_menu(title: str, options: list[tuple[str, str]], show_quit: bool = T
     console.print(Align.center(panel))
 
 
-def find_models(search_paths: list[Path] = None) -> list[dict]:
+def find_models(search_paths: list[Path] | None = None) -> list[dict]:
     """Find available models in configured locations."""
     if search_paths is None:
         # Load paths from user config
@@ -437,7 +432,7 @@ def display_config_panel(config: dict, title: str = "Configuration") -> None:
 
         # Format the value
         if isinstance(value, bool):
-            display_value = f"[green]Yes[/green]" if value else f"[red]No[/red]"
+            display_value = "[green]Yes[/green]" if value else "[red]No[/red]"
         elif isinstance(value, float):
             display_value = f"{value:.2f}"
         elif isinstance(value, Path):
@@ -447,10 +442,7 @@ def display_config_panel(config: dict, title: str = "Configuration") -> None:
             display_value = f"({', '.join(str(v) for v in value)})"
         elif isinstance(value, list):
             # Format lists nicely (e.g., target_layer_types)
-            if value:
-                display_value = ", ".join(str(v) for v in value)
-            else:
-                display_value = "[dim]None[/dim]"
+            display_value = ", ".join(str(v) for v in value) if value else "[dim]None[/dim]"
         elif value is None:
             display_value = "[dim]None[/dim]"
         else:
@@ -468,8 +460,12 @@ def display_config_panel(config: dict, title: str = "Configuration") -> None:
     console.print(panel)
 
 
-def create_progress_bar(description: str = "Processing") -> Progress:
-    """Create a Rich progress bar."""
+def create_progress_bar(_description: str = "Processing") -> Progress:
+    """Create a Rich progress bar.
+
+    The ``_description`` parameter is accepted for API stability but the
+    description is driven by each task's ``task.description`` at render time.
+    """
     return Progress(
         SpinnerColumn(),
         TextColumn("[bold]{task.description}"),
@@ -483,11 +479,7 @@ def create_progress_bar(description: str = "Processing") -> Progress:
     )
 
 
-def display_results_table(
-    results: list[dict],
-    columns: list[tuple[str, str]],
-    title: str = "Results"
-) -> None:
+def display_results_table(results: list[dict], columns: list[tuple[str, str]], title: str = "Results") -> None:
     """Display results in a formatted table."""
     table = Table(title=title, show_header=True, header_style=f"bold {THEME['primary']}")
 
@@ -522,8 +514,8 @@ def display_comparison_panel(
     console.print()
 
     # Create response panels
-    status1 = f"[red]REFUSED[/red]" if refused1 else f"[green]OK[/green]"
-    status2 = f"[red]REFUSED[/red]" if refused2 else f"[green]OK[/green]"
+    status1 = "[red]REFUSED[/red]" if refused1 else "[green]OK[/green]"
+    status2 = "[red]REFUSED[/red]" if refused2 else "[green]OK[/green]"
 
     panel1 = Panel(
         response1[:500] + "..." if len(response1) > 500 else response1,
@@ -600,8 +592,7 @@ def print_divider():
 
 
 def display_training_config_list(configs: list[dict], title: str = "Saved Training Configs") -> None:
-    """
-    Display a list of training configs in a formatted table.
+    """Display a list of training configs in a formatted table.
 
     Args:
         configs: List of config metadata dicts from list_configs()
@@ -630,6 +621,7 @@ def display_training_config_list(configs: list[dict], title: str = "Saved Traini
             try:
                 # Parse ISO format and display nicely
                 from datetime import datetime
+
                 dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
                 updated = dt.strftime("%Y-%m-%d %H:%M")
             except (ValueError, AttributeError):
@@ -654,8 +646,7 @@ def display_training_config_list(configs: list[dict], title: str = "Saved Traini
 
 
 def display_training_config_details(config: dict, title: str = "Config Details") -> None:
-    """
-    Display full training config details in a formatted panel.
+    """Display full training config details in a formatted panel.
 
     Args:
         config: Full config dict with metadata and settings
@@ -677,6 +668,7 @@ def display_training_config_details(config: dict, title: str = "Config Details")
     if created:
         try:
             from datetime import datetime
+
             dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
             created = dt.strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, AttributeError):
@@ -687,6 +679,7 @@ def display_training_config_details(config: dict, title: str = "Config Details")
     if updated:
         try:
             from datetime import datetime
+
             dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
             updated = dt.strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, AttributeError):
@@ -748,14 +741,14 @@ def display_training_config_details(config: dict, title: str = "Config Details")
     def format_value(value):
         """Format a setting value for display."""
         if isinstance(value, bool):
-            return f"[green]Yes[/green]" if value else f"[red]No[/red]"
-        elif isinstance(value, float):
+            return "[green]Yes[/green]" if value else "[red]No[/red]"
+        if isinstance(value, float):
             return f"{value:.3f}"
-        elif isinstance(value, list):
+        if isinstance(value, list):
             if value:
                 return ", ".join(str(v) for v in value)
             return "[dim]None[/dim]"
-        elif value is None:
+        if value is None:
             return "[dim]None[/dim]"
         return str(value)
 
@@ -790,7 +783,8 @@ def display_training_config_details(config: dict, title: str = "Config Details")
 
     # Add advanced settings (only if any are enabled)
     advanced_enabled = any(
-        settings.get(key) for key, _ in advanced_settings
+        settings.get(key)
+        for key, _ in advanced_settings
         if key in ("use_adaptive_weighting", "use_biprojection", "use_per_neuron_norm", "use_harmless_boundary")
     )
     if advanced_enabled:
@@ -815,7 +809,6 @@ def display_training_config_details(config: dict, title: str = "Config Details")
                 settings_table.add_row(f"  {label}", format_value(settings[key]))
 
     # Combine into panel
-    from rich.console import Group
     content = Group(
         Text("Metadata", style=f"bold {THEME['secondary']}"),
         meta_table,
@@ -842,7 +835,7 @@ class ProgressCallback:
         self.progress = progress
         self.task_id = task_id
 
-    def update(self, advance: float = 1, description: str = None):
+    def update(self, advance: float = 1, description: str | None = None):
         """Update progress."""
         if description:
             self.progress.update(self.task_id, description=description)

@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from huggingface_hub import HfApi, create_repo, upload_file
+from huggingface_hub import create_repo, upload_file
 
 load_dotenv()
 
@@ -173,6 +173,7 @@ lives in the `Source` column of every row.
 
 
 def main() -> int:
+    """Command-line entry point for uploading the derestriction dataset to the Hub."""
     token = os.environ.get("HF_TOKEN")
     if not token:
         print("ERROR: HF_TOKEN not found in environment (.env)", file=sys.stderr)
@@ -182,12 +183,11 @@ def main() -> int:
         f"data/{name}-00000-of-00001.parquet": BUILD_DIR / f"{name}-00000-of-00001.parquet"
         for name in ("harmful", "harmless", "preservation")
     }
-    for remote, local in files.items():
+    for local in files.values():
         if not local.exists():
             print(f"ERROR: missing local file {local} — run build_derestriction_dataset first", file=sys.stderr)
             return 1
 
-    api = HfApi(token=token)
     print(f"Creating (or reusing) dataset repo {REPO_ID} …", flush=True)
     create_repo(
         repo_id=REPO_ID,

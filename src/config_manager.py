@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Training Configuration Manager
+"""Training Configuration Manager.
 
 Manages reusable training configurations stored as JSON files in ~/abliterate/configs/.
 Configs contain abliteration settings (excluding model_path/output_path which are
@@ -10,9 +9,8 @@ selected at runtime).
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +80,8 @@ DEFAULT_SETTINGS = {
 
 
 def get_configs_dir() -> Path:
-    """
-    Return the path to the configs directory (~/abliterate/job_configs/).
+    """Return the path to the configs directory (``~/abliterate/job_configs/``).
+
     Creates the directory if it doesn't exist.
     """
     configs_dir = Path.home() / "abliterate" / "job_configs"
@@ -92,8 +90,7 @@ def get_configs_dir() -> Path:
 
 
 def get_config_file_path(config_name: str) -> Path:
-    """
-    Return the full path to a config file.
+    """Return the full path to a config file.
 
     Args:
         config_name: Name of the config (without .json extension)
@@ -106,8 +103,7 @@ def get_config_file_path(config_name: str) -> Path:
 
 
 def sanitize_config_name(name: str) -> str:
-    """
-    Sanitize a config name for use as a filename.
+    """Sanitize a config name for use as a filename.
 
     - Converts to lowercase
     - Replaces spaces and special chars with hyphens
@@ -142,8 +138,7 @@ def sanitize_config_name(name: str) -> str:
 
 
 def list_configs() -> list[dict]:
-    """
-    List all saved training configs with their metadata.
+    """List all saved training configs with their metadata.
 
     Returns:
         List of dicts with keys: name, description, created_at, updated_at, file_path
@@ -154,39 +149,42 @@ def list_configs() -> list[dict]:
 
     for config_file in configs_dir.glob("*.json"):
         try:
-            with open(config_file, "r", encoding="utf-8") as f:
+            with config_file.open(encoding="utf-8") as f:
                 data = json.load(f)
 
             metadata = data.get("metadata", {})
-            configs.append({
-                "name": metadata.get("name", config_file.stem),
-                "description": metadata.get("description", ""),
-                "created_at": metadata.get("created_at", ""),
-                "updated_at": metadata.get("updated_at", ""),
-                "file_path": str(config_file),
-                "filename": config_file.stem,
-            })
-        except (json.JSONDecodeError, IOError) as e:
+            configs.append(
+                {
+                    "name": metadata.get("name", config_file.stem),
+                    "description": metadata.get("description", ""),
+                    "created_at": metadata.get("created_at", ""),
+                    "updated_at": metadata.get("updated_at", ""),
+                    "file_path": str(config_file),
+                    "filename": config_file.stem,
+                }
+            )
+        except (OSError, json.JSONDecodeError) as e:
             logger.warning(f"Failed to load config {config_file}: {e}")
             # Include in list but mark as corrupted
-            configs.append({
-                "name": config_file.stem,
-                "description": "[Error loading config]",
-                "created_at": "",
-                "updated_at": "",
-                "file_path": str(config_file),
-                "filename": config_file.stem,
-                "error": str(e),
-            })
+            configs.append(
+                {
+                    "name": config_file.stem,
+                    "description": "[Error loading config]",
+                    "created_at": "",
+                    "updated_at": "",
+                    "file_path": str(config_file),
+                    "filename": config_file.stem,
+                    "error": str(e),
+                }
+            )
 
     # Sort by updated_at, most recent first
     configs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     return configs
 
 
-def load_training_config(config_name: str) -> Optional[dict]:
-    """
-    Load a training config by name.
+def load_training_config(config_name: str) -> dict | None:
+    """Load a training config by name.
 
     Args:
         config_name: Name of the config to load
@@ -201,7 +199,7 @@ def load_training_config(config_name: str) -> Optional[dict]:
         return None
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with config_path.open(encoding="utf-8") as f:
             data = json.load(f)
 
         # Validate structure
@@ -210,7 +208,7 @@ def load_training_config(config_name: str) -> Optional[dict]:
             return None
 
         return data
-    except (json.JSONDecodeError, IOError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         logger.error(f"Failed to load config {config_name}: {e}")
         return None
 
@@ -221,8 +219,7 @@ def save_training_config(
     description: str = "",
     overwrite: bool = False,
 ) -> tuple[bool, str]:
-    """
-    Save settings as a new training config.
+    """Save settings as a new training config.
 
     Args:
         config_name: Name for the config
@@ -242,12 +239,9 @@ def save_training_config(
     # Clean settings - remove excluded fields and apply defaults for missing
     clean_settings = {}
     for key, default_value in DEFAULT_SETTINGS.items():
-        if key in settings:
-            clean_settings[key] = settings[key]
-        else:
-            clean_settings[key] = default_value
+        clean_settings[key] = settings.get(key, default_value)
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     config_data = {
         "metadata": {
@@ -261,23 +255,22 @@ def save_training_config(
     }
 
     try:
-        with open(config_path, "w", encoding="utf-8") as f:
+        with config_path.open("w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2)
 
         logger.info(f"Saved config: {config_path}")
         return True, f"Config saved as '{sanitized_name}'"
-    except IOError as e:
+    except OSError as e:
         logger.error(f"Failed to save config: {e}")
         return False, f"Failed to save config: {e}"
 
 
 def update_training_config(
     config_name: str,
-    settings: Optional[dict] = None,
-    description: Optional[str] = None,
+    settings: dict | None = None,
+    description: str | None = None,
 ) -> tuple[bool, str]:
-    """
-    Update an existing training config's settings and/or description.
+    """Update an existing training config's settings and/or description.
 
     Args:
         config_name: Name of the config to update
@@ -294,7 +287,7 @@ def update_training_config(
     # Update metadata
     if description is not None:
         existing["metadata"]["description"] = description
-    existing["metadata"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+    existing["metadata"]["updated_at"] = datetime.now(UTC).isoformat()
 
     # Update settings if provided
     if settings is not None:
@@ -311,19 +304,18 @@ def update_training_config(
     config_path = get_config_file_path(config_name)
 
     try:
-        with open(config_path, "w", encoding="utf-8") as f:
+        with config_path.open("w", encoding="utf-8") as f:
             json.dump(existing, f, indent=2)
 
         logger.info(f"Updated config: {config_path}")
         return True, f"Config '{config_name}' updated"
-    except IOError as e:
+    except OSError as e:
         logger.error(f"Failed to update config: {e}")
         return False, f"Failed to update config: {e}"
 
 
 def delete_training_config(config_name: str) -> tuple[bool, str]:
-    """
-    Delete a training config.
+    """Delete a training config.
 
     Args:
         config_name: Name of the config to delete
@@ -340,14 +332,13 @@ def delete_training_config(config_name: str) -> tuple[bool, str]:
         config_path.unlink()
         logger.info(f"Deleted config: {config_path}")
         return True, f"Config '{config_name}' deleted"
-    except IOError as e:
+    except OSError as e:
         logger.error(f"Failed to delete config: {e}")
         return False, f"Failed to delete config: {e}"
 
 
 def config_exists(config_name: str) -> bool:
-    """
-    Check if a config with this name exists.
+    """Check if a config with this name exists.
 
     Args:
         config_name: Name of the config
@@ -364,8 +355,7 @@ def config_exists(config_name: str) -> bool:
 
 
 def settings_from_abliteration_config(config: dict) -> dict:
-    """
-    Extract saveable settings from a runtime abliteration config dict.
+    """Extract saveable settings from a runtime abliteration config dict.
 
     Removes model_path, output_path, and other runtime-only fields.
 
@@ -387,8 +377,7 @@ def apply_config_to_runtime(
     model_path: str,
     output_path: str,
 ) -> dict:
-    """
-    Merge loaded config settings with runtime model/output paths.
+    """Merge loaded config settings with runtime model/output paths.
 
     Args:
         loaded_config: Config dict loaded from file (has metadata and settings)
@@ -414,8 +403,7 @@ def apply_config_to_runtime(
 
 
 def validate_config_settings(settings: dict) -> tuple[bool, list[str]]:
-    """
-    Validate config settings.
+    """Validate config settings.
 
     Args:
         settings: Settings dict to validate
@@ -426,9 +414,8 @@ def validate_config_settings(settings: dict) -> tuple[bool, list[str]]:
     errors = []
 
     # Validate numeric ranges
-    if "num_prompts" in settings:
-        if not isinstance(settings["num_prompts"], int) or settings["num_prompts"] < 1:
-            errors.append("num_prompts must be a positive integer")
+    if "num_prompts" in settings and (not isinstance(settings["num_prompts"], int) or settings["num_prompts"] < 1):
+        errors.append("num_prompts must be a positive integer")
 
     if "direction_multiplier" in settings:
         val = settings["direction_multiplier"]
@@ -463,14 +450,12 @@ def validate_config_settings(settings: dict) -> tuple[bool, list[str]]:
             errors.append("intervention_range must be [start, end] where 0 <= start < end <= 1")
 
     # Validate device
-    if "device" in settings:
-        if settings["device"] not in ("cuda", "cpu", "mps"):
-            errors.append("device must be 'cuda', 'cpu', or 'mps'")
+    if "device" in settings and settings["device"] not in ("cuda", "cpu", "mps"):
+        errors.append("device must be 'cuda', 'cpu', or 'mps'")
 
     # Validate dtype
-    if "dtype" in settings:
-        if settings["dtype"] not in ("float16", "bfloat16", "float32"):
-            errors.append("dtype must be 'float16', 'bfloat16', or 'float32'")
+    if "dtype" in settings and settings["dtype"] not in ("float16", "bfloat16", "float32"):
+        errors.append("dtype must be 'float16', 'bfloat16', or 'float32'")
 
     # Validate KL monitoring fields
     if "kl_threshold" in settings:

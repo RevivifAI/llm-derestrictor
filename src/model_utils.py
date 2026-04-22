@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""
-Model loading utilities with Vision-Language (VL) model support.
+"""Model loading utilities with Vision-Language (VL) model support.
 
 This module provides centralized model loading that automatically detects
 VL models (like Qwen3-VL) and uses the appropriate AutoModel class.
 It also handles FP8 quantized models that require special loading.
 """
 
+import contextlib
 import json
 import locale
 import logging
@@ -14,7 +14,6 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Tuple, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -24,10 +23,8 @@ if sys.platform == "win32":
     # Try to set UTF-8 mode for the process
     os.environ["PYTHONUTF8"] = "1"
     # Set locale to UTF-8 if possible
-    try:
-        locale.setlocale(locale.LC_ALL, '.UTF-8')
-    except locale.Error:
-        pass
+    with contextlib.suppress(locale.Error):
+        locale.setlocale(locale.LC_ALL, ".UTF-8")
 
 logger = logging.getLogger(__name__)
 
@@ -46,24 +43,22 @@ VL_ARCHITECTURES = {
     "mistral3": ["Mistral3ForConditionalGeneration"],
 }
 
-# Architectures that need special text-only loading even though they're multimodal
-# These use ForConditionalGeneration but can be loaded with the text-only model class
-# NOTE: Removed Gemma3 - forcing text-only class drops vision encoder params
-FORCE_TEXT_MODEL_ARCHITECTURES = {
-    # "Gemma3ForConditionalGeneration": "Gemma3ForCausalLM",  # Drops ~400M vision params
-}
+# Architectures that need special text-only loading even though they're multimodal.
+# These use ForConditionalGeneration but can be loaded with the text-only model class.
+# Note: Gemma3ForConditionalGeneration is intentionally absent because forcing the
+# text-only class would drop ~400M vision encoder parameters.
+FORCE_TEXT_MODEL_ARCHITECTURES: dict[str, str] = {}
 
 # Patterns that indicate FP8 quantization (scale factors)
 FP8_SCALE_PATTERNS = [
     r"_scale_inv$",  # Common FP8 scale inverse suffix
-    r"_scale$",      # FP8 scale suffix
+    r"_scale$",  # FP8 scale suffix
     r"\.fp8_scale",  # Explicit FP8 scale
 ]
 
 
 def detect_fp8_quantization(model_path: str) -> bool:
-    """
-    Detect if a model uses FP8 quantization by checking for scale factors.
+    """Detect if a model uses FP8 quantization by checking for scale factors.
 
     FP8 quantized models have weight tensors with names ending in '_scale_inv'
     or '_scale'. These models require special loading to avoid meta tensor issues.
@@ -80,44 +75,44 @@ def detect_fp8_quantization(model_path: str) -> bool:
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
+            with index_path.open(encoding="utf-8") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
-            for key in weight_map.keys():
+            for key in weight_map:
                 for pattern in FP8_SCALE_PATTERNS:
                     if re.search(pattern, key):
                         logger.info(f"Detected FP8 quantization (found {key})")
                         return True
-        except (json.JSONDecodeError, IOError) as e:
+        except (OSError, json.JSONDecodeError) as e:
             logger.debug(f"Could not read safetensors index: {e}")
 
     # Check pytorch bin index as fallback
     bin_index_path = model_dir / "pytorch_model.bin.index.json"
     if bin_index_path.exists():
         try:
-            with open(bin_index_path, "r", encoding="utf-8") as f:
+            with bin_index_path.open(encoding="utf-8") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
-            for key in weight_map.keys():
+            for key in weight_map:
                 for pattern in FP8_SCALE_PATTERNS:
                     if re.search(pattern, key):
                         logger.info(f"Detected FP8 quantization (found {key})")
                         return True
-        except (json.JSONDecodeError, IOError) as e:
+        except (OSError, json.JSONDecodeError) as e:
             logger.debug(f"Could not read pytorch bin index: {e}")
 
     # Check config.json for quantization_config
     config_path = model_dir / "config.json"
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with config_path.open(encoding="utf-8") as f:
                 config = json.load(f)
             quant_config = config.get("quantization_config", {})
             quant_method = quant_config.get("quant_method", "")
             if "fp8" in quant_method.lower():
                 logger.info(f"Detected FP8 quantization from config (method: {quant_method})")
                 return True
-        except (json.JSONDecodeError, IOError) as e:
+        except (OSError, json.JSONDecodeError) as e:
             logger.debug(f"Could not read config.json: {e}")
 
     return False
@@ -146,13 +141,13 @@ def _fix_weight_tying(model, model_path: str):
 
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with config_path.open(encoding="utf-8") as f:
                 config = json.load(f)
             # Check main config and text_config for tie_word_embeddings
             tie_embeddings = config.get("tie_word_embeddings", False)
             if not tie_embeddings and "text_config" in config:
                 tie_embeddings = config["text_config"].get("tie_word_embeddings", False)
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     if not tie_embeddings:
@@ -199,8 +194,7 @@ def _fix_weight_tying(model, model_path: str):
 
 
 def detect_model_type(model_path: str) -> dict:
-    """
-    Detect model type by reading config.json.
+    """Detect model type by reading config.json.
 
     Args:
         model_path: Path to the model directory or HuggingFace model ID
@@ -219,7 +213,7 @@ def detect_model_type(model_path: str) -> dict:
         logger.debug(f"No config.json at {model_path}, assuming standard model")
         return {"is_vl": False, "model_type": None, "architectures": []}
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    with config_path.open(encoding="utf-8") as f:
         config = json.load(f)
 
     model_type = config.get("model_type", "")
@@ -257,9 +251,8 @@ def load_model_and_tokenizer(
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
     trust_remote_code: bool = True,
-) -> Tuple[torch.nn.Module, AutoTokenizer]:
-    """
-    Load model and tokenizer, automatically handling VL models.
+) -> tuple[torch.nn.Module, AutoTokenizer]:
+    """Load model and tokenizer, automatically handling VL models.
 
     For VL models, uses AutoModelForImageTextToText.
     For text models, uses AutoModelForCausalLM.
@@ -278,31 +271,28 @@ def load_model_and_tokenizer(
     # Load tokenizer (same for both VL and text models for abliteration purposes)
     logger.info(f"Loading tokenizer from {model_path}...")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code
-        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     except UnicodeDecodeError as e:
         # Windows encoding issue - try with use_fast=False as fallback
         logger.warning(f"Encoding error loading tokenizer, trying slow tokenizer: {e}")
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_path, trust_remote_code=trust_remote_code, use_fast=False
-            )
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code, use_fast=False)
         except UnicodeDecodeError:
             # Last resort: monkey-patch open to use UTF-8 for text mode only
             import builtins
+
             original_open = builtins.open
-            def utf8_open(file, mode='r', *args, **kwargs):
+
+            def utf8_open(file, mode="r", *args, **kwargs):
                 # Only patch text mode opens (no 'b' in mode)
-                if 'b' not in mode and 'encoding' not in kwargs:
-                    kwargs['encoding'] = 'utf-8'
-                    kwargs['errors'] = 'replace'
+                if "b" not in mode and "encoding" not in kwargs:
+                    kwargs["encoding"] = "utf-8"
+                    kwargs["errors"] = "replace"
                 return original_open(file, mode, *args, **kwargs)
+
             builtins.open = utf8_open
             try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_path, trust_remote_code=trust_remote_code
-                )
+                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
             except UnicodeDecodeError as final_error:
                 builtins.open = original_open
                 raise RuntimeError(
@@ -341,7 +331,7 @@ def load_model_and_tokenizer(
     if model_info["is_vl"]:
         # Mistral3 VL models require special handling
         if is_mistral3:
-            logger.info(f"Loading Mistral3 VL model...")
+            logger.info("Loading Mistral3 VL model...")
             try:
                 from transformers import Mistral3ForConditionalGeneration
 
@@ -351,6 +341,7 @@ def load_model_and_tokenizer(
                     logger.info("Using FineGrainedFP8Config for Mistral3 FP8 model...")
                     try:
                         from transformers import FineGrainedFP8Config
+
                         quant_config = FineGrainedFP8Config(dequantize=True)
                         model = Mistral3ForConditionalGeneration.from_pretrained(
                             model_path,
@@ -365,8 +356,7 @@ def load_model_and_tokenizer(
                         logger.info(f"Model loaded with dtype={dtype} after FP8 dequantization")
                     except ImportError:
                         logger.warning(
-                            "FineGrainedFP8Config not available. "
-                            "Install mistral-common or upgrade transformers."
+                            "FineGrainedFP8Config not available. Install mistral-common or upgrade transformers."
                         )
                         # Fallback: try loading without quantization config
                         model = Mistral3ForConditionalGeneration.from_pretrained(
@@ -384,13 +374,13 @@ def load_model_and_tokenizer(
                         device_map=device,
                         trust_remote_code=trust_remote_code,
                     )
-            except ImportError:
+            except ImportError as exc:
                 raise ImportError(
                     "Mistral3ForConditionalGeneration requires transformers >= 4.48.0. "
                     "Please upgrade with: pip install --upgrade transformers"
-                )
+                ) from exc
         else:
-            logger.info(f"Loading VL model with AutoModelForImageTextToText...")
+            logger.info("Loading VL model with AutoModelForImageTextToText...")
             try:
                 from transformers import AutoModelForImageTextToText
 
@@ -412,17 +402,18 @@ def load_model_and_tokenizer(
                         device_map=device,
                         trust_remote_code=trust_remote_code,
                     )
-            except ImportError:
+            except ImportError as exc:
                 raise ImportError(
                     "AutoModelForImageTextToText requires transformers >= 4.57.0. "
                     "Please upgrade with: pip install --upgrade transformers"
-                )
+                ) from exc
     elif force_text_class:
         # Load with specific text-only model class to avoid multimodal issues
         logger.info(f"Loading model with specific class: {force_text_class}...")
         try:
             # Dynamically import the model class from transformers
             import transformers
+
             model_class = getattr(transformers, force_text_class, None)
             if model_class is None:
                 logger.warning(f"Could not find {force_text_class}, falling back to AutoModelForCausalLM")
@@ -464,7 +455,7 @@ def load_model_and_tokenizer(
                     trust_remote_code=trust_remote_code,
                 )
     else:
-        logger.info(f"Loading model with AutoModelForCausalLM...")
+        logger.info("Loading model with AutoModelForCausalLM...")
         if is_fp8:
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,

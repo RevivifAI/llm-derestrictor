@@ -12,6 +12,7 @@ from pathlib import Path
 @dataclass
 class MetricComparison:
     """Container for a single metric comparison."""
+
     task: str
     metric: str
     val1: float
@@ -23,10 +24,12 @@ class MetricComparison:
 @dataclass
 class AggregateStats:
     """Container for aggregate statistics across all metrics."""
+
     comparisons: list[MetricComparison] = field(default_factory=list)
 
     @property
     def count(self) -> int:
+        """Number of metric comparisons contained in this aggregate."""
         return len(self.comparisons)
 
     @property
@@ -79,10 +82,7 @@ class AggregateStats:
 
     def geometric_mean_ratio(self) -> float:
         """Geometric mean of val2/val1 ratios (useful for multiplicative comparisons)."""
-        ratios = []
-        for c in self.comparisons:
-            if c.val1 > 0 and c.val2 > 0:
-                ratios.append(c.val2 / c.val1)
+        ratios = [c.val2 / c.val1 for c in self.comparisons if c.val1 > 0 and c.val2 > 0]
         if not ratios:
             return 1.0
         log_sum = sum(math.log(r) for r in ratios)
@@ -102,9 +102,10 @@ class AggregateStats:
             return 0.0, None
         return max(valid, key=lambda x: x[0])
 
+
 def load_results(filepath: str) -> dict:
     """Load JSON results file."""
-    with open(filepath, "r", encoding="utf-8") as f:
+    with Path(filepath).open(encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -150,14 +151,14 @@ def compute_pct_change(val1: float, delta: float) -> float:
     """Compute percentage change, handling division by zero."""
     if val1 != 0:
         return (delta / val1) * 100
-    elif delta > 0:
-        return float('inf')
-    elif delta < 0:
-        return float('-inf')
+    if delta > 0:
+        return float("inf")
+    if delta < 0:
+        return float("-inf")
     return 0.0
 
 
-def print_aggregate_stats(stats: AggregateStats, label: str, line_width: int) -> None:
+def print_aggregate_stats(stats: AggregateStats, label: str, line_width: int) -> None:  # noqa: ARG001 - line_width kept for call-site symmetry
     """Print aggregate statistics for a comparison."""
     if stats.count == 0:
         return
@@ -169,12 +170,12 @@ def print_aggregate_stats(stats: AggregateStats, label: str, line_width: int) ->
     n_regressed = len(stats.regressions)
     n_unchanged = len(stats.unchanged)
     print(f"Metrics compared: {stats.count}")
-    print(f"  Improved:  {n_improved:3d} ({100*n_improved/stats.count:.1f}%)")
-    print(f"  Regressed: {n_regressed:3d} ({100*n_regressed/stats.count:.1f}%)")
-    print(f"  Unchanged: {n_unchanged:3d} ({100*n_unchanged/stats.count:.1f}%)")
+    print(f"  Improved:  {n_improved:3d} ({100 * n_improved / stats.count:.1f}%)")
+    print(f"  Regressed: {n_regressed:3d} ({100 * n_regressed / stats.count:.1f}%)")
+    print(f"  Unchanged: {n_unchanged:3d} ({100 * n_unchanged / stats.count:.1f}%)")
 
     # Central tendency measures
-    print(f"Percentage Change:")
+    print("Percentage Change:")
     print(f"  Mean:   {stats.mean_pct_change():+.2f}%")
     print(f"  Median: {stats.median_pct_change():+.2f}%")
     print(f"  Std:    {stats.std_pct_change():.2f}%")
@@ -183,9 +184,9 @@ def print_aggregate_stats(stats: AggregateStats, label: str, line_width: int) ->
     geo_mean = stats.geometric_mean_ratio()
     print(f"Geometric Mean Ratio: {geo_mean:.4f}")
     if geo_mean > 1:
-        print(f"  (~{(geo_mean-1)*100:.2f}% better)")
+        print(f"  (~{(geo_mean - 1) * 100:.2f}% better)")
     elif geo_mean < 1:
-        print(f"  (~{(1-geo_mean)*100:.2f}% worse)")
+        print(f"  (~{(1 - geo_mean) * 100:.2f}% worse)")
 
     # Extremes
     min_pct, min_comp = stats.min_pct_change()
@@ -240,18 +241,20 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
     else:
         line_width = max(70, task_width + metric_width + 10 + 10 + 10 + 8 + 5)
 
-    print(f"\n{'='*line_width}")
+    print(f"\n{'=' * line_width}")
     print("EVALUATION COMPARISON")
-    print(f"{'='*line_width}")
+    print(f"{'=' * line_width}")
     print(f"Base:   {name1}")
     print(f"File 2: {name2}")
     if name3:
         print(f"File 3: {name3}")
-    print(f"{'='*line_width}\n")
+    print(f"{'=' * line_width}\n")
 
     # Print header
     if file3:
-        print(f"{'Task':<{task_width}} {'Metric':<{metric_width}} {'Base':>8} {'File2':>8} {'Δ2':>8} {'%2':>7} {'File3':>8} {'Δ3':>8} {'%3':>7}")
+        print(
+            f"{'Task':<{task_width}} {'Metric':<{metric_width}} {'Base':>8} {'File2':>8} {'Δ2':>8} {'%2':>7} {'File3':>8} {'Δ3':>8} {'%3':>7}"
+        )
     else:
         print(f"{'Task':<{task_width}} {'Metric':<{metric_width}} {'File 1':>10} {'File 2':>10} {'Delta':>10} {'%':>8}")
     print("-" * line_width)
@@ -287,10 +290,16 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
                 delta2_str, pct2_str = format_delta(delta2, pct2)
 
                 if not metric.endswith("_stderr"):
-                    stats2.comparisons.append(MetricComparison(
-                        task=task, metric=metric, val1=val1, val2=val2,
-                        delta=delta2, pct_change=pct2,
-                    ))
+                    stats2.comparisons.append(
+                        MetricComparison(
+                            task=task,
+                            metric=metric,
+                            val1=val1,
+                            val2=val2,
+                            delta=delta2,
+                            pct_change=pct2,
+                        )
+                    )
             else:
                 val2_str = f"{val2:.3f}" if val2 is not None else "N/A"
                 delta2_str, pct2_str = "", ""
@@ -304,31 +313,41 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
                     delta3_str, pct3_str = format_delta(delta3, pct3)
 
                     if not metric.endswith("_stderr"):
-                        stats3.comparisons.append(MetricComparison(
-                            task=task, metric=metric, val1=val1, val2=val3,
-                            delta=delta3, pct_change=pct3,
-                        ))
+                        stats3.comparisons.append(
+                            MetricComparison(
+                                task=task,
+                                metric=metric,
+                                val1=val1,
+                                val2=val3,
+                                delta=delta3,
+                                pct_change=pct3,
+                            )
+                        )
                 else:
                     val3_str = f"{val3:.3f}" if val3 is not None else "N/A"
                     delta3_str, pct3_str = "", ""
 
-                print(f"{task:<{task_width}} {metric:<{metric_width}} {val1_str:>8} {val2_str:>8} {delta2_str:>8} {pct2_str:>7} {val3_str:>8} {delta3_str:>8} {pct3_str:>7}")
+                print(
+                    f"{task:<{task_width}} {metric:<{metric_width}} {val1_str:>8} {val2_str:>8} {delta2_str:>8} {pct2_str:>7} {val3_str:>8} {delta3_str:>8} {pct3_str:>7}"
+                )
             else:
-                print(f"{task:<{task_width}} {metric:<{metric_width}} {val1_str:>10} {val2_str:>10} {delta2_str:>10} {pct2_str:>8}")
+                print(
+                    f"{task:<{task_width}} {metric:<{metric_width}} {val1_str:>10} {val2_str:>10} {delta2_str:>10} {pct2_str:>8}"
+                )
 
     print("-" * line_width)
 
     # Print aggregate statistics
     if stats2.count > 0 or stats3.count > 0:
-        print(f"\n{'='*line_width}")
+        print(f"\n{'=' * line_width}")
         print("AGGREGATE STATISTICS")
-        print(f"{'='*line_width}")
+        print(f"{'=' * line_width}")
 
         if stats2.count > 0:
-            print_aggregate_stats(stats2, f"File2 vs Base", line_width)
+            print_aggregate_stats(stats2, "File2 vs Base", line_width)
 
         if stats3.count > 0:
-            print_aggregate_stats(stats3, f"File3 vs Base", line_width)
+            print_aggregate_stats(stats3, "File3 vs Base", line_width)
 
     # Special interpretation for refusal evals
     any_refusal = is_refusal_eval(data1) or is_refusal_eval(data2) or (data3 and is_refusal_eval(data3))
@@ -341,9 +360,9 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
         print("  - harmless_prompts refusal_rate ~ = no over-refusal introduced")
 
     # Print metadata comparison
-    print(f"\n{'='*line_width}")
+    print(f"\n{'=' * line_width}")
     print("METADATA")
-    print(f"{'='*line_width}")
+    print(f"{'=' * line_width}")
 
     config1 = data1.get("config", {})
     config2 = data2.get("config", {})
@@ -367,9 +386,9 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
             v3 = f"{v3:.0f}"
 
         if file3:
-            print(f"{key:<25} {str(v1):<20} {str(v2):<20} {str(v3):<20}")
+            print(f"{key:<25} {v1!s:<20} {v2!s:<20} {v3!s:<20}")
         else:
-            print(f"{key:<25} {str(v1):<30} {str(v2):<30}")
+            print(f"{key:<25} {v1!s:<30} {v2!s:<30}")
 
     # Evaluation time
     time1 = data1.get("total_evaluation_time_seconds", "N/A")
@@ -389,6 +408,7 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
 
 
 def main():
+    """Command-line entry point for comparing lm_eval JSON result files."""
     parser = argparse.ArgumentParser(
         description="Compare two or three lm_eval JSON result files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -397,14 +417,14 @@ Examples:
   python compare_evals.py base.json abliterated.json
   python compare_evals.py base.json model_a.json model_b.json  # Compare two models against base
   python compare_evals.py --all base.json abliterated.json     # Include stderr
-        """
+        """,
     )
     parser.add_argument("file1", help="Base/reference results JSON file")
     parser.add_argument("file2", help="Second results JSON file (compared against base)")
-    parser.add_argument("file3", nargs="?", default=None,
-                        help="Optional third results JSON file (compared against base)")
-    parser.add_argument("--all", "-a", action="store_true",
-                        help="Show all metrics including stderr")
+    parser.add_argument(
+        "file3", nargs="?", default=None, help="Optional third results JSON file (compared against base)"
+    )
+    parser.add_argument("--all", "-a", action="store_true", help="Show all metrics including stderr")
 
     args = parser.parse_args()
 

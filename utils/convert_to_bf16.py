@@ -1,5 +1,6 @@
-import os
 import argparse
+from pathlib import Path
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -12,7 +13,8 @@ def convert_fp32_to_bf16(input_dir: str, output_dir: str, max_shard_size: str = 
         output_dir: Path to save the bf16 model
         max_shard_size: Maximum size per shard file (e.g., "5GB", "10GB")
     """
-    os.makedirs(output_dir, exist_ok=True)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading model from: {input_dir}")
     print(f"Converting to bfloat16 with max shard size: {max_shard_size}")
@@ -41,7 +43,7 @@ def convert_fp32_to_bf16(input_dir: str, output_dir: str, max_shard_size: str = 
     )
 
     # Count output files
-    safetensor_files = [f for f in os.listdir(output_dir) if f.endswith('.safetensors')]
+    safetensor_files = [p for p in output_path.iterdir() if p.suffix == ".safetensors"]
     print(f"\nConversion complete! Created {len(safetensor_files)} safetensor file(s)")
 
 

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Norm-Preserving Feature-Level Surgery (NPFS)
+"""Norm-Preserving Feature-Level Surgery (NPFS).
 
 Performs row-level (per-neuron) feature surgery on transformer weight matrices,
 enabling precise strengthening or weakening of specific SAE features while
@@ -17,14 +16,13 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
 
 import torch
-import torch.nn as nn
+from torch import nn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.abliterate import make_json_serializable, clean_model_config_for_save
+from src.abliterate import clean_model_config_for_save, make_json_serializable
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +37,7 @@ class FeatureSpec:
     layer: int  # SAE layer index
     feature_id: int  # Feature index in SAE
     modulation: float  # <1 weaken, >1 strengthen, 1 = no change
-    decoder_vector: Optional[torch.Tensor] = None  # Cached decoder, loaded lazily
+    decoder_vector: torch.Tensor | None = None  # Cached decoder, loaded lazily
 
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict."""
@@ -82,9 +80,7 @@ class FeatureSurgeryConfig:
     per_neuron_norm: bool = True
 
     # Target layers in each transformer block
-    target_layer_types: list[str] = field(
-        default_factory=lambda: ["mlp.down_proj", "mlp.up_proj"]
-    )
+    target_layer_types: list[str] = field(default_factory=lambda: ["mlp.down_proj", "mlp.up_proj"])
 
     # Device/precision
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -128,16 +124,14 @@ class FeatureSurgeryConfig:
 
 
 class FeatureAttributionComputer:
-    """
-    Compute per-neuron attribution scores for SAE features.
+    """Compute per-neuron attribution scores for SAE features.
 
     Attribution quantifies how much each row (neuron) in a weight matrix
     contributes to producing/processing a specific SAE feature.
     """
 
     def __init__(self, config: FeatureSurgeryConfig):
-        """
-        Initialize the attribution computer.
+        """Initialize the attribution computer.
 
         Args:
             config: Feature surgery configuration
@@ -149,7 +143,7 @@ class FeatureAttributionComputer:
     def sae_loader(self):
         """Lazy-load SAE loader."""
         if self._sae_loader is None:
-            from utils.sae_loader import SAELoader, SAEConfig
+            from utils.sae_loader import SAEConfig, SAELoader
 
             sae_config = SAEConfig(
                 repo_id=self.config.sae_repo,
@@ -164,8 +158,7 @@ class FeatureAttributionComputer:
         return self._sae_loader
 
     def get_decoder_vector(self, layer: int, feature_id: int) -> torch.Tensor:
-        """
-        Get decoder vector for a specific feature.
+        """Get decoder vector for a specific feature.
 
         Args:
             layer: SAE layer index
@@ -181,8 +174,7 @@ class FeatureAttributionComputer:
         weight: torch.Tensor,
         decoder: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute how much each row (neuron) contributes to the feature.
+        """Compute how much each row (neuron) contributes to the feature.
 
         For input-space features (decoder matches in_features):
             attribution[i] = |w_i . d| / ||w_i||
@@ -216,8 +208,7 @@ class FeatureAttributionComputer:
             attribution = d_norm.abs()
         else:
             raise ValueError(
-                f"Decoder shape {decoder.shape} doesn't match weight matrix "
-                f"[{out_features}, {in_features}]"
+                f"Decoder shape {decoder.shape} doesn't match weight matrix [{out_features}, {in_features}]"
             )
 
         return attribution
@@ -225,10 +216,9 @@ class FeatureAttributionComputer:
     def compute_surgery_mask(
         self,
         attribution: torch.Tensor,
-        percentile: float = None,
+        percentile: float | None = None,
     ) -> tuple[torch.Tensor, float]:
-        """
-        Create mask selecting high-attribution neurons for surgery.
+        """Create mask selecting high-attribution neurons for surgery.
 
         Only neurons above the percentile threshold are modified,
         preserving low-attribution neurons that handle other features.
@@ -250,8 +240,7 @@ class FeatureAttributionComputer:
 
 
 class NormPreservingFeatureSurgery:
-    """
-    Apply norm-preserving feature surgery to model weights.
+    """Apply norm-preserving feature surgery to model weights.
 
     Performs row-level modification of weight matrices to weaken or strengthen
     specific SAE features while preserving per-neuron activation norms.
@@ -262,8 +251,7 @@ class NormPreservingFeatureSurgery:
         model: AutoModelForCausalLM,
         config: FeatureSurgeryConfig,
     ):
-        """
-        Initialize the surgery module.
+        """Initialize the surgery module.
 
         Args:
             model: Model to modify
@@ -285,34 +273,34 @@ class NormPreservingFeatureSurgery:
 
         # Try common paths for different architectures
         # Gemma3 multimodal: model.model.language_model.layers
-        if (hasattr(model, 'model') and
-            hasattr(model.model, 'language_model') and
-            hasattr(model.model.language_model, 'layers')):
+        if (
+            hasattr(model, "model")
+            and hasattr(model.model, "language_model")
+            and hasattr(model.model.language_model, "layers")
+        ):
             return model.model.language_model.layers
 
         # Vision-Language models: model.model.model.layers
-        if (hasattr(model, 'model') and
-            hasattr(model.model, 'model') and
-            hasattr(model.model.model, 'layers')):
+        if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
             return model.model.model.layers
 
         # Standard Llama/Qwen/Gemma: model.model.layers
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
             return model.model.layers
 
         # VL with language_model: model.language_model.model.layers
-        if hasattr(model, 'language_model'):
-            if hasattr(model.language_model, 'model') and hasattr(model.language_model.model, 'layers'):
+        if hasattr(model, "language_model"):
+            if hasattr(model.language_model, "model") and hasattr(model.language_model.model, "layers"):
                 return model.language_model.model.layers
-            if hasattr(model.language_model, 'layers'):
+            if hasattr(model.language_model, "layers"):
                 return model.language_model.layers
 
         # GPT-2 style: model.transformer.h
-        if hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+        if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
             return model.transformer.h
 
         # Direct layers
-        if hasattr(model, 'layers'):
+        if hasattr(model, "layers"):
             return model.layers
 
         raise ValueError(f"Could not find transformer layers in {type(model)}")
@@ -321,8 +309,7 @@ class NormPreservingFeatureSurgery:
         self,
         layer: nn.Module,
     ) -> list[tuple[str, nn.Linear]]:
-        """
-        Get target linear modules in a layer.
+        """Get target linear modules in a layer.
 
         Args:
             layer: Transformer layer module
@@ -353,8 +340,7 @@ class NormPreservingFeatureSurgery:
         modulation: float,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
-        """
-        Apply row-level surgery with per-neuron norm preservation.
+        """Apply row-level surgery with per-neuron norm preservation.
 
         Args:
             weight: Weight matrix [out_features, in_features]
@@ -385,8 +371,8 @@ class NormPreservingFeatureSurgery:
             # Scale factor: (mu - 1) is negative for weakening, positive for strengthening
             scale = modulation - 1.0
 
-            # Create adjustment matrix
-            # adjustment[i] = scale * proj_coeff[i] * d_norm
+            # Build the adjustment matrix where adjustment[i] equals
+            # scale * proj_coeff[i] * d_norm for each targeted row.
             adjustment = torch.zeros_like(weight)
             for i in range(out_features):
                 if mask[i]:
@@ -403,9 +389,7 @@ class NormPreservingFeatureSurgery:
                     adjustment[i] = scale * d_norm[i] * proj_coeff
 
         else:
-            raise ValueError(
-                f"Decoder shape {d_norm.shape} incompatible with weight {weight.shape}"
-            )
+            raise ValueError(f"Decoder shape {d_norm.shape} incompatible with weight {weight.shape}")
 
         # Apply adjustment
         weight_new = weight + adjustment
@@ -440,8 +424,7 @@ class NormPreservingFeatureSurgery:
         feature: FeatureSpec,
         dry_run: bool = False,
     ) -> dict:
-        """
-        Apply surgery for a single feature across all target layers.
+        """Apply surgery for a single feature across all target layers.
 
         Args:
             feature: Feature specification
@@ -451,10 +434,7 @@ class NormPreservingFeatureSurgery:
             Statistics dict
         """
         # Clamp modulation to safety bounds
-        modulation = max(
-            self.config.min_modulation,
-            min(self.config.max_modulation, feature.modulation)
-        )
+        modulation = max(self.config.min_modulation, min(self.config.max_modulation, feature.modulation))
 
         if modulation == 1.0:
             logger.debug(f"Skipping feature {feature.layer}:{feature.feature_id} (modulation=1.0)")
@@ -464,9 +444,7 @@ class NormPreservingFeatureSurgery:
         if feature.decoder_vector is not None:
             decoder = feature.decoder_vector
         else:
-            decoder = self.attribution_computer.get_decoder_vector(
-                feature.layer, feature.feature_id
-            )
+            decoder = self.attribution_computer.get_decoder_vector(feature.layer, feature.feature_id)
             feature.decoder_vector = decoder
 
         layers = self._find_layers()
@@ -494,9 +472,7 @@ class NormPreservingFeatureSurgery:
             weight = module.weight.data
 
             # Compute attribution
-            attribution = self.attribution_computer.compute_row_attribution(
-                weight, decoder
-            )
+            attribution = self.attribution_computer.compute_row_attribution(weight, decoder)
 
             # Compute surgery mask
             mask, threshold = self.attribution_computer.compute_surgery_mask(
@@ -505,15 +481,11 @@ class NormPreservingFeatureSurgery:
 
             # Apply surgery
             if not dry_run:
-                new_weight, surgery_stats = self.apply_feature_surgery(
-                    weight, decoder, modulation, mask
-                )
+                new_weight, surgery_stats = self.apply_feature_surgery(weight, decoder, modulation, mask)
                 module.weight.data = new_weight
             else:
                 # Dry run: compute stats without modifying
-                _, surgery_stats = self.apply_feature_surgery(
-                    weight.clone(), decoder, modulation, mask
-                )
+                _, surgery_stats = self.apply_feature_surgery(weight.clone(), decoder, modulation, mask)
 
             module_stats = {
                 "name": module_name,
@@ -533,11 +505,10 @@ class NormPreservingFeatureSurgery:
     @torch.no_grad()
     def apply_multi_feature_surgery(
         self,
-        features: list[FeatureSpec] = None,
+        features: list[FeatureSpec] | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """
-        Apply surgery for multiple features.
+        """Apply surgery for multiple features.
 
         Args:
             features: List of feature specs (default: from config)
@@ -580,15 +551,13 @@ class NormPreservingFeatureSurgery:
 
 
 class FeatureSurgeryPipeline:
-    """
-    End-to-end pipeline for feature surgery.
+    """End-to-end pipeline for feature surgery.
 
     Handles loading models, features, applying surgery, and saving results.
     """
 
     def __init__(self, config: FeatureSurgeryConfig):
-        """
-        Initialize the pipeline.
+        """Initialize the pipeline.
 
         Args:
             config: Surgery configuration
@@ -609,8 +578,7 @@ class FeatureSurgeryPipeline:
         sae_repo: str = "google/gemma-scope-2-4b-it",
         **config_kwargs,
     ) -> "FeatureSurgeryPipeline":
-        """
-        Create pipeline from circuit_analysis differential output.
+        """Create pipeline from circuit_analysis differential output.
 
         Automatically selects features to weaken (high in harmful/set A)
         and optionally strengthen (high in harmless/set B).
@@ -626,7 +594,7 @@ class FeatureSurgeryPipeline:
         Returns:
             Configured pipeline
         """
-        with open(differential_path, "r", encoding="utf-8") as f:
+        with Path(differential_path).open(encoding="utf-8") as f:
             diff_data = json.load(f)
 
         features = []
@@ -638,9 +606,7 @@ class FeatureSurgeryPipeline:
 
             # Sort by absolute difference
             sorted_features = sorted(
-                layer_features,
-                key=lambda x: abs(x.get("diff", x.get("mean_diff", 0))),
-                reverse=True
+                layer_features, key=lambda x: abs(x.get("diff", x.get("mean_diff", 0))), reverse=True
             )[:top_k_per_layer]
 
             for feat in sorted_features:
@@ -649,16 +615,15 @@ class FeatureSurgeryPipeline:
 
                 # Positive diff = higher in set A (harmful) -> weaken
                 # Negative diff = higher in set B (harmless) -> strengthen
-                if diff > 0:
-                    modulation = weaken_strength
-                else:
-                    modulation = strengthen_strength
+                modulation = weaken_strength if diff > 0 else strengthen_strength
 
-                features.append(FeatureSpec(
-                    layer=layer,
-                    feature_id=feature_id,
-                    modulation=modulation,
-                ))
+                features.append(
+                    FeatureSpec(
+                        layer=layer,
+                        feature_id=feature_id,
+                        modulation=modulation,
+                    )
+                )
 
         logger.info(f"Loaded {len(features)} features from differential analysis")
 
@@ -677,8 +642,7 @@ class FeatureSurgeryPipeline:
         sae_repo: str = "google/gemma-scope-2-4b-it",
         **config_kwargs,
     ) -> "FeatureSurgeryPipeline":
-        """
-        Create pipeline from explicit feature list.
+        """Create pipeline from explicit feature list.
 
         Args:
             features: List of {layer, feature_id, modulation} dicts
@@ -700,8 +664,7 @@ class FeatureSurgeryPipeline:
 
     @classmethod
     def from_json(cls, path: str) -> "FeatureSurgeryPipeline":
-        """
-        Load pipeline configuration from JSON file.
+        """Load pipeline configuration from JSON file.
 
         Args:
             path: Path to config JSON
@@ -709,7 +672,7 @@ class FeatureSurgeryPipeline:
         Returns:
             Configured pipeline
         """
-        with open(path, "r", encoding="utf-8") as f:
+        with Path(path).open(encoding="utf-8") as f:
             data = json.load(f)
 
         config = FeatureSurgeryConfig.from_dict(data)
@@ -720,8 +683,7 @@ class FeatureSurgeryPipeline:
         model_path: str,
         dtype: torch.dtype = None,
     ) -> AutoModelForCausalLM:
-        """
-        Load model for surgery.
+        """Load model for surgery.
 
         Args:
             model_path: Path or HuggingFace ID
@@ -755,8 +717,7 @@ class FeatureSurgeryPipeline:
         return self.model
 
     def validate_sae_compatibility(self, strict: bool = True) -> bool:
-        """
-        Check if SAE dimensions match the model.
+        """Check if SAE dimensions match the model.
 
         Args:
             strict: If True, raise error on mismatch; if False, warn only
@@ -775,17 +736,17 @@ class FeatureSurgeryPipeline:
         hidden_dim = None
 
         # Try common attribute names
-        if hasattr(config, 'hidden_size'):
+        if hasattr(config, "hidden_size"):
             hidden_dim = config.hidden_size
-        elif hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+        elif hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
             # Gemma 3 and other multimodal models
             hidden_dim = config.text_config.hidden_size
-        elif hasattr(config, 'd_model'):
+        elif hasattr(config, "d_model"):
             hidden_dim = config.d_model
-        elif hasattr(config, 'n_embd'):
+        elif hasattr(config, "n_embd"):
             # GPT-2 style
             hidden_dim = config.n_embd
-        elif hasattr(config, 'hidden_dim'):
+        elif hasattr(config, "hidden_dim"):
             hidden_dim = config.hidden_dim
 
         if hidden_dim is None:
@@ -796,18 +757,15 @@ class FeatureSurgeryPipeline:
             return True
 
         # Validate with SAE loader - use strict mode by default to prevent corrupted models
-        return self._surgery.attribution_computer.sae_loader.validate_model_compatibility(
-            hidden_dim, strict=strict
-        )
+        return self._surgery.attribution_computer.sae_loader.validate_model_compatibility(hidden_dim, strict=strict)
 
     def run(
         self,
-        output_path: str = None,
+        output_path: str | None = None,
         dry_run: bool = False,
         skip_validation: bool = False,
     ) -> dict:
-        """
-        Run the full surgery pipeline.
+        """Run the full surgery pipeline.
 
         Args:
             output_path: Path to save modified model (None = don't save)
@@ -840,9 +798,8 @@ class FeatureSurgeryPipeline:
 
         return stats
 
-    def save(self, output_path: str, stats: dict = None, source_model_path: str = None):
-        """
-        Save the modified model and config, preserving architecture integrity.
+    def save(self, output_path: str, stats: dict | None = None, source_model_path: str | None = None):
+        """Save the modified model and config, preserving architecture integrity.
 
         Args:
             output_path: Directory to save to
@@ -885,6 +842,7 @@ class FeatureSurgeryPipeline:
 
             # Preserve original model config fields that transformers might not save
             from src.abliterate import preserve_model_config
+
             preserve_model_config(source_path, output_path)
 
         # Verify architecture was preserved correctly
@@ -892,26 +850,22 @@ class FeatureSurgeryPipeline:
 
         # Save surgery config
         config_path = output_path / "feature_surgery_config.json"
-        with open(config_path, "w", encoding="utf-8") as f:
+        with config_path.open("w", encoding="utf-8") as f:
             json.dump(make_json_serializable(self.config.to_dict()), f, indent=2)
 
         # Save stats if provided
         if stats:
             stats_path = output_path / "feature_surgery_stats.json"
             # Filter non-serializable items
-            serializable_stats = {
-                k: v for k, v in stats.items()
-                if k != "feature_results"
-            }
+            serializable_stats = {k: v for k, v in stats.items() if k != "feature_results"}
             serializable_stats["num_features"] = len(self.config.features)
-            with open(stats_path, "w", encoding="utf-8") as f:
+            with stats_path.open("w", encoding="utf-8") as f:
                 json.dump(make_json_serializable(serializable_stats), f, indent=2)
 
         logger.info(f"Saved model and config to {output_path}")
 
     def _verify_saved_architecture(self, output_path: Path):
-        """
-        Verify that the saved model has correct architecture configuration.
+        """Verify that the saved model has correct architecture configuration.
 
         Args:
             output_path: Path to the saved model
@@ -923,7 +877,7 @@ class FeatureSurgeryPipeline:
         if not config_path.exists():
             raise RuntimeError(f"Model config.json not found at {output_path}")
 
-        with open(config_path, "r", encoding="utf-8") as f:
+        with config_path.open(encoding="utf-8") as f:
             saved_config = json.load(f)
 
         # Verify essential architecture fields are present
@@ -956,8 +910,7 @@ class FeatureSurgeryPipeline:
                     original_value = original_config.get(field)
                     if saved_value != original_value:
                         raise RuntimeError(
-                            f"Architecture mismatch in {field}: "
-                            f"saved={saved_value}, expected={original_value}"
+                            f"Architecture mismatch in {field}: saved={saved_value}, expected={original_value}"
                         )
 
         # Verify model weights file exists
@@ -971,13 +924,12 @@ class FeatureSurgeryPipeline:
         logger.info("Architecture verification passed")
 
     def export_config(self, path: str):
-        """
-        Save configuration for reproducibility.
+        """Save configuration for reproducibility.
 
         Args:
             path: Path to save config JSON
         """
-        with open(path, "w", encoding="utf-8") as f:
+        with Path(path).open("w", encoding="utf-8") as f:
             json.dump(make_json_serializable(self.config.to_dict()), f, indent=2)
         logger.info(f"Exported config to {path}")
 
@@ -990,8 +942,7 @@ def weaken_feature(
     sae_repo: str = "google/gemma-scope-2-4b-it",
     **kwargs,
 ) -> dict:
-    """
-    Convenience function to weaken a single feature.
+    """Convenience function to weaken a single feature.
 
     Args:
         model: Model to modify
@@ -1021,8 +972,7 @@ def strengthen_feature(
     sae_repo: str = "google/gemma-scope-2-4b-it",
     **kwargs,
 ) -> dict:
-    """
-    Convenience function to strengthen a single feature.
+    """Convenience function to strengthen a single feature.
 
     Args:
         model: Model to modify

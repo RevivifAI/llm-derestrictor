@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-KL Divergence Monitor & Auto-Tune Multiplier
+"""KL Divergence Monitor & Auto-Tune Multiplier.
 
 Measures distribution drift between original and abliterated model outputs
 on reference prompts (typically preservation/harmless prompts). Uses top-k
@@ -14,9 +13,8 @@ Provides:
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +56,7 @@ class KLResult:
     multiplier: float  # The direction_multiplier used
 
     def to_dict(self) -> dict:
+        """Return a JSON-serializable dict representation of this result."""
         return {
             "mean_kl": self.mean_kl,
             "median_kl": self.median_kl,
@@ -80,6 +79,7 @@ class AutoTuneResult:
     kl_threshold: float
 
     def to_dict(self) -> dict:
+        """Return a JSON-serializable dict representation of this result."""
         return {
             "best_multiplier": self.best_multiplier,
             "best_kl": self.best_kl,
@@ -96,8 +96,7 @@ class AutoTuneResult:
 
 
 class WeightSnapshot:
-    """
-    Saves and restores linear layer weights for iterative rollback.
+    """Saves and restores linear layer weights for iterative rollback.
 
     Stores weight clones on CPU to avoid doubling GPU memory.
     For 7B models: ~13GB CPU RAM. For 70B+: ~140GB.
@@ -140,8 +139,7 @@ class WeightSnapshot:
 
 
 class KLDivergenceMonitor:
-    """
-    Monitors KL divergence between original and abliterated model distributions.
+    """Monitors KL divergence between original and abliterated model distributions.
 
     Usage:
         1. Create monitor with original model
@@ -177,14 +175,11 @@ class KLDivergenceMonitor:
         """Format prompt with chat template."""
         if hasattr(self.tokenizer, "apply_chat_template"):
             messages = [{"role": "user", "content": prompt}]
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         return prompt
 
     def _forward_batch(self, prompts: list[str]) -> list[torch.Tensor]:
-        """
-        Run forward pass on a batch of prompts, returning per-prompt logits.
+        """Run forward pass on a batch of prompts, returning per-prompt logits.
 
         Returns list of logit tensors, each (seq_len, vocab_size), trimmed
         to exclude padding positions.
@@ -194,9 +189,7 @@ class KLDivergenceMonitor:
         original_padding_side = self.tokenizer.padding_side
         try:
             self.tokenizer.padding_side = "left"
-            inputs = self.tokenizer(
-                formatted, return_tensors="pt", padding=True, truncation=True
-            ).to(self.model.device)
+            inputs = self.tokenizer(formatted, return_tensors="pt", padding=True, truncation=True).to(self.model.device)
 
             with torch.no_grad():
                 outputs = self.model(**inputs)
@@ -222,8 +215,7 @@ class KLDivergenceMonitor:
             self.tokenizer.padding_side = original_padding_side
 
     def cache_reference_logits(self, prompts: list[str]):
-        """
-        Cache top-k log probabilities from the original (pre-abliteration) model.
+        """Cache top-k log probabilities from the original (pre-abliteration) model.
 
         Must be called BEFORE abliteration since the model is modified in-place.
 
@@ -241,15 +233,13 @@ class KLDivergenceMonitor:
             batch_logits = self._forward_batch(batch_prompts)
 
             for logits in batch_logits:
-                # logits: (seq_len, vocab_size)
+                # logits has shape (seq_len, vocab_size).
                 log_probs = F.log_softmax(logits.float(), dim=-1)
 
                 # Take top-k per position
                 top_values, top_indices = log_probs.topk(top_k, dim=-1)
                 # Store on CPU: (seq_len, top_k)
-                self.cached_references.append(
-                    (top_values.cpu(), top_indices.cpu())
-                )
+                self.cached_references.append((top_values.cpu(), top_indices.cpu()))
 
             # Free GPU cache between batches
             if torch.cuda.is_available():
@@ -258,8 +248,7 @@ class KLDivergenceMonitor:
         logger.info(f"Cached reference logits for {len(self.cached_references)} prompts")
 
     def compute_kl_divergence(self, prompts: list[str], multiplier: float) -> KLResult:
-        """
-        Compute KL(P_orig || P_abl) using top-k approximation.
+        """Compute KL(P_orig || P_abl) using top-k approximation.
 
         Args:
             prompts: Same reference prompts used for caching (in same order)
@@ -273,8 +262,7 @@ class KLDivergenceMonitor:
 
         if len(prompts) != len(self.cached_references):
             raise ValueError(
-                f"Prompt count mismatch: {len(prompts)} prompts vs "
-                f"{len(self.cached_references)} cached references"
+                f"Prompt count mismatch: {len(prompts)} prompts vs {len(self.cached_references)} cached references"
             )
 
         batch_size = self.config.batch_size
@@ -291,7 +279,7 @@ class KLDivergenceMonitor:
 
                 ref_log_probs, ref_indices = self.cached_references[prompt_idx]
 
-                # logits: (seq_len, vocab_size)
+                # logits has shape (seq_len, vocab_size).
                 abl_log_probs = F.log_softmax(logits.float(), dim=-1)
 
                 # Match sequence lengths (use minimum)
@@ -340,7 +328,7 @@ class KLDivergenceMonitor:
 
 def auto_tune_multiplier(
     model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
+    tokenizer: AutoTokenizer,  # noqa: ARG001 - kept in signature for parity with callers; kl_monitor owns its tokenizer
     directions,  # RefusalDirections
     config,  # AbliterationConfig
     kl_monitor: KLDivergenceMonitor,
@@ -348,12 +336,12 @@ def auto_tune_multiplier(
     reference_prompts: list[str],
     null_space_projector=None,
 ) -> AutoTuneResult:
-    """
-    Binary search over direction_multiplier to find the highest value
-    that keeps KL divergence below the threshold.
+    """Binary-search ``direction_multiplier`` for the largest KL-safe value.
 
-    Each iteration: restore weights → abliterate with candidate → measure KL.
-    Final state: model abliterated with the best multiplier found.
+    Each iteration restores the model weights, abliterates with the candidate
+    multiplier, and measures KL divergence. The KL-divergence threshold is read
+    from ``kl_config``. The search terminates once the bracket converges, and
+    the model is left abliterated with the best multiplier found.
 
     Args:
         model: The model (pre-abliteration weights expected)
@@ -402,13 +390,15 @@ def auto_tune_multiplier(
         kl_result = kl_monitor.compute_kl_divergence(reference_prompts, candidate)
         mean_kl = kl_result.mean_kl
 
-        search_history.append({
-            "iteration": iteration + 1,
-            "multiplier": candidate,
-            "mean_kl": mean_kl,
-            "median_kl": kl_result.median_kl,
-            "max_kl": kl_result.max_kl,
-        })
+        search_history.append(
+            {
+                "iteration": iteration + 1,
+                "multiplier": candidate,
+                "mean_kl": mean_kl,
+                "median_kl": kl_result.median_kl,
+                "max_kl": kl_result.max_kl,
+            }
+        )
 
         logger.info(f"    KL: mean={mean_kl:.4f}, median={kl_result.median_kl:.4f}, max={kl_result.max_kl:.4f}")
 
@@ -421,7 +411,7 @@ def auto_tune_multiplier(
         else:
             # KL too high — try lower multiplier
             high = candidate
-            logger.info(f"    Over budget. Reducing range.")
+            logger.info("    Over budget. Reducing range.")
 
         # Check convergence
         if (high - low) < kl_config.search_tolerance:
@@ -471,8 +461,8 @@ def load_reference_prompts(num_prompts: int = 50) -> list[str]:
 
 def save_kl_report(
     output_path: Path,
-    kl_result: Optional[KLResult] = None,
-    auto_tune_result: Optional[AutoTuneResult] = None,
+    kl_result: KLResult | None = None,
+    auto_tune_result: AutoTuneResult | None = None,
 ):
     """Save KL divergence report to JSON file."""
     report = {}
@@ -484,7 +474,7 @@ def save_kl_report(
         report["auto_tune"] = auto_tune_result.to_dict()
 
     report_path = output_path / "kl_divergence_report.json"
-    with open(report_path, "w", encoding="utf-8") as f:
+    with report_path.open("w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     logger.info(f"Saved KL divergence report to {report_path}")

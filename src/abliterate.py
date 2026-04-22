@@ -3,23 +3,24 @@ import argparse
 import gc
 import json
 import logging
-import os
 import random
 import shutil
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.model_utils import load_model_and_tokenizer
 from src.cli_components import get_versioned_path
 from src.dataset_loader import load_split
+from src.model_utils import load_model_and_tokenizer
 from utils.refusal_detector import LogLikelihoodRefusalDetector, RefusalDetectorConfig
+
+if TYPE_CHECKING:
+    from src.null_space import NullSpaceProjector
 
 # Configure logging
 logging.basicConfig(
@@ -52,15 +53,15 @@ def make_json_serializable(obj):
     """
     if isinstance(obj, torch.dtype):
         return DTYPE_TO_STRING.get(obj, str(obj))
-    elif isinstance(obj, torch.Tensor):
+    if isinstance(obj, torch.Tensor):
         return obj.tolist()
-    elif isinstance(obj, Path):
+    if isinstance(obj, Path):
         return str(obj)
-    elif isinstance(obj, dict):
+    if isinstance(obj, dict):
         return {k: make_json_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
+    if isinstance(obj, (list, tuple)):
         return [make_json_serializable(item) for item in obj]
-    elif hasattr(obj, '__dict__'):
+    if hasattr(obj, "__dict__"):
         # Handle dataclass-like objects that might have dtype attributes
         return make_json_serializable(vars(obj))
     return obj
@@ -102,13 +103,13 @@ def _clean_config_dtypes_recursive(obj, visited=None) -> None:
         return
 
     # For objects with attributes, iterate over all attributes
-    if hasattr(obj, '__dict__'):
+    if hasattr(obj, "__dict__"):
         for attr_name in list(vars(obj).keys()):
             try:
                 value = getattr(obj, attr_name)
                 if isinstance(value, torch.dtype):
                     setattr(obj, attr_name, DTYPE_TO_STRING.get(value, str(value)))
-                elif not callable(value) and not attr_name.startswith('_'):
+                elif not callable(value) and not attr_name.startswith("_"):
                     _clean_config_dtypes_recursive(value, visited)
             except (AttributeError, TypeError):
                 # Some attributes might be properties that raise on access
@@ -123,7 +124,7 @@ def clean_model_config_for_save(model) -> None:
     This function converts those to strings in-place by recursively traversing
     all config attributes.
     """
-    if not hasattr(model, 'config'):
+    if not hasattr(model, "config"):
         return
 
     config = model.config
@@ -133,9 +134,9 @@ def clean_model_config_for_save(model) -> None:
 
     # Also explicitly handle quantization_config via to_dict() for completeness
     # Some quantization configs have special serialization logic
-    if hasattr(config, 'quantization_config') and config.quantization_config is not None:
+    if hasattr(config, "quantization_config") and config.quantization_config is not None:
         qconfig = config.quantization_config
-        if hasattr(qconfig, 'to_dict'):
+        if hasattr(qconfig, "to_dict"):
             try:
                 qdict = qconfig.to_dict()
                 # Convert any dtype objects to strings and update attributes
@@ -155,29 +156,26 @@ def _needs_manual_save(model) -> bool:
     save_pretrained would fail with NotImplementedError.
     """
     # Check for quantization config indicators
-    if hasattr(model, 'config') and hasattr(model.config, 'quantization_config'):
+    if hasattr(model, "config") and hasattr(model.config, "quantization_config"):
         qconfig = model.config.quantization_config
         if qconfig is not None:
             # Check various FP8/dequantization indicators
-            is_dequantized = getattr(qconfig, 'dequantize', False)
-            quant_method = str(getattr(qconfig, 'quant_method', '')).lower()
-            if is_dequantized or 'fp8' in quant_method:
+            is_dequantized = getattr(qconfig, "dequantize", False)
+            quant_method = str(getattr(qconfig, "quant_method", "")).lower()
+            if is_dequantized or "fp8" in quant_method:
                 return True
 
     # Check for hf_quantizer (indicates quantization was applied during load)
-    if hasattr(model, 'hf_quantizer') and model.hf_quantizer is not None:
+    if hasattr(model, "hf_quantizer") and model.hf_quantizer is not None:
         return True
 
     # Check for weight conversion hooks/operations
-    if hasattr(model, '_hf_hook') and model._hf_hook is not None:
+    if hasattr(model, "_hf_hook") and model._hf_hook is not None:
         return True
 
     # Check for Mistral3 models which typically need special handling
-    model_type = getattr(getattr(model, 'config', None), 'model_type', '')
-    if 'mistral3' in str(model_type).lower():
-        return True
-
-    return False
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    return "mistral3" in str(model_type).lower()
 
 
 def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.dtype = torch.float16) -> None:
@@ -202,18 +200,18 @@ def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.
     logger.info("Using manual save to bypass weight conversion")
 
     # Clear quantization-related config
-    if hasattr(model, 'config'):
-        if hasattr(model.config, 'quantization_config'):
+    if hasattr(model, "config"):
+        if hasattr(model.config, "quantization_config"):
             model.config.quantization_config = None
-        if hasattr(model.config, '_pre_quantization_dtype'):
-            delattr(model.config, '_pre_quantization_dtype')
+        if hasattr(model.config, "_pre_quantization_dtype"):
+            delattr(model.config, "_pre_quantization_dtype")
 
     # Get state dict and save with safetensors
     raw_state_dict = model.state_dict()
 
     # FP8 scale tensor patterns that must be filtered out for GGUF compatibility
     # These tensors cause "ValueError: Can not map tensor" errors in convert_hf_to_gguf
-    fp8_scale_patterns = ('_scale_inv', '_scale', '.fp8_scale')
+    fp8_scale_patterns = ("_scale_inv", "_scale", ".fp8_scale")
 
     # Filter out FP8 scale tensors and convert dtypes
     state_dict = {}
@@ -229,15 +227,16 @@ def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.
         # Convert bfloat16 to float16 for GGUF compatibility
         # llama.cpp's convert_hf_to_gguf downcasts bf16 to fp16 which can cause artifacts
         # By doing the conversion here with proper rounding, we get cleaner results
+        converted_tensor = tensor
         if tensor.dtype == torch.bfloat16 and target_dtype == torch.float16:
-            tensor = tensor.to(torch.float16)
+            converted_tensor = tensor.to(torch.float16)
             converted_count += 1
         elif tensor.dtype != target_dtype and tensor.is_floating_point():
             # Convert other floating point tensors to target dtype
-            tensor = tensor.to(target_dtype)
+            converted_tensor = tensor.to(target_dtype)
             converted_count += 1
 
-        state_dict[key] = tensor
+        state_dict[key] = converted_tensor
 
     if filtered_count > 0:
         logger.info(f"Filtered out {filtered_count} FP8 scale tensors for GGUF compatibility")
@@ -292,7 +291,7 @@ def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.
 
         # Save index file
         index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
-        with open(output_path / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+        with (output_path / "model.safetensors.index.json").open("w", encoding="utf-8") as f:
             json.dump(index, f, indent=2)
     else:
         # Single file save
@@ -322,7 +321,7 @@ def _untie_shared_weights(model) -> None:
         ptr_to_names[ptr].append(name)
 
     # Find groups of tensors that share memory
-    for ptr, names in ptr_to_names.items():
+    for names in ptr_to_names.values():
         if len(names) > 1:
             logger.info(f"Found shared weights: {names}")
             # Clone all but the first tensor in each group
@@ -421,16 +420,16 @@ def _update_config_dtype(output_path: Path, target_dtype: torch.dtype) -> None:
     dtype_str = DTYPE_TO_STRING.get(target_dtype, "float16")
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with Path(config_path).open(encoding="utf-8") as f:
             config = json.load(f)
 
         config["torch_dtype"] = dtype_str
 
-        with open(config_path, "w", encoding="utf-8") as f:
+        with Path(config_path).open("w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
 
         logger.debug(f"Updated config.json torch_dtype to {dtype_str}")
-    except (json.JSONDecodeError, IOError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         logger.warning(f"Could not update config.json dtype: {e}")
 
 
@@ -441,8 +440,6 @@ def get_package_root() -> Path:
     the prompts directory correctly on both Windows and Unix systems.
     """
     return Path(__file__).resolve().parent.parent
-
-
 
 
 def copy_vision_files(source_path: Path, dest_path: Path) -> list[str]:
@@ -520,16 +517,16 @@ def copy_essential_model_files(source_path: Path, dest_path: Path) -> list[str]:
         # Generation config
         "generation_config.json",
         # Custom tokenizer files (various model families)
-        "tekken.json",           # Ministral/Mistral tokenizer
-        "merges.txt",            # BPE merges file
-        "vocab.json",            # Vocabulary file
-        "added_tokens.json",     # Additional tokens
+        "tekken.json",  # Ministral/Mistral tokenizer
+        "merges.txt",  # BPE merges file
+        "vocab.json",  # Vocabulary file
+        "added_tokens.json",  # Additional tokens
         "special_tokens_map.json",  # Special token mappings
         # Model params
-        "params.json",           # Mistral-style params
+        "params.json",  # Mistral-style params
         # Chat templates (if not already saved by tokenizer)
-        "chat_template.jinja",   # Jinja2 chat template
-        "chat_template.json",    # JSON chat template
+        "chat_template.jinja",  # Jinja2 chat template
+        "chat_template.json",  # JSON chat template
         # Other config files
         "preprocessor_config.json",
     ]
@@ -576,11 +573,11 @@ def preserve_model_config(source_path: Path, dest_path: Path) -> None:
 
     try:
         # Read original config
-        with open(source_config_path, "r", encoding="utf-8") as f:
+        with source_config_path.open(encoding="utf-8") as f:
             original_config = json.load(f)
 
         # Read saved config
-        with open(dest_config_path, "r", encoding="utf-8") as f:
+        with dest_config_path.open(encoding="utf-8") as f:
             saved_config = json.load(f)
 
         # Track fields that were preserved
@@ -597,8 +594,7 @@ def preserve_model_config(source_path: Path, dest_path: Path) -> None:
 
         # Also check for and remove any nested quantization-related configs
         # that might confuse GGUF converters
-        quant_related_keys = [k for k in saved_config.keys()
-                              if 'quant' in k.lower() or 'fp8' in k.lower()]
+        quant_related_keys = [k for k in saved_config if "quant" in k.lower() or "fp8" in k.lower()]
         for key in quant_related_keys:
             skip_fields.add(key)
 
@@ -618,22 +614,21 @@ def preserve_model_config(source_path: Path, dest_path: Path) -> None:
                 preserved_fields.append(key)
 
         # Also ensure architectures matches original (transformers might change it)
-        if "architectures" in original_config:
-            if saved_config.get("architectures") != original_config["architectures"]:
-                saved_config["architectures"] = original_config["architectures"]
-                if "architectures" not in preserved_fields:
-                    preserved_fields.append("architectures")
+        if "architectures" in original_config and saved_config.get("architectures") != original_config["architectures"]:
+            saved_config["architectures"] = original_config["architectures"]
+            if "architectures" not in preserved_fields:
+                preserved_fields.append("architectures")
 
         # Write merged config back
         if preserved_fields or removed_fields:
-            with open(dest_config_path, "w", encoding="utf-8") as f:
+            with dest_config_path.open("w", encoding="utf-8") as f:
                 json.dump(saved_config, f, indent=2)
             if removed_fields:
                 logger.info(f"Removed invalidated config fields: {removed_fields}")
             if preserved_fields:
                 logger.info(f"Preserved {len(preserved_fields)} config fields from original: {preserved_fields}")
 
-    except (json.JSONDecodeError, IOError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         logger.warning(f"Failed to preserve model config: {e}")
 
 
@@ -652,40 +647,46 @@ def _has_vision_weights(model_path: Path) -> bool:
     import struct
 
     vision_prefixes = [
-        "vision_tower", "vision_model", "visual_encoder",
-        "vision_encoder", "image_encoder", "vit.", "visual.",
-        "model.vision_tower", "model.vision_model",
+        "vision_tower",
+        "vision_model",
+        "visual_encoder",
+        "vision_encoder",
+        "image_encoder",
+        "vit.",
+        "visual.",
+        "model.vision_tower",
+        "model.vision_model",
     ]
 
     # Check safetensors index for vision-related weight names
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
+            with index_path.open(encoding="utf-8") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
-            for weight_name in weight_map.keys():
+            for weight_name in weight_map:
                 weight_lower = weight_name.lower()
                 if any(prefix in weight_lower for prefix in vision_prefixes):
                     return True
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     # Check single safetensors file header
     single_safetensors = model_path / "model.safetensors"
     if single_safetensors.exists():
         try:
-            with open(single_safetensors, "rb") as f:
+            with single_safetensors.open("rb") as f:
                 header_size = struct.unpack("<Q", f.read(8))[0]
                 header_json = f.read(header_size).decode("utf-8")
                 header = json.loads(header_json)
-                for weight_name in header.keys():
+                for weight_name in header:
                     if weight_name == "__metadata__":
                         continue
                     weight_lower = weight_name.lower()
                     if any(prefix in weight_lower for prefix in vision_prefixes):
                         return True
-        except (struct.error, json.JSONDecodeError, IOError):
+        except (OSError, struct.error, json.JSONDecodeError):
             pass
 
     return False
@@ -717,7 +718,7 @@ def is_vision_model(model_path: Path) -> bool:
         is_vl_architecture = any(kw in model_name_lower for kw in ["vl", "vision", "llava", "visual", "pixtral"])
     else:
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with config_path.open(encoding="utf-8") as f:
                 config = json.load(f)
 
             # Check for VL architectures
@@ -751,7 +752,7 @@ def is_vision_model(model_path: Path) -> bool:
             if any(kw in model_type for kw in ["vl", "vision", "llava"]):
                 is_vl_architecture = True
 
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     # If architecture suggests VL, verify by checking for actual vision weights
@@ -771,11 +772,11 @@ class AbliterationConfig:
 
     model_path: str
     output_path: str
-    num_prompts: Optional[int] = None  # Number of prompts to sample (None = use all)
+    num_prompts: int | None = None  # Number of prompts to sample (None = use all)
     harmful_prompts: list[str] = field(default_factory=list)
     harmless_prompts: list[str] = field(default_factory=list)
-    target_layers: Optional[list[int]] = None  # None = all layers
-    extraction_layer_indices: Optional[list[int]] = None  # Layers to extract directions from
+    target_layers: list[int] | None = None  # None = all layers
+    extraction_layer_indices: list[int] | None = None  # Layers to extract directions from
     use_mean_direction: bool = True  # Average directions across extraction layers
     normalize_directions: bool = True
     norm_preservation: bool = True  # Rescale weights to preserve Frobenius norm
@@ -783,24 +784,50 @@ class AbliterationConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float32  # Computation dtype
     save_directions: bool = True  # Save computed refusal directions
-    load_directions_path: Optional[str] = None  # Load pre-computed directions
+    load_directions_path: str | None = None  # Load pre-computed directions
     batch_size: int = 4
     max_new_tokens: int = 1  # We only need the first forward pass
-    token_position: str = "last"  # Which token position to extract: "last", "mean", or int
+    token_position: str = "last"  # noqa: S105 - literal token-position enum, not a credential
     filter_harmful_prompts: bool = True  # Filter out harmful prompts that aren't actually refused
     refusal_test_max_tokens: int = 50  # Max tokens to generate when testing for refusal (legacy)
     refusal_test_batch_size: int = 16  # Batch size for refusal testing (larger = faster but more VRAM)
     refusal_threshold: float = -7.0  # Log-likelihood threshold for refusal detection (higher = more likely to refuse)
-    refusal_keywords: list[str] = field(default_factory=lambda: [
-        "I cannot", "I can't", "I'm not able", "I am not able",
-        "I won't", "I will not", "I'm unable", "I am unable",
-        "Sorry", "I apologize", "As an AI", "As a language model",
-        "I'm an AI", "I am an AI", "not appropriate", "against my",
-        "ethical", "illegal", "harmful", "dangerous", "unethical",
-        "I must refuse", "I have to refuse", "cannot assist", "can't assist",
-        "cannot help", "can't help", "cannot provide", "can't provide",
-        "not able to help", "not able to assist", "not able to provide",
-    ])
+    refusal_keywords: list[str] = field(
+        default_factory=lambda: [
+            "I cannot",
+            "I can't",
+            "I'm not able",
+            "I am not able",
+            "I won't",
+            "I will not",
+            "I'm unable",
+            "I am unable",
+            "Sorry",
+            "I apologize",
+            "As an AI",
+            "As a language model",
+            "I'm an AI",
+            "I am an AI",
+            "not appropriate",
+            "against my",
+            "ethical",
+            "illegal",
+            "harmful",
+            "dangerous",
+            "unethical",
+            "I must refuse",
+            "I have to refuse",
+            "cannot assist",
+            "can't assist",
+            "cannot help",
+            "can't help",
+            "cannot provide",
+            "can't provide",
+            "not able to help",
+            "not able to assist",
+            "not able to provide",
+        ]
+    )
 
     # Advanced options: Winsorization (clips outlier activations)
     use_winsorization: bool = False  # Enable per-dimension Winsorization preprocessing
@@ -832,13 +859,13 @@ class AbliterationConfig:
     use_per_neuron_norm: bool = False  # Use per-neuron norm preservation instead of Frobenius
 
     # Biprojection configuration
-    measurement_layers: Optional[list[int]] = None  # Layers to measure refusal direction (auto if None)
-    intervention_layers: Optional[list[int]] = None  # Layers to apply ablation (auto if None)
+    measurement_layers: list[int] | None = None  # Layers to measure refusal direction (auto if None)
+    intervention_layers: list[int] | None = None  # Layers to apply ablation (auto if None)
     num_measurement_layers: int = 2  # How many top-quality layers for measurement
     intervention_range: tuple[float, float] = (0.25, 0.95)  # Depth range for intervention as fraction
 
     # Layer type targeting
-    target_layer_types: Optional[list[str]] = None  # e.g., ['o_proj', 'down_proj'], None = all types
+    target_layer_types: list[str] | None = None  # e.g., ['o_proj', 'down_proj'], None = all types
 
     # Harmless direction boundary clamping
     use_harmless_boundary: bool = False  # Clamp ablation to preserve harmless direction
@@ -849,9 +876,9 @@ class AbliterationConfig:
     min_quality_threshold: float = 0.0  # Skip layers below this quality score
 
     # Layer target map integration (data-driven per-layer weighting)
-    layer_target_map_path: Optional[str] = None  # Path to layer_target_map.json
-    per_layer_multipliers: Optional[dict[int, float]] = None  # Direct multipliers per layer
-    exclude_layers: Optional[list[int]] = None  # Layers to skip entirely
+    layer_target_map_path: str | None = None  # Path to layer_target_map.json
+    per_layer_multipliers: dict[int, float] | None = None  # Direct multipliers per layer
+    exclude_layers: list[int] | None = None  # Layers to skip entirely
     layer_targeting_mode: str = "none"  # "none", "adaptive", "target_map"
 
     # Unmapped layer behavior (when using target map)
@@ -888,13 +915,13 @@ class RefusalDirections:
     """Container for computed refusal directions."""
 
     directions: dict[int, torch.Tensor]  # layer_idx -> direction vector
-    mean_direction: Optional[torch.Tensor] = None
+    mean_direction: torch.Tensor | None = None
     metadata: dict = field(default_factory=dict)
 
     # Biprojection support
-    harmless_directions: Optional[dict[int, torch.Tensor]] = None  # layer_idx -> harmless mean
-    quality_scores: Optional[dict[int, dict[str, float]]] = None  # layer_idx -> {snr, cos_sim, quality}
-    biprojected_direction: Optional[torch.Tensor] = None  # Combined direction from measurement layers
+    harmless_directions: dict[int, torch.Tensor] | None = None  # layer_idx -> harmless mean
+    quality_scores: dict[int, dict[str, float]] | None = None  # layer_idx -> {snr, cos_sim, quality}
+    biprojected_direction: torch.Tensor | None = None  # Combined direction from measurement layers
 
     def save(self, path: str):
         """Save directions to disk."""
@@ -903,9 +930,13 @@ class RefusalDirections:
             "mean_direction": self.mean_direction.cpu() if self.mean_direction is not None else None,
             "metadata": self.metadata,
             # Biprojection fields
-            "harmless_directions": {k: v.cpu() for k, v in self.harmless_directions.items()} if self.harmless_directions else None,
+            "harmless_directions": {k: v.cpu() for k, v in self.harmless_directions.items()}
+            if self.harmless_directions
+            else None,
             "quality_scores": self.quality_scores,
-            "biprojected_direction": self.biprojected_direction.cpu() if self.biprojected_direction is not None else None,
+            "biprojected_direction": self.biprojected_direction.cpu()
+            if self.biprojected_direction is not None
+            else None,
         }
         torch.save(save_dict, path)
         logger.info(f"Saved refusal directions to {path}")
@@ -940,8 +971,7 @@ class HybridArchitectureInfo:
 
 
 def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
-    """
-    Detect hybrid attention architecture from model config.json.
+    """Detect hybrid attention architecture from model config.json.
 
     Reads layer_types from config.json to identify models with mixed
     full attention and linear attention layers (e.g., Qwen3.5 with
@@ -957,17 +987,23 @@ def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
     config_path = Path(model_path) / "config.json"
     if not config_path.exists():
         return HybridArchitectureInfo(
-            is_hybrid=False, layer_types=[], full_attention_indices=[],
-            linear_attention_indices=[], full_attention_interval=0,
+            is_hybrid=False,
+            layer_types=[],
+            full_attention_indices=[],
+            linear_attention_indices=[],
+            full_attention_interval=0,
         )
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with config_path.open(encoding="utf-8") as f:
             config = json.load(f)
     except (json.JSONDecodeError, OSError):
         return HybridArchitectureInfo(
-            is_hybrid=False, layer_types=[], full_attention_indices=[],
-            linear_attention_indices=[], full_attention_interval=0,
+            is_hybrid=False,
+            layer_types=[],
+            full_attention_indices=[],
+            linear_attention_indices=[],
+            full_attention_interval=0,
         )
 
     # Look for layer_types in text_config (VL models) or top-level
@@ -979,8 +1015,11 @@ def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
 
     if not layer_types_raw or not isinstance(layer_types_raw, list):
         return HybridArchitectureInfo(
-            is_hybrid=False, layer_types=[], full_attention_indices=[],
-            linear_attention_indices=[], full_attention_interval=0,
+            is_hybrid=False,
+            layer_types=[],
+            full_attention_indices=[],
+            linear_attention_indices=[],
+            full_attention_interval=0,
         )
 
     # Normalize layer type names
@@ -1015,6 +1054,7 @@ def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
         intervals = [full_indices[i + 1] - full_indices[i] for i in range(len(full_indices) - 1)]
         # Use the most common interval
         from collections import Counter
+
         interval = Counter(intervals).most_common(1)[0][0]
     elif len(full_indices) == 1:
         interval = len(layer_types_raw)  # Only one full attention layer
@@ -1053,28 +1093,29 @@ class ActivationExtractor:
             if hasattr(self.model.model, "model") and hasattr(self.model.model.model, "layers"):
                 return self.model.model.model.layers
             # VL MoE models, Mistral3, Qwen3.5 (Qwen3-VL-MoE, Qwen2-VL-MoE, Mistral3, Qwen3_5, etc.)
-            # Structure: model.model.language_model.layers
+            # Layers live under "model.model.language_model.layers".
             if hasattr(self.model.model, "language_model") and hasattr(self.model.model.language_model, "layers"):
                 return self.model.model.language_model.layers
-            # Standard text models (Llama, Qwen, etc.)
-            # Structure: model.model.layers
+            # Standard text models (Llama, Qwen, etc.) keep layers under "model.model.layers".
             if hasattr(self.model.model, "layers"):
                 return self.model.model.layers
-            elif hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):
+            if hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):
                 return self.model.model.decoder.layers
         # VL models with language_model attribute (some LLaVA variants, InternVL, GLM4v, etc.)
         if hasattr(self.model, "language_model"):
             if hasattr(self.model.language_model, "model") and hasattr(self.model.language_model.model, "layers"):
                 return self.model.language_model.model.layers
             # GLM4v and similar: language_model.transformer.layers
-            if hasattr(self.model.language_model, "transformer") and hasattr(self.model.language_model.transformer, "layers"):
+            if hasattr(self.model.language_model, "transformer") and hasattr(
+                self.model.language_model.transformer, "layers"
+            ):
                 return self.model.language_model.transformer.layers
             if hasattr(self.model.language_model, "layers"):
                 return self.model.language_model.layers
         if hasattr(self.model, "transformer"):
             if hasattr(self.model.transformer, "h"):
                 return self.model.transformer.h
-            elif hasattr(self.model.transformer, "layers"):
+            if hasattr(self.model.transformer, "layers"):
                 return self.model.transformer.layers
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
             return self.model.gpt_neox.layers
@@ -1112,32 +1153,29 @@ class ActivationExtractor:
                     elif isinstance(attr, torch.nn.Module):
                         lines.append(f"{prefix}{name}: {type(attr).__name__}")
                         explore(attr, prefix + "  ", depth + 1)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping attribute %s during model exploration: %s", name, exc)
 
         explore(self.model)
         return "\n".join(lines[:50])  # Limit output
 
-    def _create_hook(self, layer_idx: int, hidden_dim: Optional[int] = None):
+    def _create_hook(self, layer_idx: int, hidden_dim: int | None = None):  # noqa: ARG002 - reserved for future Welford-mode use
         """Create a forward hook for a specific layer.
 
         Args:
             layer_idx: Index of the layer to hook
-            hidden_dim: Hidden dimension size (required for Welford mode)
+            hidden_dim: Hidden dimension size (reserved for future Welford mode)
         """
 
-        def hook(module, input, output):
+        def hook(module, input, output):  # noqa: ARG001 - torch forward-hook signature
             # Handle different output formats
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-            else:
-                hidden_states = output
+            hidden_states = output[0] if isinstance(output, tuple) else output
 
             # Extract based on token position config
-            if self.config.token_position == "last":
+            if self.config.token_position == "last":  # noqa: S105 - enum string, not a credential
                 # Get the last non-padding token
                 extracted = hidden_states[:, -1, :]
-            elif self.config.token_position == "mean":
+            elif self.config.token_position == "mean":  # noqa: S105 - enum string, not a credential
                 extracted = hidden_states.mean(dim=1)
             elif isinstance(self.config.token_position, int):
                 extracted = hidden_states[:, self.config.token_position, :]
@@ -1160,7 +1198,7 @@ class ActivationExtractor:
 
         return hook
 
-    def register_hooks(self, layer_indices: Optional[list[int]] = None):
+    def register_hooks(self, layer_indices: list[int] | None = None):
         """Register forward hooks on specified layers."""
         layers = self._get_layers()
         num_layers = len(layers)
@@ -1208,9 +1246,7 @@ class ActivationExtractor:
                 formatted_prompts = []
                 for prompt in batch_prompts:
                     messages = [{"role": "user", "content": prompt}]
-                    formatted = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                    formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                     formatted_prompts.append(formatted)
             else:
                 formatted_prompts = batch_prompts
@@ -1247,10 +1283,7 @@ class ActivationExtractor:
         Returns:
             Dict mapping layer_idx to mean activation [hidden_dim]
         """
-        return {
-            layer_idx: acc.get_mean()
-            for layer_idx, acc in self.welford_accumulators.items()
-        }
+        return {layer_idx: acc.get_mean() for layer_idx, acc in self.welford_accumulators.items()}
 
 
 # Adaptive Layer Weighting
@@ -1262,8 +1295,7 @@ def compute_adaptive_layer_weights(
     sigma: float = 0.2,
     min_weight: float = 0.1,
 ) -> dict[int, float]:
-    """
-    Compute adaptive weights for each layer using a Gaussian distribution.
+    """Compute adaptive weights for each layer using a Gaussian distribution.
 
     Research shows refusal behavior is more concentrated in middle-to-later layers.
     This function assigns higher weights to layers around the specified center
@@ -1302,8 +1334,7 @@ def compute_adaptive_layer_weights(
 
 
 def load_layer_target_map(path: str) -> dict:
-    """
-    Load and parse a layer target map from a JSON file.
+    """Load and parse a layer target map from a JSON file.
 
     The layer target map provides data-driven per-layer abliteration weights
     based on feature distribution analysis. It identifies which layers to
@@ -1321,15 +1352,13 @@ def load_layer_target_map(path: str) -> dict:
             - recommended_sigma_ratio: float for Gaussian fallback
             - metadata: dict with layer_stats, aggressive_layers, protected_layers
     """
-    with open(path, "r", encoding="utf-8") as f:
+    with Path(path).open(encoding="utf-8") as f:
         raw_config = json.load(f)
 
     # Convert string keys to int for layer_multipliers
     per_layer_multipliers = {}
     if "layer_multipliers" in raw_config:
-        per_layer_multipliers = {
-            int(k): float(v) for k, v in raw_config["layer_multipliers"].items()
-        }
+        per_layer_multipliers = {int(k): float(v) for k, v in raw_config["layer_multipliers"].items()}
     elif "abliteration_config" in raw_config and "per_layer_multipliers" in raw_config["abliteration_config"]:
         per_layer_multipliers = {
             int(k): float(v) for k, v in raw_config["abliteration_config"]["per_layer_multipliers"].items()
@@ -1381,8 +1410,7 @@ def load_layer_target_map(path: str) -> dict:
 
 
 def validate_layer_target_map(target_map: dict, num_layers: int) -> list[str]:
-    """
-    Validate a layer target map against a model's architecture.
+    """Validate a layer target map against a model's architecture.
 
     Checks that layer indices are valid and warns about gaps in coverage.
 
@@ -1393,21 +1421,18 @@ def validate_layer_target_map(target_map: dict, num_layers: int) -> list[str]:
     Returns:
         List of warning messages (empty if no issues found)
     """
-    warnings = []
-
     # Check layer indices don't exceed model layers
     per_layer_multipliers = target_map.get("per_layer_multipliers", {})
-    for layer_idx in per_layer_multipliers.keys():
-        if layer_idx >= num_layers:
-            warnings.append(
-                f"Layer {layer_idx} in target map exceeds model layers ({num_layers})"
-            )
-
-    for layer_idx in target_map.get("exclude_layers", []):
-        if layer_idx >= num_layers:
-            warnings.append(
-                f"Excluded layer {layer_idx} exceeds model layers ({num_layers})"
-            )
+    warnings = [
+        f"Layer {layer_idx} in target map exceeds model layers ({num_layers})"
+        for layer_idx in per_layer_multipliers
+        if layer_idx >= num_layers
+    ]
+    warnings.extend(
+        f"Excluded layer {layer_idx} exceeds model layers ({num_layers})"
+        for layer_idx in target_map.get("exclude_layers", [])
+        if layer_idx >= num_layers
+    )
 
     # Check for layers not covered by map
     covered_layers = set(per_layer_multipliers.keys())
@@ -1424,8 +1449,7 @@ def validate_layer_target_map(target_map: dict, num_layers: int) -> list[str]:
             warnings.append(f"Layers not in target map: {missing_sorted}")
         else:
             warnings.append(
-                f"Layers not in target map: {missing_sorted[:5]}...{missing_sorted[-5:]} "
-                f"({len(missing_sorted)} total)"
+                f"Layers not in target map: {missing_sorted[:5]}...{missing_sorted[-5:]} ({len(missing_sorted)} total)"
             )
 
     return warnings
@@ -1438,8 +1462,7 @@ def winsorize_activations(
     activations: torch.Tensor,
     percentile: float = 0.995,
 ) -> torch.Tensor:
-    """
-    Apply per-dimension Winsorization to clip extreme activation values.
+    """Apply per-dimension Winsorization to clip extreme activation values.
 
     Critical for models like Gemma 3 where high-magnitude outliers
     can obscure the true refusal direction. Computes thresholds
@@ -1457,17 +1480,14 @@ def winsorize_activations(
     thresholds = torch.quantile(abs_acts.float(), percentile, dim=0)
 
     # Clip to thresholds (both positive and negative)
-    clipped = torch.clamp(activations, -thresholds, thresholds)
-
-    return clipped
+    return torch.clamp(activations, -thresholds, thresholds)
 
 
 def magnitude_clip_activations(
     activations: torch.Tensor,
     percentile: float = 0.99,
 ) -> torch.Tensor:
-    """
-    Apply global magnitude clipping.
+    """Apply global magnitude clipping.
 
     Unlike per-dimension Winsorization, this clips based on the global
     magnitude of each activation vector. This can be more effective when
@@ -1497,8 +1517,7 @@ def magnitude_clip_activations(
 
 
 class WelfordMeanAccumulator:
-    """
-    Welford's online algorithm for numerically stable streaming mean computation.
+    """Welford's online algorithm for numerically stable streaming mean computation.
 
     This is more numerically stable than the naive sum-and-divide approach,
     especially for large numbers of samples or when values have high variance.
@@ -1508,8 +1527,7 @@ class WelfordMeanAccumulator:
     """
 
     def __init__(self, hidden_dim: int, device: str = "cpu", dtype: torch.dtype = torch.float32):
-        """
-        Initialize the accumulator.
+        """Initialize the accumulator.
 
         Args:
             hidden_dim: Dimension of the activation vectors
@@ -1523,8 +1541,7 @@ class WelfordMeanAccumulator:
         self.dtype = dtype
 
     def update(self, batch: torch.Tensor) -> None:
-        """
-        Update running mean with a batch of samples.
+        """Update running mean with a batch of samples.
 
         Uses the batch Welford update formula for efficiency:
             new_count = count + batch_size
@@ -1567,8 +1584,7 @@ def compute_mean_welford(
     hidden_dim: int,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """
-    Compute mean using Welford's online algorithm for numerical stability.
+    """Compute mean using Welford's online algorithm for numerical stability.
 
     Args:
         activations_list: List of [batch_size, hidden_dim] tensors
@@ -1590,8 +1606,7 @@ def compute_refusal_direction_float64(
     harmful_mean: torch.Tensor,
     harmless_mean: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Compute refusal direction using float64 for numerical stability.
+    """Compute refusal direction using float64 for numerical stability.
 
     When harmful and harmless means have high cosine similarity (common in
     well-trained models), the difference can suffer from catastrophic
@@ -1606,16 +1621,14 @@ def compute_refusal_direction_float64(
         Refusal direction in float32 [hidden_dim]
     """
     # Perform subtraction in float64 to avoid catastrophic cancellation
-    direction = (harmful_mean.double() - harmless_mean.double()).float()
-    return direction
+    return (harmful_mean.double() - harmless_mean.double()).float()
 
 
 def orthogonalize_against_harmless(
     refusal_dir: torch.Tensor,
     harmless_mean: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Orthogonalize refusal direction against harmless direction.
+    """Orthogonalize refusal direction against harmless direction.
 
     The raw refusal direction r = harmful_mean - harmless_mean contains two components:
         - r_parallel: Component aligned with harmless direction (general helpfulness magnitude)
@@ -1647,9 +1660,7 @@ def orthogonalize_against_harmless(
     projection_scalar = refusal_float @ harmless_normalized
 
     # Remove parallel component (keep only perpendicular)
-    refusal_orthogonal = refusal_float - projection_scalar * harmless_normalized
-
-    return refusal_orthogonal
+    return refusal_float - projection_scalar * harmless_normalized
 
 
 # Biprojection: SNR-Based Layer Quality Scoring
@@ -1660,8 +1671,7 @@ def compute_direction_quality_scores(
     harmless_activations: dict[int, torch.Tensor],
     hybrid_info: Optional["HybridArchitectureInfo"] = None,
 ) -> dict[int, dict[str, float]]:
-    """
-    Compute SNR-based quality scores for refusal directions at each layer.
+    """Compute SNR-based quality scores for refusal directions at each layer.
 
     Args:
         harmful_activations: Per-layer harmful prompt activations {layer_idx: tensor}
@@ -1695,10 +1705,7 @@ def compute_direction_quality_scores(
         snr = refusal_norm / (max_norm + 1e-8)
 
         # Cosine similarity between harmful and harmless means
-        cos_sim = F.cosine_similarity(
-            harmful_mean.unsqueeze(0),
-            harmless_mean.unsqueeze(0)
-        ).item()
+        cos_sim = F.cosine_similarity(harmful_mean.unsqueeze(0), harmless_mean.unsqueeze(0)).item()
 
         quality = snr * (1 - cos_sim)
 
@@ -1731,8 +1738,7 @@ def select_biprojection_layers(
     num_measurement_layers: int = 2,
     intervention_range: tuple[float, float] = (0.25, 0.95),
 ) -> tuple[list[int], list[int]]:
-    """
-    Select measurement and intervention layers for biprojection.
+    """Select measurement and intervention layers for biprojection.
 
     Strategy:
         1. Measurement layers: Top N layers by quality score (where refusal is clearest)
@@ -1748,11 +1754,7 @@ def select_biprojection_layers(
         (measurement_layers, intervention_layers)
     """
     # Sort layers by quality score (descending)
-    sorted_layers = sorted(
-        quality_scores.items(),
-        key=lambda x: x[1]["quality"],
-        reverse=True
-    )
+    sorted_layers = sorted(quality_scores.items(), key=lambda x: x[1]["quality"], reverse=True)
 
     # Top layers for measurement
     measurement_layers = [layer_idx for layer_idx, _ in sorted_layers[:num_measurement_layers]]
@@ -1776,8 +1778,7 @@ def compute_refusal_directions(
     tokenizer: AutoTokenizer,
     config: AbliterationConfig,
 ) -> RefusalDirections:
-    """
-    Compute refusal directions from contrastive prompt pairs.
+    """Compute refusal directions from contrastive prompt pairs.
 
     The refusal direction is computed as the mean difference between
     harmful and harmless prompt activations at each layer.
@@ -1797,7 +1798,12 @@ def compute_refusal_directions(
         # Dynamic layer targeting: extract from ALL layers
         extraction_layers = list(range(num_layers))
         logger.info(f"Dynamic layer targeting enabled: extracting from all {num_layers} layers")
-    elif hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto" and config.extraction_layer_indices is None:
+    elif (
+        hybrid_info
+        and hybrid_info.is_hybrid
+        and config.hybrid_strategy == "auto"
+        and config.extraction_layer_indices is None
+    ):
         # Hybrid-aware extraction: all full attention layers + the linear attention layer before each
         extraction_layers = []
         for fa_idx in hybrid_info.full_attention_indices:
@@ -1963,10 +1969,7 @@ def compute_refusal_directions(
         )
 
         # Average directions from measurement layers
-        measurement_directions = [
-            directions[layer_idx] for layer_idx in measurement_layers
-            if layer_idx in directions
-        ]
+        measurement_directions = [directions[layer_idx] for layer_idx in measurement_layers if layer_idx in directions]
         if measurement_directions:
             biprojected_direction = torch.stack(measurement_directions).mean(dim=0)
             if config.normalize_directions:
@@ -2012,8 +2015,7 @@ def compute_refusal_directions(
 
 
 def orthogonal_projection_matrix(direction: torch.Tensor) -> torch.Tensor:
-    """
-    Compute the orthogonal projection matrix that removes the component along `direction`.
+    """Compute the orthogonal projection matrix that removes the component along `direction`.
 
     P = I - (d @ d^T) / (d^T @ d)
 
@@ -2035,8 +2037,7 @@ def apply_norm_preserving_projection(
     preserve_norm: bool = True,
     multiplier: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Apply norm-preserving orthogonal projection to a weight matrix.
+    """Apply norm-preserving orthogonal projection to a weight matrix.
 
     This removes the component of each row (or column, depending on the weight's role)
     that aligns with the refusal direction, then optionally rescales to preserve
@@ -2076,9 +2077,8 @@ def apply_norm_preserving_projection(
         weight_new = weight_float - adjustment
 
     elif direction_float.shape[0] == weight_float.shape[0]:
-        # Project along output dimension (rows)
-        # W_new = P @ W
-        # Equivalent to: W_new = W - d @ (d^T @ W)
+        # Project along the output dimension (rows): W_new = P @ W,
+        # which is equivalent to W_new = W - d @ (d^T @ W).
         proj_coeffs = direction_float @ weight_float  # [in_features]
         proj_coeffs = proj_coeffs * multiplier
         adjustment = torch.outer(direction_float, proj_coeffs)  # [out_features, in_features]
@@ -2103,14 +2103,15 @@ def apply_per_neuron_norm_preserving_projection(
     weight: torch.Tensor,
     refusal_dir: torch.Tensor,
     scale_factor: float = 1.0,
-    harmless_dir: Optional[torch.Tensor] = None,
+    harmless_dir: torch.Tensor | None = None,
     clamp_ratio: float = 0.1,
-    null_space_V: Optional[torch.Tensor] = None,
+    null_space_V: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Decompose W into magnitude M (per-row norms) and direction W_hat,
-    ablate only the direction component, then recombine with original magnitudes.
-    This preserves per-neuron activation scales better than Frobenius norm preservation.
+    """Ablate only the direction component of W while preserving per-row magnitudes.
+
+    Decomposes W into magnitude M (per-row norms) and direction W_hat, ablates the
+    direction component, and recombines with the original magnitudes. This preserves
+    per-neuron activation scales better than Frobenius-norm preservation.
 
     Mathematical formulation:
         W = M @ W_hat  where M = diag(||W[i,:]||) and W_hat[i,:] = W[i,:] / ||W[i,:]||
@@ -2145,9 +2146,7 @@ def apply_per_neuron_norm_preserving_projection(
         # Direction aligns with output dimension
         project_input = False
     else:
-        logger.warning(
-            f"Direction shape {refusal_dir.shape} doesn't match weight shape {weight_float.shape}, skipping"
-        )
+        logger.warning(f"Direction shape {refusal_dir.shape} doesn't match weight shape {weight_float.shape}, skipping")
         return weight
 
     # Normalize refusal direction
@@ -2162,12 +2161,12 @@ def apply_per_neuron_norm_preserving_projection(
 
         W_direction = weight_float / W_norm  # Normalized direction [out_features, in_features]
 
-        # Compute per-neuron projection onto refusal direction
-        # projection[i] = W_direction[i,:] . refusal_normalized
+        # Per-neuron projection onto the refusal direction:
+        # projection[i] equals the dot product of W_direction[i, :] with refusal_normalized.
         projection = W_direction @ refusal_normalized  # [out_features]
 
-        # Ablate: remove component along refusal direction
-        # W_direction_new[i,:] = W_direction[i,:] - scale_factor * projection[i] * refusal_normalized
+        # Ablate the component along the refusal direction:
+        # W_direction_new[i, :] = W_direction[i, :] - scale_factor * projection[i] * refusal_normalized.
         W_direction_new = W_direction - scale_factor * torch.outer(projection, refusal_normalized)
 
         # Optional: apply null-space constraint before re-normalization
@@ -2235,8 +2234,7 @@ def apply_per_neuron_norm_preserving_projection(
 
 
 def _get_language_model_root(model: AutoModelForCausalLM) -> tuple[torch.nn.Module, str]:
-    """
-    Find the language model root module for VL and standard architectures.
+    """Find the language model root module for VL and standard architectures.
 
     Returns (root_module, prefix) where prefix is the dotted path from the
     top-level model to root_module. For standard text models, prefix may be ""
@@ -2281,8 +2279,7 @@ def _get_language_model_root(model: AutoModelForCausalLM) -> tuple[torch.nn.Modu
 
 
 def get_linear_layer_names(model: AutoModelForCausalLM) -> list[str]:
-    """
-    Get names of all linear layers in the language model.
+    """Get names of all linear layers in the language model.
 
     For VL models, only returns layers within the language model submodule
     (excluding vision encoder, projector, etc.) plus lm_head if present.
@@ -2316,7 +2313,7 @@ def get_linear_layer_names(model: AutoModelForCausalLM) -> list[str]:
     return linear_names
 
 
-def get_layer_index_from_name(name: str) -> Optional[int]:
+def get_layer_index_from_name(name: str) -> int | None:
     """Extract layer index from a parameter name."""
     import re
 
@@ -2334,9 +2331,8 @@ def get_layer_index_from_name(name: str) -> Optional[int]:
     return None
 
 
-def get_layer_type_from_name(name: str) -> Optional[str]:
-    """
-    Extract the layer type (sublayer name) from a full parameter path.
+def get_layer_type_from_name(name: str) -> str | None:
+    """Extract the layer type (sublayer name) from a full parameter path.
 
     For transformer layers, identifies specific sublayers:
         - q_proj, k_proj, v_proj: attention query/key/value projections
@@ -2353,16 +2349,28 @@ def get_layer_type_from_name(name: str) -> Optional[str]:
     """
     # Common layer type patterns (order matters - check more specific first)
     layer_types = [
-        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-        "gate_proj", "up_proj", "down_proj",      # MLP
-        "qkv_proj", "out_proj",                   # Alternative naming
-        "in_proj_a", "in_proj_b",                 # Hybrid linear attention (Qwen3.5 SSM)
-        "in_proj_qkv", "in_proj_z",              # Hybrid linear attention (Qwen3.5 SSM)
-        "fc1", "fc2",                             # GPT-style MLP
-        "c_attn", "c_proj",                       # GPT-2 naming
-        "w1", "w2", "w3",                         # MoE expert layers (Mixtral/GptOss)
-        "router",                                  # MoE router
-        "lm_head",                                # Output head
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",  # Attention
+        "gate_proj",
+        "up_proj",
+        "down_proj",  # MLP
+        "qkv_proj",
+        "out_proj",  # Alternative naming
+        "in_proj_a",
+        "in_proj_b",  # Hybrid linear attention (Qwen3.5 SSM)
+        "in_proj_qkv",
+        "in_proj_z",  # Hybrid linear attention (Qwen3.5 SSM)
+        "fc1",
+        "fc2",  # GPT-style MLP
+        "c_attn",
+        "c_proj",  # GPT-2 naming
+        "w1",
+        "w2",
+        "w3",  # MoE expert layers (Mixtral/GptOss)
+        "router",  # MoE router
+        "lm_head",  # Output head
     ]
 
     name_lower = name.lower()
@@ -2375,10 +2383,9 @@ def get_layer_type_from_name(name: str) -> Optional[str]:
 
 def filter_layers_by_type(
     linear_names: list[str],
-    target_types: Optional[list[str]] = None,
+    target_types: list[str] | None = None,
 ) -> list[str]:
-    """
-    Filter linear layer names to only include specified types.
+    """Filter linear layer names to only include specified types.
 
     Args:
         linear_names: List of all linear layer names
@@ -2410,8 +2417,7 @@ def abliterate_model(
     config: AbliterationConfig,
     null_space_projector: Optional["NullSpaceProjector"] = None,
 ) -> AutoModelForCausalLM:
-    """
-    Apply norm-preserving orthogonal projection abliteration to the model.
+    """Apply norm-preserving orthogonal projection abliteration to the model.
 
     This modifies the model's weights in-place to remove refusal behavior.
 
@@ -2519,22 +2525,19 @@ def abliterate_model(
         layer_idx = get_layer_index_from_name(name)
 
         # Check intervention layer range for biprojection
-        if intervention_layers is not None and layer_idx is not None:
-            if layer_idx not in intervention_layers:
-                skipped_count += 1
-                continue
+        if intervention_layers is not None and layer_idx is not None and layer_idx not in intervention_layers:
+            skipped_count += 1
+            continue
 
         # Check target_layers (legacy config option)
-        if config.target_layers is not None and layer_idx is not None:
-            if layer_idx not in config.target_layers:
-                skipped_count += 1
-                continue
+        if config.target_layers is not None and layer_idx is not None and layer_idx not in config.target_layers:
+            skipped_count += 1
+            continue
 
         # Check excluded layers from target map
-        if config.exclude_layers and layer_idx is not None:
-            if layer_idx in config.exclude_layers:
-                skipped_count += 1
-                continue
+        if config.exclude_layers and layer_idx is not None and layer_idx in config.exclude_layers:
+            skipped_count += 1
+            continue
 
         # Hybrid architecture: skip recurrent dynamics projections
         if hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto":
@@ -2657,7 +2660,7 @@ def abliterate_model(
 # Main Pipeline
 
 
-def load_prompts(split: str, num_prompts: Optional[int] = None) -> list[str]:
+def load_prompts(split: str, num_prompts: int | None = None) -> list[str]:
     """Load ``num_prompts`` samples from a RevivifAI/derestriction split."""
     return load_split(split, n=num_prompts)
 
@@ -2666,8 +2669,7 @@ def load_prompts(split: str, num_prompts: Optional[int] = None) -> list[str]:
 
 
 def is_refusal_response(response: str, refusal_keywords: list[str]) -> bool:
-    """
-    Check if a model response indicates a refusal.
+    """Check if a model response indicates a refusal.
 
     Args:
         response: The model's generated response
@@ -2677,10 +2679,7 @@ def is_refusal_response(response: str, refusal_keywords: list[str]) -> bool:
         True if the response appears to be a refusal
     """
     response_lower = response.lower()
-    for keyword in refusal_keywords:
-        if keyword.lower() in response_lower:
-            return True
-    return False
+    return any(keyword.lower() in response_lower for keyword in refusal_keywords)
 
 
 @torch.no_grad()
@@ -2691,8 +2690,7 @@ def test_prompts_for_refusal_batch(
     config: AbliterationConfig,
     show_progress: bool = False,
 ) -> list[tuple[str, bool, str]]:
-    """
-    Test multiple prompts for refusal in batches (much faster than one-by-one).
+    """Test multiple prompts for refusal in batches (much faster than one-by-one).
 
     Args:
         prompts: List of prompts to test
@@ -2724,9 +2722,7 @@ def test_prompts_for_refusal_batch(
             formatted_prompts = []
             for prompt in batch_prompts:
                 messages = [{"role": "user", "content": prompt}]
-                formatted = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 formatted_prompts.append(formatted)
         else:
             formatted_prompts = batch_prompts
@@ -2749,7 +2745,7 @@ def test_prompts_for_refusal_batch(
             )
 
         # Decode each response in the batch
-        for j, (prompt, output) in enumerate(zip(batch_prompts, outputs)):
+        for j, (prompt, output) in enumerate(zip(batch_prompts, outputs, strict=False)):
             # Get the input length for this specific prompt
             input_len = (inputs["attention_mask"][j] == 1).sum().item()
             generated_tokens = output[input_len:]
@@ -2766,11 +2762,11 @@ def filter_harmful_prompts_by_refusal(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     config: AbliterationConfig,
-    target_count: Optional[int] = None,
+    target_count: int | None = None,
 ) -> tuple[list[str], list[str]]:
-    """
-    Filter harmful prompts to only include those that the model actually refuses.
-    Uses log-likelihood based detection for fast, accurate refusal prediction
+    """Filter harmful prompts to only those the model actually refuses.
+
+    Uses log-likelihood-based detection for fast, accurate refusal prediction
     without generating responses.
 
     Args:
@@ -2814,7 +2810,7 @@ def filter_harmful_prompts_by_refusal(
             # Use log-likelihood detection (no generation needed)
             batch_results = detector.detect_refusal_with_scores(batch_prompts)
 
-            for prompt, (is_refused, score) in zip(batch_prompts, batch_results):
+            for prompt, (is_refused, score) in zip(batch_prompts, batch_results, strict=False):
                 tested_count += 1
                 if is_refused:
                     refused_prompts.append(prompt)
@@ -2827,7 +2823,7 @@ def filter_harmful_prompts_by_refusal(
                     non_refused_prompts.append(prompt)
                     logger.debug(f"NOT REFUSED (score={score:.2f}): {prompt[:50]}...")
 
-    logger.info(f"Refusal filtering complete:")
+    logger.info("Refusal filtering complete:")
     logger.info(f"  - Prompts tested: {tested_count}")
     logger.info(f"  - Prompts refused: {len(refused_prompts)}")
     logger.info(f"  - Prompts NOT refused: {len(non_refused_prompts)}")
@@ -2947,7 +2943,6 @@ def run_abliteration(config: AbliterationConfig):
     if config.use_null_space:
         from src.null_space import (
             NullSpaceConfig,
-            NullSpaceProjector,
             compute_null_space_projectors,
         )
 
@@ -3024,8 +3019,10 @@ def run_abliteration(config: AbliterationConfig):
             reference_prompts=kl_reference_prompts,
             null_space_projector=null_space_projector,
         )
-        logger.info(f"Auto-tune complete: best_multiplier={auto_tune_result.best_multiplier:.4f}, "
-                     f"KL={auto_tune_result.best_kl:.4f}, converged={auto_tune_result.converged}")
+        logger.info(
+            f"Auto-tune complete: best_multiplier={auto_tune_result.best_multiplier:.4f}, "
+            f"KL={auto_tune_result.best_kl:.4f}, converged={auto_tune_result.converged}"
+        )
     else:
         model = abliterate_model(model, directions, config, null_space_projector)
 
@@ -3033,8 +3030,10 @@ def run_abliteration(config: AbliterationConfig):
     if config.use_kl_monitoring and kl_monitor is not None and auto_tune_result is None:
         logger.info("Computing KL divergence on reference prompts...")
         kl_result = kl_monitor.compute_kl_divergence(kl_reference_prompts, config.direction_multiplier)
-        logger.info(f"KL divergence: mean={kl_result.mean_kl:.4f}, median={kl_result.median_kl:.4f}, "
-                     f"max={kl_result.max_kl:.4f}, std={kl_result.std_kl:.4f}")
+        logger.info(
+            f"KL divergence: mean={kl_result.mean_kl:.4f}, median={kl_result.median_kl:.4f}, "
+            f"max={kl_result.max_kl:.4f}, std={kl_result.std_kl:.4f}"
+        )
 
     # Save the modified model (with version suffix if path already exists)
     output_path = get_versioned_path(config.output_path)
@@ -3128,7 +3127,9 @@ def run_abliteration(config: AbliterationConfig):
         "layer_target_map_path": config.layer_target_map_path,
         "exclude_layers": config.exclude_layers,
         "unmapped_layer_behavior": config.unmapped_layer_behavior if config.layer_target_map_path else None,
-        "unmapped_layer_multiplier": config.unmapped_layer_multiplier if config.unmapped_layer_behavior == "default" else None,
+        "unmapped_layer_multiplier": config.unmapped_layer_multiplier
+        if config.unmapped_layer_behavior == "default"
+        else None,
         "num_layers_with_multipliers": len(config.per_layer_multipliers) if config.per_layer_multipliers else None,
         # Dynamic layer targeting
         "dynamic_layer_targeting": config.dynamic_layer_targeting,
@@ -3137,7 +3138,9 @@ def run_abliteration(config: AbliterationConfig):
         "use_kl_auto_tune": config.use_kl_auto_tune,
         "kl_threshold": config.kl_threshold if config.use_kl_auto_tune else None,
         "kl_top_k": config.kl_top_k if (config.use_kl_monitoring or config.use_kl_auto_tune) else None,
-        "kl_num_reference_prompts": config.kl_num_reference_prompts if (config.use_kl_monitoring or config.use_kl_auto_tune) else None,
+        "kl_num_reference_prompts": config.kl_num_reference_prompts
+        if (config.use_kl_monitoring or config.use_kl_auto_tune)
+        else None,
     }
 
     # Add auto-tune result to config if available
@@ -3149,7 +3152,7 @@ def run_abliteration(config: AbliterationConfig):
             "num_iterations": auto_tune_result.num_iterations,
         }
 
-    with open(output_path / "abliteration_config.json", "w", encoding="utf-8") as f:
+    with (output_path / "abliteration_config.json").open("w", encoding="utf-8") as f:
         json.dump(make_json_serializable(config_save), f, indent=2)
 
     # Save KL divergence report if monitoring was active
@@ -3163,7 +3166,9 @@ def run_abliteration(config: AbliterationConfig):
 
     return model, tokenizer
 
+
 def main():
+    """Command-line entry point for norm-preserving orthogonal projection abliteration."""
     parser = argparse.ArgumentParser(
         description="Norm-Preserving Orthogonal Projection Abliteration",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3199,8 +3204,7 @@ Examples:
         "--num_prompts",
         type=int,
         default=30,
-        help="Number of prompts to sample from each RevivifAI/derestriction "
-        "split (default: 30).",
+        help="Number of prompts to sample from each RevivifAI/derestriction split (default: 30).",
     )
     parser.add_argument(
         "--target_layers",

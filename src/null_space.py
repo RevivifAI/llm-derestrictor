@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Null-Space Constrained Abliteration
+"""Null-Space Constrained Abliteration.
 
 Extends norm-preserving orthogonal projection with null-space constraints
 from AlphaEdit (ICLR 2025) to preserve model capabilities on specified inputs.
@@ -29,8 +28,6 @@ This ensures: W_new @ k_i ≈ W @ k_i for all preserved activations k_i
 
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -74,9 +71,7 @@ class NullSpaceProjector:
     def save(self, path: str):
         """Save projectors to disk."""
         save_dict = {
-            "low_rank_factors": {
-                k: (v.cpu(), s.cpu()) for k, (v, s) in self.low_rank_factors.items()
-            },
+            "low_rank_factors": {k: (v.cpu(), s.cpu()) for k, (v, s) in self.low_rank_factors.items()},
             "metadata": self.metadata,
         }
         torch.save(save_dict, path)
@@ -87,13 +82,11 @@ class NullSpaceProjector:
         """Load projectors from disk."""
         data = torch.load(path, map_location="cpu", weights_only=True)
         return cls(
-            low_rank_factors={
-                k: (v, s) for k, (v, s) in data.get("low_rank_factors", {}).items()
-            },
+            low_rank_factors={k: (v, s) for k, (v, s) in data.get("low_rank_factors", {}).items()},
             metadata=data.get("metadata", {}),
         )
 
-    def get_projector_for_layer(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_projector_for_layer(self, layer_idx: int) -> torch.Tensor | None:
         """Get low-rank V matrix for a specific layer."""
         if layer_idx in self.low_rank_factors:
             V, _ = self.low_rank_factors[layer_idx]
@@ -108,8 +101,7 @@ def compute_null_space_projector_svd(
     regularization: float = 1e-4,
     max_samples: int = 2000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute null-space projector using SVD for numerical stability.
+    """Compute null-space projector using SVD for numerical stability.
 
     Given activations K ∈ ℝ^(p×n), we want P_null such that P_null @ k ≈ 0
     for all rows k in K, while preserving other directions.
@@ -177,14 +169,14 @@ def compute_null_space_projector_svd(
         # Always use randomized SVD - it's faster and sufficient for our purpose
         # Full SVD is O(n*m^2) vs randomized O(n*k^2) where k << m
         logger.debug(f"Computing randomized SVD for {n_samples} samples, rank={max_rank_for_randomized}")
-        U, S, V = torch.svd_lowrank(centered, q=max_rank_for_randomized, niter=2)
+        _U, S, V = torch.svd_lowrank(centered, q=max_rank_for_randomized, niter=2)
         Vh = V.T
     except RuntimeError as e:
         logger.warning(f"GPU randomized SVD failed, trying CPU randomized SVD: {e}")
         # Fallback 1: Try randomized SVD on CPU (often more stable than GPU cusolver)
         try:
             centered_cpu = centered.cpu()
-            U, S, V = torch.svd_lowrank(centered_cpu, q=max_rank_for_randomized, niter=2)
+            _U, S, V = torch.svd_lowrank(centered_cpu, q=max_rank_for_randomized, niter=2)
             S = S.to(activations.device)
             Vh = V.T.to(activations.device)
         except RuntimeError as e2:
@@ -211,7 +203,7 @@ def compute_null_space_projector_svd(
                 try:
                     # svd_lowrank is more robust for ill-conditioned matrices
                     target_rank = min(n_samples, hidden_dim, 500)
-                    U, S, V = torch.svd_lowrank(centered, q=target_rank, niter=5)
+                    _U, S, V = torch.svd_lowrank(centered, q=target_rank, niter=5)
                     Vh = V.T
                 except RuntimeError as e4:
                     logger.warning(f"Randomized SVD failed, using safe fallback: {e4}")
@@ -252,8 +244,7 @@ def apply_null_space_projection(
     V: torch.Tensor,
     project_dim: str = "input",
 ) -> torch.Tensor:
-    """
-    Apply null-space projection using low-rank factors.
+    """Apply null-space projection using low-rank factors.
 
     P_null = I - V @ Vᵀ
 
@@ -273,21 +264,19 @@ def apply_null_space_projection(
         # ΔW @ P_null = ΔW - (ΔW @ V) @ Vᵀ
         proj = delta_w @ V  # [m, rank]
         return delta_w - proj @ V.T
-    else:
-        # P_null @ ΔW = ΔW - V @ (Vᵀ @ ΔW)
-        proj = V.T @ delta_w  # [rank, n]
-        return delta_w - V @ proj
+    # P_null @ ΔW = ΔW - V @ (Vᵀ @ ΔW)
+    proj = V.T @ delta_w  # [rank, n]
+    return delta_w - V @ proj
 
 
 def apply_null_space_constrained_projection(
     weight: torch.Tensor,
     direction: torch.Tensor,
-    null_space_V: Optional[torch.Tensor] = None,
+    null_space_V: torch.Tensor | None = None,
     preserve_norm: bool = True,
     multiplier: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Apply null-space constrained norm-preserving projection.
+    """Apply null-space constrained norm-preserving projection.
 
     This is the core function that combines:
     1. Standard ablation: ΔW = -α(W @ d) ⊗ dᵀ
@@ -323,9 +312,7 @@ def apply_null_space_constrained_projection(
         proj_coeffs = direction_float @ weight_float  # [in_features]
         delta_w = -multiplier * torch.outer(direction_float, proj_coeffs)
     else:
-        logger.warning(
-            f"Direction shape {direction_float.shape} doesn't match weight {weight_float.shape}"
-        )
+        logger.warning(f"Direction shape {direction_float.shape} doesn't match weight {weight_float.shape}")
         return weight
 
     # Apply null-space constraint if provided
@@ -372,7 +359,7 @@ class NullSpaceActivationExtractor:
                 return self.model.model.language_model.layers
             if hasattr(self.model.model, "layers"):
                 return self.model.model.layers
-            elif hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):
+            if hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):
                 return self.model.model.decoder.layers
         if hasattr(self.model, "language_model"):
             if hasattr(self.model.language_model, "model") and hasattr(self.model.language_model.model, "layers"):
@@ -382,7 +369,7 @@ class NullSpaceActivationExtractor:
         if hasattr(self.model, "transformer"):
             if hasattr(self.model.transformer, "h"):
                 return self.model.transformer.h
-            elif hasattr(self.model.transformer, "layers"):
+            if hasattr(self.model.transformer, "layers"):
                 return self.model.transformer.layers
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
             return self.model.gpt_neox.layers
@@ -398,11 +385,9 @@ class NullSpaceActivationExtractor:
 
     def _create_hook(self, layer_idx: int):
         """Create forward hook that captures last-token activations."""
-        def hook(module, input, output):
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-            else:
-                hidden_states = output
+
+        def hook(module, input, output):  # noqa: ARG001 - torch forward-hook signature
+            hidden_states = output[0] if isinstance(output, tuple) else output
 
             # Check for NaN on EVERY batch (not just first)
             if not torch.isfinite(hidden_states).all():
@@ -422,7 +407,9 @@ class NullSpaceActivationExtractor:
     def register_hooks(self, layer_indices: list[int]):
         """Register hooks on specified layers."""
         layers = self._get_layers()
-        logger.info(f"Registering null-space hooks on {len(layer_indices)} layers (indices: {min(layer_indices)}-{max(layer_indices)})")
+        logger.info(
+            f"Registering null-space hooks on {len(layer_indices)} layers (indices: {min(layer_indices)}-{max(layer_indices)})"
+        )
         for idx in layer_indices:
             if 0 <= idx < len(layers):
                 hook = layers[idx].register_forward_hook(self._create_hook(idx))
@@ -446,8 +433,7 @@ class NullSpaceActivationExtractor:
         batch_size: int = 4,
         max_length: int = 512,
     ) -> dict[int, torch.Tensor]:
-        """
-        Extract activations for preservation prompts.
+        """Extract activations for preservation prompts.
 
         Uses last token position (consistent with refusal direction extraction)
         for numerical stability. One activation vector per prompt.
@@ -463,9 +449,7 @@ class NullSpaceActivationExtractor:
                 formatted = []
                 for p in batch:
                     messages = [{"role": "user", "content": p}]
-                    fmt = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                    fmt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                     formatted.append(fmt)
             else:
                 formatted = batch
@@ -504,8 +488,7 @@ def compute_null_space_projectors(
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
 ) -> NullSpaceProjector:
-    """
-    Compute null-space projectors from preservation prompts.
+    """Compute null-space projectors from preservation prompts.
 
     Args:
         model: The model to extract activations from
@@ -525,10 +508,7 @@ def compute_null_space_projectors(
         from src.dataset_loader import load_split
 
         prompts = load_split("preservation")
-        logger.info(
-            f"Using {len(prompts)} preservation prompts from "
-            "RevivifAI/derestriction"
-        )
+        logger.info(f"Using {len(prompts)} preservation prompts from RevivifAI/derestriction")
     else:
         logger.info(f"Using {len(prompts)} caller-supplied preservation prompts")
 
@@ -572,8 +552,7 @@ def compute_null_space_projectors(
         low_rank_factors[layer_idx] = (V.to(dtype), S.to(dtype))
 
         logger.debug(
-            f"Layer {layer_idx}: null-space rank {V.shape[1]}, "
-            f"preserving {hidden_dim - V.shape[1]} dimensions"
+            f"Layer {layer_idx}: null-space rank {V.shape[1]}, preserving {hidden_dim - V.shape[1]} dimensions"
         )
 
     metadata = {
@@ -587,5 +566,3 @@ def compute_null_space_projectors(
         low_rank_factors=low_rank_factors,
         metadata=metadata,
     )
-
-
