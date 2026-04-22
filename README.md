@@ -38,16 +38,39 @@ On first run, a setup wizard walks you through configuration—where your models
 
 ## Data
 
-All prompts (harmful / harmless / preservation) live in the
+All prompts live in the
 [RevivifAI/derestriction](https://huggingface.co/datasets/RevivifAI/derestriction)
-HuggingFace dataset, three aligned 10,000-row splits with a `{Prompt, Source}`
-schema. They are loaded lazily by `derestrictor.data.loader.load_split` and
-cached under `~/.cache/huggingface/datasets`; no local files are required.
+HuggingFace dataset, partitioned into three splits with a
+`{Prompt, Source, Restriction_Category}` schema:
 
-The `harmful` split is pre-filtered to drop any prompt that mentions or targets
-children (keyword regex + semantic similarity against child-harm anchors) — see
+| Split | Role |
+|---|---|
+| `restrict` | Genuinely harmful prompts the model **should** continue to refuse (child harm, targeted violence, WMD, graphic sexual, self-harm). Carries `Restriction_Category`. |
+| `derestrict` | Refusal-target prompts the abliteration run should **unlock** (AdvBench / JailbreakBench minus the restricted subset, Chinese sensitive topics, and the non-genuinely-harmful subcategories of WildGuardMix — benign-but-refused, cyberattack, fraud, copyright, privacy / whistleblower, hate speech, stereotypes, political disinformation). |
+| `allow` | Benign instructions and capability-preservation prompts (Alpaca, MMLU, GSM8K, ARC, MATH-500, HumanEval, JailbreakBench benign). |
+
+Splits are loaded lazily by `derestrictor.data.loader.load_split` and cached
+under `~/.cache/huggingface/datasets`; no local files are required.
+
+The build pipeline pulls the entire upstream (no row caps) from **original**
+sources only — no AdvBench repackagings, no Alpaca forks — and applies a
+two-stage keyword + semantic harm filter to the `derestrict` pool.
+Matching prompts are **moved to `restrict`** (not silently dropped) so the
+restriction set stays auditable. The same filter audits `allow` and flags any
+safety violations to `build/allow_split_safety_flags.jsonl`. See
 [`src/derestrictor/data/harm_filter.py`](src/derestrictor/data/harm_filter.py)
-for details.
+for the category definitions.
+
+[`allenai/wildguardmix`](https://huggingface.co/datasets/allenai/wildguardmix)
+is gated (AI2 Responsible Use acceptance required) — the build script
+reads `HF_TOKEN` from the environment / `.env` to load it. If the token
+is missing or unauthorized the build logs a warning and continues
+without WildGuardMix. WildGuardMix prompts are routed by their
+per-prompt `subcategory`: `violence_and_physical_harm`, `sexual_content`,
+`mental_health_over-reliance_crisis`, and
+`causing_material_harm_by_disseminating_misinformation` go straight to
+`restrict`; everything else (including `benign`) joins `derestrict`
+where the harm filter gets the final word.
 
 The dataset is the only prompt source — there is no local-file fallback or
 override. Rebuild the dataset (and re-upload it) if you need different content.
@@ -75,7 +98,7 @@ The CLI scans your configured directories and shows available models. Already-ab
 Defaults to `./abliterate/abliterated_models/{model-name}-abliterated`. Change it if you like.
 
 **Step 3: Configuration**
-- **Number of prompts**: How many harmful/harmless pairs to use (default: 30)
+- **Number of prompts**: How many `derestrict`/`allow` pairs to use (default: 30)
 - **Direction multiplier**: Ablation strength—1.0 is full, lower values are gentler
 - **Norm preservation**: Keeps weight magnitudes stable (recommended)
 - **Filter prompts by refusal**: Only uses prompts the model actually refuses (recommended)
@@ -103,7 +126,7 @@ Load an original and abliterated model side-by-side, enter a prompt, and see bot
 
 ### Evaluate Refusal
 
-Runs the model against harmful and harmless prompt sets, computing refusal rates for each. Results are saved as timestamped JSON files to your configured eval directory.
+Runs the model against `derestrict` and `allow` prompt sets, computing refusal rates for each. Results are saved as timestamped JSON files to your configured eval directory.
 
 - **Harmful refusal rate**: Lower = more abliterated
 - **Harmless refusal rate**: Lower = fewer false positives
@@ -126,9 +149,9 @@ defaults. The **Manage prompts** entry shows the row counts of each
 
 Based on [Arditi et al. (2024)](https://arxiv.org/abs/2406.11717), refusal behavior is mediated by a single direction in activation space.
 
-1. Run the model on harmful prompts, extract hidden states from middle layers
-2. Run the model on harmless prompts, extract hidden states
-3. Refusal direction **d** = mean(harmful) − mean(harmless), normalized
+1. Run the model on `derestrict` prompts, extract hidden states from middle layers
+2. Run the model on `allow` prompts, extract hidden states
+3. Refusal direction **d** = mean(derestrict) − mean(allow), normalized
 
 ### Orthogonal Projection
 
@@ -155,7 +178,7 @@ $$x_{clipped} = \text{clamp}(x, -\text{threshold}, \text{threshold})$$
 
 ### Null-Space Constraints
 
-Adapted from [AlphaEdit (Fang et al., ICLR 2025)](https://arxiv.org/abs/2410.02355). To preserve capabilities, we project the ablation update into the null space of preservation activations:
+Adapted from [AlphaEdit (Fang et al., ICLR 2025)](https://arxiv.org/abs/2410.02355). To preserve capabilities, we project the ablation update into the null space of activations captured from the `allow` split:
 
 1. Collect activations **K** from diverse capability prompts (math, coding, reasoning)
 2. Compute SVD: **U, S, V** = SVD(**K**)

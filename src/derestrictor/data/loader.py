@@ -1,9 +1,17 @@
 """Thin loader for the RevivifAI/derestriction dataset on HuggingFace.
 
-Every prompt used by this project (harmful / harmless / preservation) is
+Every prompt used by this project (restrict / derestrict / allow) is
 sourced exclusively from ``RevivifAI/derestriction``. Call :func:`load_split`
 to get a list of prompt strings for a split. The dataset caches under
 ``~/.cache/huggingface/datasets`` on first use.
+
+Splits:
+    - ``restrict``   — prompts the model should continue to refuse
+      (child harm, targeted violence, WMD, graphic sexual, self-harm).
+    - ``derestrict`` — prompts the model should learn to answer
+      (AdvBench-style + Chinese sensitive topics, minus restricted hits).
+    - ``allow``      — benign instructions and capability-preservation
+      prompts (Alpaca, MMLU, GSM8K, ARC, MATH-500, HumanEval, …).
 """
 
 from __future__ import annotations
@@ -13,13 +21,14 @@ import random
 from collections.abc import Iterable
 from functools import lru_cache
 
+from datasets import load_dataset
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
 DATASET_ID = "RevivifAI/derestriction"
-VALID_SPLITS: tuple[str, ...] = ("harmful", "harmless", "preservation")
+VALID_SPLITS: tuple[str, ...] = ("restrict", "derestrict", "allow")
 
 
 def _validate_split(split: str) -> str:
@@ -30,8 +39,6 @@ def _validate_split(split: str) -> str:
 
 @lru_cache(maxsize=8)
 def _load_dataset_cached(split: str, revision: str | None):
-    from datasets import load_dataset
-
     token = os.environ.get("HF_TOKEN")
     return load_dataset(DATASET_ID, split=split, revision=revision, token=token)
 
@@ -45,7 +52,7 @@ def load_split(
     """Return the ``Prompt`` column of a split as a list of strings.
 
     Args:
-        split: One of ``"harmful"``, ``"harmless"``, ``"preservation"``.
+        split: One of ``"restrict"``, ``"derestrict"``, ``"allow"``.
         n: If given and less than split size, random-sample ``n`` prompts.
         seed: RNG seed for the sampling.
         revision: Optional Hub revision / git SHA to pin.
@@ -61,8 +68,6 @@ def load_split(
 
 def refresh_cache(splits: Iterable[str] = VALID_SPLITS) -> None:
     """Force-redownload the dataset from the Hub, bypassing the local cache."""
-    from datasets import load_dataset
-
     token = os.environ.get("HF_TOKEN")
     _load_dataset_cached.cache_clear()
     for split in splits:

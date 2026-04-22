@@ -453,10 +453,10 @@ def auto_tune_multiplier(
 
 
 def load_reference_prompts(num_prompts: int = 50) -> list[str]:
-    """Load reference prompts for KL monitoring from the preservation split."""
+    """Load reference prompts for KL monitoring from the allow split."""
     from derestrictor.data.loader import load_split
 
-    return load_split("preservation", n=num_prompts)
+    return load_split("allow", n=num_prompts)
 
 
 def save_kl_report(

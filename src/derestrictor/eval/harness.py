@@ -794,10 +794,10 @@ def eval_refusal_rates(
     random.seed(seed)
     start_time = time.perf_counter()
 
-    logger.info(f"Loading harmful prompts from {DATASET_ID} / harmful")
-    all_harmful = load_split("harmful")
-    logger.info(f"Loading harmless prompts from {DATASET_ID} / harmless")
-    all_harmless = load_split("harmless")
+    logger.info(f"Loading derestrict prompts from {DATASET_ID} / derestrict")
+    all_harmful = load_split("derestrict")
+    logger.info(f"Loading allow prompts from {DATASET_ID} / allow")
+    all_harmless = load_split("allow")
 
     # Sample prompts
     harmful_sample = random.sample(all_harmful, min(limit, len(all_harmful)))

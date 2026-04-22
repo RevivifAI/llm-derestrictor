@@ -724,10 +724,10 @@ def run_abliteration(config: dict) -> bool:
             # Load prompts from RevivifAI/derestriction
             progress.update(task, description="Loading prompts...")
             harmful_prompts = load_prompts(
-                "harmful",
+                "derestrict",
                 num_prompts=None if config["filter_prompts"] else config["num_prompts"],
             )
-            harmless_prompts = load_prompts("harmless", config["num_prompts"])
+            harmless_prompts = load_prompts("allow", config["num_prompts"])
             progress.advance(task, 10)
 
             # Load model
@@ -1138,7 +1138,7 @@ def run_evaluation(model_path: str | None = None):
     eval_output_dir = get_eval_results_dir()
     console.print(f"\n[{THEME['muted']}]Results will be saved to: {eval_output_dir}[/{THEME['muted']}]\n")
 
-    prompts_split = "harmful"
+    prompts_split = "derestrict"
 
     # Display configuration
     from rich.panel import Panel
@@ -2438,9 +2438,9 @@ def _manage_prompts():
     )
 
     descriptions = {
-        "harmful": "Prompts that should be refused (before abliteration)",
-        "harmless": "Prompts that should be answered normally",
-        "preservation": "Prompts for null-space capability preservation",
+        "restrict": "Genuinely harmful prompts the model should continue to refuse",
+        "derestrict": "Refusal-target prompts the abliteration run should unlock",
+        "allow": "Benign instructions and capability-preservation prompts",
     }
 
     table = Table(show_header=True, header_style=f"bold {THEME['primary']}")

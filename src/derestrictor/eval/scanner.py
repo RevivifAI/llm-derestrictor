@@ -166,9 +166,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split",
         type=str,
-        default="harmful",
-        choices=["harmful", "harmless", "preservation"],
-        help="RevivifAI/derestriction split to scan (default: harmful).",
+        default="derestrict",
+        choices=["restrict", "derestrict", "allow"],
+        help="RevivifAI/derestriction split to scan (default: derestrict).",
     )
     parser.add_argument("--output", type=str, default="refusal_results.csv", help="Output CSV path")
     parser.add_argument("--model", type=str, default="google/gemma-2-9b-it", help="Hugging Face model ID")

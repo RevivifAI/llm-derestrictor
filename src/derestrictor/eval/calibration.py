@@ -38,7 +38,7 @@ class CalibrationConfig:
     """Configuration for calibration run."""
 
     model_path: str
-    split: str = "harmful"
+    split: str = "derestrict"
     output_path: str = "calibration_results.json"
     batch_size: int = 4
     max_new_tokens: int = 128
@@ -519,9 +519,9 @@ def main():
         "-s",
         "--split",
         type=str,
-        default="harmful",
-        choices=["harmful", "harmless", "preservation"],
-        help="RevivifAI/derestriction split to calibrate against (default: harmful).",
+        default="derestrict",
+        choices=["restrict", "derestrict", "allow"],
+        help="RevivifAI/derestriction split to calibrate against (default: derestrict).",
     )
     parser.add_argument(
         "-o",

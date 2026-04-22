@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "derestrictor"
-version = "1.2.0"
+version = "2.0.0"
 description = "Remove refusal behavior from language models using norm-preserving orthogonal projection"
 readme = "README.md"
 license = {text = "MIT"}

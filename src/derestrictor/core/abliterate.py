@@ -2898,12 +2898,13 @@ def run_abliteration(config: AbliterationConfig):
     )
 
     # Load prompts from the RevivifAI/derestriction dataset.
-    # For harmful prompts with filtering: load ALL prompts as a pool, then
-    # filter down to target_count refused prompts. For harmless prompts we
-    # sample directly since no filtering is needed.
+    # For the refusal-direction pool (``derestrict``) with filtering, we
+    # load the full split and filter down to ``target_count`` refused
+    # prompts. The baseline pool (``allow``) is sampled directly since no
+    # filtering is needed.
     if config.filter_harmful_prompts and not config.load_directions_path:
-        harmful_prompt_pool = load_prompts("harmful")
-        logger.info(f"Loaded {len(harmful_prompt_pool)} harmful prompts from RevivifAI/derestriction")
+        harmful_prompt_pool = load_prompts("derestrict")
+        logger.info(f"Loaded {len(harmful_prompt_pool)} derestrict prompts from RevivifAI/derestriction")
 
         target_count = config.num_prompts if config.num_prompts else len(harmful_prompt_pool)
         refused_prompts, _ = filter_harmful_prompts_by_refusal(
@@ -2912,7 +2913,7 @@ def run_abliteration(config: AbliterationConfig):
 
         if len(refused_prompts) == 0:
             raise ValueError(
-                "No harmful prompts were refused by the model! "
+                "No derestrict prompts were refused by the model! "
                 "Cannot compute refusal directions without refused prompts. "
                 "Try a stricter refusal threshold or disable filtering with --no_filter_prompts."
             )
@@ -2920,11 +2921,11 @@ def run_abliteration(config: AbliterationConfig):
         config.harmful_prompts = refused_prompts
         logger.info(f"Using {len(config.harmful_prompts)} refused prompts for refusal direction computation")
     else:
-        config.harmful_prompts = load_prompts("harmful", config.num_prompts)
-        logger.info(f"Loaded {len(config.harmful_prompts)} harmful prompts from RevivifAI/derestriction")
+        config.harmful_prompts = load_prompts("derestrict", config.num_prompts)
+        logger.info(f"Loaded {len(config.harmful_prompts)} derestrict prompts from RevivifAI/derestriction")
 
-    config.harmless_prompts = load_prompts("harmless", config.num_prompts)
-    logger.info(f"Loaded {len(config.harmless_prompts)} harmless prompts from RevivifAI/derestriction")
+    config.harmless_prompts = load_prompts("allow", config.num_prompts)
+    logger.info(f"Loaded {len(config.harmless_prompts)} allow prompts from RevivifAI/derestriction")
 
     # Get or compute refusal directions
     if config.load_directions_path:

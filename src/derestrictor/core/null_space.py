@@ -507,8 +507,8 @@ def compute_null_space_projectors(
     if not prompts:
         from derestrictor.data.loader import load_split
 
-        prompts = load_split("preservation")
-        logger.info(f"Using {len(prompts)} preservation prompts from RevivifAI/derestriction")
+        prompts = load_split("allow")
+        logger.info(f"Using {len(prompts)} allow prompts from RevivifAI/derestriction for null-space")
     else:
         logger.info(f"Using {len(prompts)} caller-supplied preservation prompts")
 
