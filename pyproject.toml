@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "abliteration"
-version = "1.0.0"
+name = "derestrictor"
+version = "1.1.0"
 description = "Remove refusal behavior from language models using norm-preserving orthogonal projection"
 readme = "README.md"
 license = {text = "MIT"}
@@ -38,8 +38,15 @@ dependencies = [
 ]
 
 [project.scripts]
-abliterate = "src.cli:cli"
-feature-surgery = "src.feature_surgery_cli:main"
+derestrictor = "derestrictor.cli.main:cli"
+derestrictor-feature-surgery = "derestrictor.cli.feature_surgery:main"
+derestrictor-search = "derestrictor.scripts.abliteration_search:main"
+derestrictor-quantize = "derestrictor.scripts.batch_quantize:main"
+derestrictor-build-dataset = "derestrictor.scripts.build_dataset:main"
+derestrictor-upload-dataset = "derestrictor.scripts.upload_dataset:main"
+derestrictor-convert-bf16 = "derestrictor.scripts.convert_to_bf16:main"
+abliterate = "derestrictor.cli.main:cli"
+feature-surgery = "derestrictor.cli.feature_surgery:main"
 
 [project.optional-dependencies]
 dev = [
@@ -64,7 +71,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src", "utils"]
+packages = ["src/derestrictor"]
 
 [tool.ruff]
 line-length = 120
@@ -143,20 +150,28 @@ unfixable = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"utils/*.py" = [
+"src/derestrictor/cli/*.py" = ["T201"]
+"src/derestrictor/scripts/*.py" = [
     "T201",    # print() is acceptable in CLI/research utilities
     "S603",    # subprocess call: research scripts are trusted
     "S607",    # start-process with partial path: fine for tooling
 ]
-"src/cli*.py" = ["T201"]
-"src/gguf_export.py" = [
+"src/derestrictor/export/gguf.py" = [
     "S603",    # subprocess invokes vetted llama.cpp binaries with constructed args
 ]
-"utils/test_*.py" = ["S", "D", "PLR", "ARG"]
+# eval/ modules double as CLI tools (they have their own argparse main()),
+# so print() is acceptable and subprocess-adjacent lints are relaxed.
+"src/derestrictor/eval/*.py" = [
+    "T201",    # print() is acceptable in CLI/research utilities
+    "S603",    # subprocess call: research scripts are trusted
+    "S607",    # start-process with partial path: fine for tooling
+]
+"src/derestrictor/eval/harness.py" = ["S", "D", "PLR", "ARG", "T201"]
+"tests/**/*.py" = ["S", "D", "PLR", "ARG"]
 "**/__init__.py" = ["F401", "D"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["src", "utils"]
+known-first-party = ["derestrictor"]
 combine-as-imports = true
 split-on-trailing-comma = true
 
@@ -175,3 +190,10 @@ indent-style = "space"
 line-ending = "lf"
 docstring-code-format = true
 skip-magic-trailing-comma = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "requires_cuda: test requires a CUDA device and is skipped on CPU-only runners",
+]
