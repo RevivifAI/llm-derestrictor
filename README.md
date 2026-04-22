@@ -6,9 +6,20 @@
 
 ## Installation
 
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+
 ```bash
-pip install -e .
+# One-time: install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+git clone https://github.com/RevivifAI/llm-derestrictor
+cd llm-derestrictor
+uv sync                 # runtime deps only
+uv sync --group dev     # + dataset-build + pytest/black/ruff
 ```
+
+This creates `.venv/` and installs the `abliterate` entry point. The pinned
+Python version lives in `.python-version` (3.12).
 
 ## Requirements
 
@@ -19,10 +30,35 @@ pip install -e .
 ## Quick Start
 
 ```bash
-abliterate
+uv run abliterate
 ```
 
 On first run, a setup wizard walks you through configuration—where your models live, output directories, and default precision. After that, you'll land in the main menu.
+
+## Data
+
+All prompts (harmful / harmless / preservation) live in the
+[RevivifAI/derestriction](https://huggingface.co/datasets/RevivifAI/derestriction)
+HuggingFace dataset, three aligned 10,000-row splits with a `{Prompt, Source}`
+schema. They are loaded lazily by `src.dataset_loader.load_split` and cached
+under `~/.cache/huggingface/datasets`; no local files are required.
+
+The `harmful` split is pre-filtered to drop any prompt that mentions or targets
+children (keyword regex + semantic similarity against child-harm anchors) — see
+[`utils/harm_filter.py`](utils/harm_filter.py) for details.
+
+The dataset is the only prompt source — there is no local-file fallback or
+override. Rebuild the dataset (and re-upload it) if you need different content.
+
+To rebuild or re-upload the dataset:
+
+```bash
+uv run python -m utils.build_derestriction_dataset
+uv run python -m utils.upload_derestriction_dataset
+```
+
+The upload script requires `HF_TOKEN` in `.env` (or the environment) with write
+access to the `RevivifAI` org.
 
 ## Using the CLI
 
@@ -76,7 +112,9 @@ Converts abliterated models to GGUF format for llama.cpp, Ollama, or LM Studio. 
 
 ### Settings
 
-Manage model search directories, eval output location, llama.cpp path, and defaults.
+Manage model search directories, eval output location, llama.cpp path, and
+defaults. The **Manage prompts** entry shows the row counts of each
+`RevivifAI/derestriction` split and lets you force-refresh the local HF cache.
 
 ---
 

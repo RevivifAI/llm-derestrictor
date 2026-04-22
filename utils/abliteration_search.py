@@ -83,9 +83,7 @@ class SearchConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float16"
 
-    # Paths
-    harmful_prompts_path: str = "./prompts/harmful.txt"
-    harmless_prompts_path: str = "./prompts/harmless.txt"
+    # lm-evaluation-harness checkout location (prompts come from the HF dataset).
     lm_eval_path: str = "./lm-evaluation-harness"
 
 
@@ -341,13 +339,10 @@ def run_single_abliteration(
     output_path: str,
     direction_multiplier: float,
     num_prompts: int,
-    harmful_prompts_path: str,
-    harmless_prompts_path: str,
     device: str = "cuda",
     dtype: str = "float16",
 ) -> str:
-    """
-    Run abliteration with specific parameters.
+    """Run abliteration with specific parameters against RevivifAI/derestriction.
 
     Returns:
         Path to the abliterated model.
@@ -357,8 +352,6 @@ def run_single_abliteration(
     config = AbliterationConfig(
         model_path=base_model_path,
         output_path=output_path,
-        harmful_prompts_path=harmful_prompts_path,
-        harmless_prompts_path=harmless_prompts_path,
         num_prompts=num_prompts,
         direction_multiplier=direction_multiplier,
         device=device,
@@ -428,8 +421,6 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
                 output_path=str(trial_path),
                 direction_multiplier=params["direction_multiplier"],
                 num_prompts=params["num_prompts"],
-                harmful_prompts_path=config.harmful_prompts_path,
-                harmless_prompts_path=config.harmless_prompts_path,
                 device=config.device,
                 dtype=config.dtype,
             )
@@ -667,18 +658,6 @@ Examples:
         help="Minimum required refusal reduction (default: 0.5 = 50%%)",
     )
     parser.add_argument(
-        "--harmful_prompts",
-        type=str,
-        default="./prompts/harmful.txt",
-        help="Path to harmful prompts file",
-    )
-    parser.add_argument(
-        "--harmless_prompts",
-        type=str,
-        default="./prompts/harmless.txt",
-        help="Path to harmless prompts file",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -704,8 +683,6 @@ Examples:
         eval_limit=args.eval_limit,
         max_acc_delta=args.max_acc_delta,
         min_refusal_reduction=args.min_refusal_reduction,
-        harmful_prompts_path=args.harmful_prompts,
-        harmless_prompts_path=args.harmless_prompts,
         device=args.device,
         dtype=args.dtype,
     )

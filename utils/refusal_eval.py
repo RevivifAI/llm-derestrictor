@@ -86,40 +86,28 @@ class RefusalScanner:
         """
         return self._detector.get_log_prob(prompts, target_string)
 
-    def scan_file(
+    def scan_split(
         self,
-        input_file: str,
+        split: str,
         output_file: str,
         limit: int = None,
         model_name: str = None,
         save_csv: bool = True,
         threshold: float = None,
     ):
-        """
-        Scan a file of prompts and evaluate refusal rates.
+        """Scan prompts from a RevivifAI/derestriction split and score refusals."""
+        from src.dataset_loader import load_split
 
-        Args:
-            input_file: Path to text file with prompts (one per line)
-            output_file: Path for output CSV
-            limit: Max number of prompts to scan
-            model_name: Model name for output filename generation
-            save_csv: Whether to save results to CSV
-            threshold: Override threshold for this scan (uses default if None)
-        """
-        # 1. Read Prompts
-        print(f"Reading prompts from {input_file}...")
-        with open(input_file, 'r', encoding='utf-8') as f:
-            prompts = [line.strip() for line in f if line.strip()]
+        print(f"Reading prompts from RevivifAI/derestriction split={split}...")
+        prompts = load_split(split)
 
         if limit is not None:
             prompts = prompts[:limit]
 
-        # Generate output filename if not provided or using default
         if output_file == "refusal_results.csv" and model_name:
             output_dir = Path("eval_abliterated")
             output_dir.mkdir(exist_ok=True)
 
-            # Clean model name for filename (get last part of path, replace special chars)
             clean_name = Path(model_name).name.replace("/", "_").replace("\\", "_")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             limit_str = f"_n{limit}" if limit else "_all"
@@ -127,7 +115,6 @@ class RefusalScanner:
 
         results = []
 
-        # 2. Process in Batches with optional threshold override
         print(f"Scanning {len(prompts)} prompts...")
 
         # Debug: show formatted prompt example
@@ -185,7 +172,13 @@ class RefusalScanner:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM Refusal Scanner")
-    parser.add_argument("--input", type=str, required=True, help="Path to text file with prompts")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="harmful",
+        choices=["harmful", "harmless", "preservation"],
+        help="RevivifAI/derestriction split to scan (default: harmful).",
+    )
     parser.add_argument("--output", type=str, default="refusal_results.csv", help="Output CSV path")
     parser.add_argument("--model", type=str, default="google/gemma-2-9b-it", help="Hugging Face model ID")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -206,8 +199,8 @@ if __name__ == "__main__":
         debug=args.debug,
         threshold=args.threshold,
     )
-    scanner.scan_file(
-        args.input,
+    scanner.scan_split(
+        args.split,
         args.output,
         limit=args.limit,
         model_name=args.model,

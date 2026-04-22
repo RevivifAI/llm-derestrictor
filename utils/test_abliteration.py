@@ -24,7 +24,6 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.abliterate import get_default_prompts_path
 from src.model_utils import load_model_and_tokenizer
 from utils.refusal_detector import LogLikelihoodRefusalDetector
 
@@ -631,15 +630,6 @@ def test_single_model(
     return results
 
 
-def load_prompts(filepath: str) -> list[str]:
-    """Load prompts from a text file (one per line)."""
-    prompts = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                prompts.append(line)
-    return prompts
 
 
 def get_git_hash() -> str:
@@ -731,8 +721,6 @@ def evaluate_prompts_batched(
 
 def eval_refusal_rates(
     model_path: str,
-    harmful_prompts_path: str,
-    harmless_prompts_path: str,
     limit: int = 100,
     batch_size: Optional[int] = None,  # None = auto
     device: str = "cuda",
@@ -741,22 +729,25 @@ def eval_refusal_rates(
     seed: int = 42,
     output_dir: str = "./eval_results",
 ) -> dict:
-    """
-    Evaluate refusal rates on harmful and harmless prompts.
+    """Evaluate refusal rates against RevivifAI/derestriction.
+
+    Loads the ``harmful`` and ``harmless`` splits from HuggingFace and samples
+    ``limit`` prompts from each.
 
     Args:
         batch_size: Batch size for generation. None = auto-detect optimal size.
 
     Returns a dict in lm-evaluation-harness compatible format.
     """
+    from src.dataset_loader import DATASET_ID, load_split
+
     random.seed(seed)
     start_time = time.perf_counter()
 
-    # Load prompts
-    logger.info(f"Loading harmful prompts from {harmful_prompts_path}")
-    all_harmful = load_prompts(harmful_prompts_path)
-    logger.info(f"Loading harmless prompts from {harmless_prompts_path}")
-    all_harmless = load_prompts(harmless_prompts_path)
+    logger.info(f"Loading harmful prompts from {DATASET_ID} / harmful")
+    all_harmful = load_split("harmful")
+    logger.info(f"Loading harmless prompts from {DATASET_ID} / harmless")
+    all_harmless = load_split("harmless")
 
     # Sample prompts
     harmful_sample = random.sample(all_harmful, min(limit, len(all_harmful)))
@@ -854,7 +845,7 @@ def eval_refusal_rates(
             "harmful_prompts": {
                 "task": "harmful_prompts",
                 "description": "Refusal rate evaluation on harmful/adversarial prompts",
-                "dataset_path": harmful_prompts_path,
+                "dataset_path": f"{DATASET_ID}:harmful",
                 "num_fewshot": 0,
                 "metric_list": [
                     {"metric": "refusal_rate", "aggregation": "mean", "higher_is_better": True},
@@ -871,7 +862,7 @@ def eval_refusal_rates(
             "harmless_prompts": {
                 "task": "harmless_prompts",
                 "description": "Refusal rate evaluation on harmless/benign prompts",
-                "dataset_path": harmless_prompts_path,
+                "dataset_path": f"{DATASET_ID}:harmless",
                 "num_fewshot": 0,
                 "metric_list": [
                     {"metric": "refusal_rate", "aggregation": "mean", "higher_is_better": False},
@@ -994,18 +985,6 @@ Examples:
         help="Number of prompts to sample from each category (default: 100)",
     )
     eval_parser.add_argument(
-        "--harmful_prompts",
-        type=str,
-        default=get_default_prompts_path("harmful.txt"),
-        help="Path to harmful prompts file (default: <package>/prompts/harmful.txt)",
-    )
-    eval_parser.add_argument(
-        "--harmless_prompts",
-        type=str,
-        default=get_default_prompts_path("harmless.txt"),
-        help="Path to harmless prompts file (default: <package>/prompts/harmless.txt)",
-    )
-    eval_parser.add_argument(
         "--output_dir", "-o",
         type=str,
         default="./eval_results",
@@ -1119,8 +1098,6 @@ Examples:
     if args.command == "eval":
         eval_refusal_rates(
             model_path=args.model_path,
-            harmful_prompts_path=args.harmful_prompts,
-            harmless_prompts_path=args.harmless_prompts,
             limit=args.limit,
             batch_size=args.batch_size,
             device=args.device,

@@ -33,7 +33,6 @@ from rich.console import Console
 from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-from src.abliterate import get_default_prompts_path
 from utils.refusal_eval import RefusalScanner
 from src.gguf_export import (
     GGUFExportConfig,
@@ -51,7 +50,6 @@ from src.cli_components import (
     add_model_path,
     clear_screen,
     console,
-    copy_prompts_to_user_dir,
     create_progress_bar,
     display_banner,
     display_comparison_panel,
@@ -73,7 +71,6 @@ from src.cli_components import (
     get_default_output_dir,
     get_eval_results_dir,
     get_model_paths,
-    get_user_prompts_dir,
     get_versioned_path,
     load_config,
     print_divider,
@@ -81,7 +78,6 @@ from src.cli_components import (
     save_config,
     set_default_output_dir,
     set_eval_results_dir,
-    user_prompts_exist,
 )
 from src.config_manager import (
     config_exists,
@@ -410,20 +406,6 @@ def get_abliteration_config() -> Optional[dict]:
         ).ask()
 
         if config["use_null_space"]:
-            use_default_preservation = questionary.confirm(
-                "Use default preservation prompts?",
-                default=True,
-                style=custom_style,
-            ).ask()
-
-            if use_default_preservation:
-                config["preservation_prompts_path"] = None
-            else:
-                config["preservation_prompts_path"] = questionary.path(
-                    "Path to custom preservation prompts:",
-                    style=custom_style,
-                ).ask()
-
             config["null_space_rank_ratio"] = float(questionary.text(
                 "Null-space SVD rank ratio (0.9-0.99):",
                 default="0.95",
@@ -661,7 +643,7 @@ def run_abliteration(config: dict) -> bool:
         abliterate_model,
         compute_refusal_directions,
         filter_harmful_prompts_by_refusal,
-        load_prompts_from_file,
+        load_prompts,
     )
     from src.model_utils import load_model_and_tokenizer
 
@@ -682,16 +664,13 @@ def run_abliteration(config: dict) -> bool:
             # Loading task
             task = progress.add_task("Loading model...", total=100)
 
-            # Load prompts
+            # Load prompts from RevivifAI/derestriction
             progress.update(task, description="Loading prompts...")
-            harmful_prompts = load_prompts_from_file(
-                get_default_prompts_path("harmful.txt"),
-                num_prompts=None if config["filter_prompts"] else config["num_prompts"]
+            harmful_prompts = load_prompts(
+                "harmful",
+                num_prompts=None if config["filter_prompts"] else config["num_prompts"],
             )
-            harmless_prompts = load_prompts_from_file(
-                get_default_prompts_path("harmless.txt"),
-                config["num_prompts"]
-            )
+            harmless_prompts = load_prompts("harmless", config["num_prompts"])
             progress.advance(task, 10)
 
             # Load model
@@ -721,7 +700,6 @@ def run_abliteration(config: dict) -> bool:
                 use_winsorization=config.get("use_winsorization", False),
                 winsorize_percentile=config.get("winsorize_percentile", 0.995),
                 use_null_space=config.get("use_null_space", False),
-                preservation_prompts_path=config.get("preservation_prompts_path"),
                 null_space_rank_ratio=config.get("null_space_rank_ratio", 0.95),
                 use_adaptive_weighting=config.get("use_adaptive_weighting", False),
                 use_projected_refusal=config.get("use_projected_refusal", True),
@@ -748,7 +726,6 @@ def run_abliteration(config: dict) -> bool:
                 hybrid_skip_state_proj=config.get("hybrid_skip_state_proj", False),
                 # KL monitoring
                 use_kl_monitoring=config.get("use_kl_monitoring", False),
-                kl_reference_prompts_path=config.get("kl_reference_prompts_path"),
                 kl_num_reference_prompts=config.get("kl_num_reference_prompts", 50),
                 kl_top_k=config.get("kl_top_k", 200),
                 use_kl_auto_tune=config.get("use_kl_auto_tune", False),
@@ -781,17 +758,11 @@ def run_abliteration(config: dict) -> bool:
                 from src.null_space import (
                     NullSpaceConfig,
                     compute_null_space_projectors,
-                    get_default_preservation_prompts_path,
                 )
-
-                preservation_path = abl_config.preservation_prompts_path
-                if preservation_path is None:
-                    preservation_path = get_default_preservation_prompts_path()
 
                 layers = list(directions.directions.keys()) or abl_config.extraction_layer_indices or []
 
                 null_config = NullSpaceConfig(
-                    preservation_prompts_path=preservation_path,
                     svd_rank_ratio=abl_config.null_space_rank_ratio,
                     regularization=abl_config.null_space_regularization,
                 )
@@ -818,7 +789,6 @@ def run_abliteration(config: dict) -> bool:
                 )
 
                 kl_reference_prompts = load_reference_prompts(
-                    path=abl_config.kl_reference_prompts_path,
                     num_prompts=abl_config.kl_num_reference_prompts,
                 )
                 console.print(f"[{THEME['muted']}]Loaded {len(kl_reference_prompts)} reference prompts for KL monitoring[/{THEME['muted']}]")
@@ -1093,14 +1063,13 @@ def run_evaluation(model_path: str = None):
     eval_output_dir = get_eval_results_dir()
     console.print(f"\n[{THEME['muted']}]Results will be saved to: {eval_output_dir}[/{THEME['muted']}]\n")
 
-    # Get prompts file path
-    prompts_path = get_default_prompts_path("harmful.txt")
+    prompts_split = "harmful"
 
     # Display configuration
     from rich.panel import Panel
     config_text = (
         f"Model: [{THEME['primary']}]{model_path}[/{THEME['primary']}]\n"
-        f"Prompts: [{THEME['muted']}]{prompts_path}[/{THEME['muted']}]\n"
+        f"Prompts: [{THEME['muted']}]RevivifAI/derestriction / {prompts_split}[/{THEME['muted']}]\n"
         f"Limit: [{THEME['accent']}]{limit if limit else 'all'}[/{THEME['accent']}]\n"
         f"Batch size: [{THEME['accent']}]{batch_size}[/{THEME['accent']}]\n"
         f"Dtype: [{THEME['accent']}]{dtype}[/{THEME['accent']}]\n"
@@ -1141,8 +1110,8 @@ def run_evaluation(model_path: str = None):
 
         # Run scan
         console.print(f"\n[bold {THEME['primary']}]Running evaluation...[/bold {THEME['primary']}]\n")
-        scanner.scan_file(
-            input_file=prompts_path,
+        scanner.scan_split(
+            split=prompts_split,
             output_file=str(output_file),
             limit=limit,
             model_name=model_path,
@@ -2364,48 +2333,47 @@ def _manage_eval_results_dir():
 
 
 def _manage_prompts():
-    """Manage prompts directory and files."""
-    prompts_dir = get_user_prompts_dir()
+    """Show info about the RevivifAI/derestriction dataset and allow a refresh."""
+    from rich.table import Table
 
-    console.print(f"\n[bold {THEME['primary']}]Prompts Management[/bold {THEME['primary']}]\n")
-    console.print(f"Prompts directory: [{THEME['primary']}]{prompts_dir}[/{THEME['primary']}]")
+    from src.dataset_loader import DATASET_ID, VALID_SPLITS, refresh_cache
 
-    # Check status
-    if user_prompts_exist():
-        console.print(f"Status: [green]configured[/green]\n")
+    console.print(f"\n[bold {THEME['primary']}]Prompts Dataset[/bold {THEME['primary']}]\n")
+    console.print(
+        f"Source: [{THEME['primary']}]https://huggingface.co/datasets/{DATASET_ID}[/{THEME['primary']}]"
+    )
+    console.print(
+        f"[{THEME['muted']}]Prompts load lazily from the HuggingFace Hub and are "
+        f"cached under ~/.cache/huggingface/datasets.[/{THEME['muted']}]\n"
+    )
 
-        # List prompt files
-        from rich.table import Table
-        table = Table(show_header=True, header_style=f"bold {THEME['primary']}")
-        table.add_column("File", style=THEME["primary"])
-        table.add_column("Lines", justify="right")
-        table.add_column("Description", style=THEME["muted"])
+    descriptions = {
+        "harmful": "Prompts that should be refused (before abliteration)",
+        "harmless": "Prompts that should be answered normally",
+        "preservation": "Prompts for null-space capability preservation",
+    }
 
-        descriptions = {
-            "harmful.txt": "Prompts that should be refused (before abliteration)",
-            "harmless.txt": "Prompts that should be answered normally",
-            "preservation.txt": "Prompts for null-space capability preservation",
-        }
+    table = Table(show_header=True, header_style=f"bold {THEME['primary']}")
+    table.add_column("Split", style=THEME["primary"])
+    table.add_column("Rows", justify="right")
+    table.add_column("Description", style=THEME["muted"])
 
-        for prompt_file in sorted(prompts_dir.glob("*.txt")):
-            try:
-                line_count = sum(1 for line in open(prompt_file, encoding="utf-8") if line.strip())
-            except Exception:
-                line_count = "?"
-            desc = descriptions.get(prompt_file.name, "Custom prompts file")
-            table.add_row(prompt_file.name, str(line_count), desc)
+    for split in VALID_SPLITS:
+        try:
+            from src.dataset_loader import split_size
 
-        console.print(table)
-    else:
-        console.print(f"Status: [yellow]not configured[/yellow]\n")
+            rows = f"{split_size(split):,}"
+        except Exception as e:
+            rows = f"[red]err: {e}[/red]"
+        table.add_row(split, rows, descriptions.get(split, ""))
 
+    console.print(table)
     console.print()
 
     action = questionary.select(
         "What would you like to do?",
         choices=[
-            questionary.Choice("Reset prompts to defaults", value="reset"),
-            questionary.Choice("Open prompts directory", value="open"),
+            questionary.Choice("Refresh dataset cache (re-download from HF)", value="refresh"),
             questionary.Choice("Back", value="back"),
         ],
         style=custom_style,
@@ -2414,36 +2382,16 @@ def _manage_prompts():
     if action == "back" or action is None:
         return
 
-    elif action == "reset":
-        confirm = questionary.confirm(
-            "Reset all prompts to package defaults? (This will overwrite your changes)",
-            default=False,
-            style=custom_style,
-        ).ask()
-
-        if confirm:
-            if copy_prompts_to_user_dir(force=True):
-                display_success(f"Prompts reset to defaults in: {prompts_dir}")
-            else:
-                display_error("Could not reset prompts (package prompts not found)")
-
-    elif action == "open":
-        # Try to open the directory in file explorer
-        import subprocess
-        import platform
-
-        prompts_dir.mkdir(parents=True, exist_ok=True)
-
+    if action == "refresh":
+        console.print(
+            f"\n[{THEME['muted']}]Re-downloading all three splits of "
+            f"{DATASET_ID}…[/{THEME['muted']}]"
+        )
         try:
-            if platform.system() == "Windows":
-                subprocess.run(["explorer", str(prompts_dir)], check=False)
-            elif platform.system() == "Darwin":  # macOS
-                subprocess.run(["open", str(prompts_dir)], check=False)
-            else:  # Linux
-                subprocess.run(["xdg-open", str(prompts_dir)], check=False)
-            display_success(f"Opened: {prompts_dir}")
+            refresh_cache()
+            display_success("Dataset cache refreshed.")
         except Exception as e:
-            display_warning(f"Could not open directory: {e}\n\nPath: {prompts_dir}")
+            display_error(f"Could not refresh dataset: {e}")
 
 
 def _manage_llama_cpp_path():
@@ -2641,23 +2589,16 @@ def run_first_time_setup():
         style=custom_style,
     ).ask()
 
-    # Save config
     save_config(config)
 
-    # Copy prompts to user directory
-    console.print(f"\n[bold {THEME['primary']}]Step 5: Setting Up Prompts[/bold {THEME['primary']}]\n")
-    console.print(f"[{THEME['muted']}]Copying default prompts to your config directory...[/{THEME['muted']}]")
-    console.print(f"[{THEME['muted']}]You can edit these prompts to customize abliteration behavior.[/{THEME['muted']}]\n")
-
-    if copy_prompts_to_user_dir():
-        prompts_dir = get_user_prompts_dir()
-        display_success(f"Prompts copied to: {prompts_dir}")
-        console.print(f"\n[{THEME['muted']}]Files:[/{THEME['muted']}]")
-        console.print(f"  [{THEME['primary']}]harmful.txt[/{THEME['primary']}]     - Prompts that should be refused (before abliteration)")
-        console.print(f"  [{THEME['primary']}]harmless.txt[/{THEME['primary']}]   - Prompts that should be answered normally")
-        console.print(f"  [{THEME['primary']}]preservation.txt[/{THEME['primary']}] - Prompts for null-space capability preservation")
-    else:
-        display_warning("Could not copy prompts (package prompts not found)")
+    console.print(f"\n[bold {THEME['primary']}]Step 5: Prompts Dataset[/bold {THEME['primary']}]\n")
+    console.print(
+        f"[{THEME['muted']}]Prompts are loaded from the HuggingFace dataset "
+        f"[bold]RevivifAI/derestriction[/bold], which provides 10,000 rows each "
+        f"for harmful / harmless / preservation splits and is cached locally "
+        f"under ~/.cache/huggingface/datasets. No setup required — the dataset "
+        f"will be fetched on first use.[/{THEME['muted']}]\n"
+    )
 
     console.print()
     display_success(f"Configuration saved to: {get_config_path()}")
@@ -2757,7 +2698,6 @@ def main_menu():
 @click.option("--winsorize/--no-winsorize", default=False, help="Enable Winsorization (clips outliers)")
 @click.option("--winsorize-percentile", type=float, default=0.995, help="Winsorize percentile (0.99-0.999)")
 @click.option("--null-space/--no-null-space", default=False, help="Enable null-space constraints")
-@click.option("--preservation-prompts", type=str, default=None, help="Path to preservation prompts file")
 @click.option("--null-space-rank-ratio", type=float, default=0.95, help="Null-space SVD rank ratio (0.9-0.99)")
 @click.option("--adaptive-weighting/--no-adaptive-weighting", default=False, help="Enable adaptive layer weighting")
 
@@ -2782,8 +2722,7 @@ def main_menu():
 @click.option("--hybrid-skip-state/--no-hybrid-skip-state", default=False, help="Also skip in_proj_qkv/in_proj_z (more conservative)")
 # KL divergence monitoring
 @click.option("--kl-monitor/--no-kl-monitor", default=False, help="Report KL divergence after abliteration")
-@click.option("--kl-reference-prompts", type=str, default=None, help="Path to reference prompts for KL (default: preservation.txt)")
-@click.option("--kl-num-prompts", type=int, default=50, help="Number of reference prompts for KL")
+@click.option("--kl-num-prompts", type=int, default=50, help="Number of reference prompts for KL (preservation split)")
 @click.option("--kl-top-k", type=int, default=200, help="Top-k tokens for KL approximation")
 @click.option("--kl-auto-tune/--no-kl-auto-tune", default=False, help="Binary search for best multiplier within KL budget")
 @click.option("--kl-threshold", type=float, default=0.5, help="Max mean KL divergence (nats) for auto-tune")
@@ -2791,14 +2730,14 @@ def main_menu():
 @click.option("--kl-search-max", type=float, default=2.0, help="Auto-tune search range maximum")
 def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         no_norm_preservation, no_filter_prompts, device, dtype,
-        winsorize, winsorize_percentile, null_space, preservation_prompts,
+        winsorize, winsorize_percentile, null_space,
         null_space_rank_ratio, adaptive_weighting,
         projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
         harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end,
         layer_target_map, unmapped_layer_behavior, dynamic_layer_targeting,
         hybrid_strategy, hybrid_full_attn_weight, hybrid_linear_attn_weight,
         hybrid_skip_recurrent, hybrid_skip_state,
-        kl_monitor, kl_reference_prompts, kl_num_prompts, kl_top_k,
+        kl_monitor, kl_num_prompts, kl_top_k,
         kl_auto_tune, kl_threshold, kl_search_min, kl_search_max):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
@@ -2810,7 +2749,6 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
       --projected              Orthogonalize refusal against harmless direction (default: on)
       --winsorize              Clip outlier activations (recommended for Gemma models)
       --null-space             Preserve model capabilities using null-space constraints
-      --preservation-prompts   Custom prompts for null-space computation
       --adaptive-weighting     Per-layer adaptive ablation strength
 
     Dynamic layer targeting (per-layer precision):
@@ -2898,7 +2836,6 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "use_winsorization": winsorize,
             "winsorize_percentile": winsorize_percentile,
             "use_null_space": null_space,
-            "preservation_prompts_path": preservation_prompts,
             "null_space_rank_ratio": null_space_rank_ratio,
             "use_adaptive_weighting": adaptive_weighting and not layer_target_map,  # Disabled if target map provided
             # Projected abliteration (orthogonalize against harmless)
@@ -2927,7 +2864,6 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "hybrid_skip_state_proj": hybrid_skip_state,
             # KL divergence monitoring
             "use_kl_monitoring": kl_monitor,
-            "kl_reference_prompts_path": kl_reference_prompts,
             "kl_num_reference_prompts": kl_num_prompts,
             "kl_top_k": kl_top_k,
             "use_kl_auto_tune": kl_auto_tune,

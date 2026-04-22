@@ -462,44 +462,11 @@ def auto_tune_multiplier(
 # ==============================================================================
 
 
-def load_reference_prompts(
-    path: Optional[str] = None,
-    num_prompts: int = 50,
-) -> list[str]:
-    """
-    Load reference prompts for KL monitoring.
+def load_reference_prompts(num_prompts: int = 50) -> list[str]:
+    """Load reference prompts for KL monitoring from the preservation split."""
+    from src.dataset_loader import load_split
 
-    Falls back to preservation.txt from the null-space module.
-
-    Args:
-        path: Path to reference prompts file (one per line or JSON)
-        num_prompts: Maximum number of prompts to use
-
-    Returns:
-        List of reference prompt strings
-    """
-    import random
-    from src.abliterate import load_prompts_from_file
-
-    if path is not None:
-        prompts = load_prompts_from_file(path, num_prompts=None)
-    else:
-        # Default: use preservation prompts
-        try:
-            from src.null_space import get_default_preservation_prompts_path
-            preservation_path = get_default_preservation_prompts_path()
-            prompts = load_prompts_from_file(preservation_path, num_prompts=None)
-        except (ImportError, FileNotFoundError):
-            # Fallback: use harmless prompts
-            from src.abliterate import get_default_prompts_path
-            harmless_path = get_default_prompts_path("harmless.txt")
-            prompts = load_prompts_from_file(harmless_path, num_prompts=None)
-
-    # Sample if we have more than needed
-    if len(prompts) > num_prompts:
-        prompts = random.sample(prompts, num_prompts)
-
-    return prompts
+    return load_split("preservation", n=num_prompts)
 
 
 def save_kl_report(

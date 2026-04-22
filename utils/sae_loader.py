@@ -14,6 +14,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 logger = logging.getLogger(__name__)
 
@@ -208,16 +210,6 @@ class SAELoader:
 
         logger.info(f"Loading SAE for layer {layer} from {self.config.repo_id}")
 
-        try:
-            from huggingface_hub import hf_hub_download
-            from safetensors.torch import load_file
-        except ImportError as e:
-            raise ImportError(
-                "SAE loading requires huggingface_hub and safetensors. "
-                "Install with: pip install huggingface_hub safetensors"
-            ) from e
-
-        # Download the SAE weights
         sae_path = self._get_sae_path(layer)
 
         try:

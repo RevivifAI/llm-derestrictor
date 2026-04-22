@@ -34,77 +34,6 @@ def get_config_path() -> Path:
     return get_config_dir() / "config.json"
 
 
-def get_user_prompts_dir() -> Path:
-    """Get the user prompts directory path (~/.abliterate/prompts/)."""
-    prompts_dir = get_config_dir() / "prompts"
-    return prompts_dir
-
-
-def get_package_prompts_dir() -> Path:
-    """Get the package prompts directory path (bundled with the app)."""
-    # Navigate from this file to the prompts directory
-    return Path(__file__).parent.parent / "prompts"
-
-
-def copy_prompts_to_user_dir(force: bool = False) -> bool:
-    """
-    Copy the default prompts from the package to the user's config directory.
-
-    Args:
-        force: If True, overwrite existing files. If False, skip existing files.
-
-    Returns:
-        True if any files were copied, False otherwise.
-    """
-    import shutil
-
-    package_prompts = get_package_prompts_dir()
-    user_prompts = get_user_prompts_dir()
-
-    if not package_prompts.exists():
-        return False
-
-    # Create user prompts directory
-    user_prompts.mkdir(parents=True, exist_ok=True)
-
-    copied = False
-    for prompt_file in package_prompts.glob("*.txt"):
-        dest_file = user_prompts / prompt_file.name
-        if force or not dest_file.exists():
-            shutil.copy2(prompt_file, dest_file)
-            copied = True
-
-    return copied
-
-
-def user_prompts_exist() -> bool:
-    """Check if user prompts directory exists and has prompt files."""
-    user_prompts = get_user_prompts_dir()
-    if not user_prompts.exists():
-        return False
-    return any(user_prompts.glob("*.txt"))
-
-
-def get_prompts_path(filename: str) -> Path:
-    """
-    Get the path to a prompts file, preferring user prompts over package prompts.
-
-    Args:
-        filename: Name of the prompts file (e.g., 'harmful.txt')
-
-    Returns:
-        Path to the prompts file (user's copy if exists, otherwise package default)
-    """
-    # Check user prompts directory first
-    user_path = get_user_prompts_dir() / filename
-    if user_path.exists():
-        return user_path
-
-    # Fall back to package prompts
-    package_path = get_package_prompts_dir() / filename
-    return package_path
-
-
 def get_default_config() -> dict:
     """Return default configuration settings."""
     config_dir = get_config_dir()
@@ -793,7 +722,6 @@ def display_training_config_details(config: dict, title: str = "Config Details")
 
     nullspace_settings = [
         ("use_null_space", "Null-Space Constraints"),
-        ("preservation_prompts_path", "Preservation Prompts"),
         ("null_space_rank_ratio", "Null-Space Rank Ratio"),
     ]
 

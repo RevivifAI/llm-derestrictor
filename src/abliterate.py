@@ -17,7 +17,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.model_utils import load_model_and_tokenizer
-from src.cli_components import get_versioned_path, get_prompts_path
+from src.cli_components import get_versioned_path
+from src.dataset_loader import load_split
 from utils.refusal_detector import LogLikelihoodRefusalDetector, RefusalDetectorConfig
 
 # Configure logging
@@ -442,19 +443,6 @@ def get_package_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def get_default_prompts_path(filename: str) -> str:
-    """Get the absolute path to a prompts file.
-
-    Checks user prompts directory (~/.abliterate/prompts/) first,
-    then falls back to the package prompts directory.
-
-    Args:
-        filename: Name of the prompts file (e.g., 'harmful.txt')
-
-    Returns:
-        Absolute path to the prompts file as a string
-    """
-    return str(get_prompts_path(filename))
 
 
 def copy_vision_files(source_path: Path, dest_path: Path) -> list[str]:
@@ -783,8 +771,6 @@ class AbliterationConfig:
 
     model_path: str
     output_path: str
-    harmful_prompts_path: str = field(default_factory=lambda: get_default_prompts_path("harmful.txt"))
-    harmless_prompts_path: str = field(default_factory=lambda: get_default_prompts_path("harmless.txt"))
     num_prompts: Optional[int] = None  # Number of prompts to sample (None = use all)
     harmful_prompts: list[str] = field(default_factory=list)
     harmless_prompts: list[str] = field(default_factory=list)
@@ -830,7 +816,6 @@ class AbliterationConfig:
 
     # Advanced options: Null-space constraints (preserves model capabilities)
     use_null_space: bool = False  # Enable null-space constrained abliteration
-    preservation_prompts_path: Optional[str] = None  # Path to preservation prompts file
     null_space_rank_ratio: float = 0.95  # SVD rank ratio for null-space computation
     null_space_regularization: float = 1e-4  # Tikhonov regularization for numerical stability
 
@@ -885,7 +870,6 @@ class AbliterationConfig:
 
     # KL divergence monitoring
     use_kl_monitoring: bool = False
-    kl_reference_prompts_path: Optional[str] = None  # default: preservation.txt
     kl_num_reference_prompts: int = 50
     kl_top_k: int = 200
     kl_batch_size: int = 4
@@ -2673,29 +2657,9 @@ def abliterate_model(
 # Main Pipeline
 
 
-def load_prompts_from_file(path: str, num_prompts: Optional[int] = None) -> list[str]:
-    """Load prompts from a JSON or text file, optionally sampling randomly."""
-    path = Path(path)
-
-    if path.suffix == ".json":
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                prompts = data
-            elif isinstance(data, dict) and "prompts" in data:
-                prompts = data["prompts"]
-            else:
-                raise ValueError(f"Unexpected JSON structure in {path}")
-    else:
-        # Assume text file with one prompt per line
-        with open(path, "r", encoding="utf-8") as f:
-            prompts = [line.strip() for line in f if line.strip()]
-
-    # Randomly sample if num_prompts is specified and less than total
-    if num_prompts is not None and num_prompts < len(prompts):
-        prompts = random.sample(prompts, num_prompts)
-
-    return prompts
+def load_prompts(split: str, num_prompts: Optional[int] = None) -> list[str]:
+    """Load ``num_prompts`` samples from a RevivifAI/derestriction split."""
+    return load_split(split, n=num_prompts)
 
 
 # Refusal Detection and Filtering
@@ -2937,15 +2901,14 @@ def run_abliteration(config: AbliterationConfig):
         trust_remote_code=True,
     )
 
-    # Load prompts from files
-    # For harmful prompts with filtering: load ALL prompts as a pool, then filter to target count
-    # For harmless prompts: sample directly since no filtering needed
+    # Load prompts from the RevivifAI/derestriction dataset.
+    # For harmful prompts with filtering: load ALL prompts as a pool, then
+    # filter down to target_count refused prompts. For harmless prompts we
+    # sample directly since no filtering is needed.
     if config.filter_harmful_prompts and not config.load_directions_path:
-        # Load full pool of harmful prompts for filtering
-        harmful_prompt_pool = load_prompts_from_file(config.harmful_prompts_path, num_prompts=None)
-        logger.info(f"Loaded {len(harmful_prompt_pool)} harmful prompts from {config.harmful_prompts_path}")
+        harmful_prompt_pool = load_prompts("harmful")
+        logger.info(f"Loaded {len(harmful_prompt_pool)} harmful prompts from RevivifAI/derestriction")
 
-        # Filter to find target_count refused prompts
         target_count = config.num_prompts if config.num_prompts else len(harmful_prompt_pool)
         refused_prompts, _ = filter_harmful_prompts_by_refusal(
             harmful_prompt_pool, model, tokenizer, config, target_count=target_count
@@ -2955,18 +2918,17 @@ def run_abliteration(config: AbliterationConfig):
             raise ValueError(
                 "No harmful prompts were refused by the model! "
                 "Cannot compute refusal directions without refused prompts. "
-                "Either use different harmful prompts or disable filtering with --no_filter_prompts"
+                "Try a stricter refusal threshold or disable filtering with --no_filter_prompts."
             )
 
         config.harmful_prompts = refused_prompts
         logger.info(f"Using {len(config.harmful_prompts)} refused prompts for refusal direction computation")
     else:
-        # No filtering - just sample directly
-        config.harmful_prompts = load_prompts_from_file(config.harmful_prompts_path, config.num_prompts)
-        logger.info(f"Loaded {len(config.harmful_prompts)} harmful prompts from {config.harmful_prompts_path}")
+        config.harmful_prompts = load_prompts("harmful", config.num_prompts)
+        logger.info(f"Loaded {len(config.harmful_prompts)} harmful prompts from RevivifAI/derestriction")
 
-    config.harmless_prompts = load_prompts_from_file(config.harmless_prompts_path, config.num_prompts)
-    logger.info(f"Loaded {len(config.harmless_prompts)} harmless prompts from {config.harmless_prompts_path}")
+    config.harmless_prompts = load_prompts("harmless", config.num_prompts)
+    logger.info(f"Loaded {len(config.harmless_prompts)} harmless prompts from RevivifAI/derestriction")
 
     # Get or compute refusal directions
     if config.load_directions_path:
@@ -2987,21 +2949,14 @@ def run_abliteration(config: AbliterationConfig):
             NullSpaceConfig,
             NullSpaceProjector,
             compute_null_space_projectors,
-            get_default_preservation_prompts_path,
         )
-
-        preservation_path = config.preservation_prompts_path
-        if preservation_path is None:
-            preservation_path = get_default_preservation_prompts_path()
 
         # Determine layer indices for null-space computation
         layers = directions.directions.keys()
         if not layers:
-            # Use extraction layers from config
             layers = config.extraction_layer_indices or []
 
         null_config = NullSpaceConfig(
-            preservation_prompts_path=preservation_path,
             svd_rank_ratio=config.null_space_rank_ratio,
             regularization=config.null_space_regularization,
         )
@@ -3038,7 +2993,6 @@ def run_abliteration(config: AbliterationConfig):
         )
 
         kl_reference_prompts = load_reference_prompts(
-            path=config.kl_reference_prompts_path,
             num_prompts=config.kl_num_reference_prompts,
         )
         logger.info(f"Loaded {len(kl_reference_prompts)} reference prompts for KL monitoring")
@@ -3151,7 +3105,6 @@ def run_abliteration(config: AbliterationConfig):
         "use_null_space": config.use_null_space,
         "null_space_rank_ratio": config.null_space_rank_ratio if config.use_null_space else None,
         "null_space_regularization": config.null_space_regularization if config.use_null_space else None,
-        "preservation_prompts_path": config.preservation_prompts_path if config.use_null_space else None,
         # Adaptive weighting options
         "use_adaptive_weighting": config.use_adaptive_weighting,
         "adaptive_position_center": config.adaptive_position_center if config.use_adaptive_weighting else None,
@@ -3216,18 +3169,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage (uses ./prompts/harmful.txt and ./prompts/harmless.txt)
+  # Basic usage (loads RevivifAI/derestriction from HuggingFace)
   python abliterate.py --model_path ./my_model --output_path ./abliterated_model
 
-  # Sample 100 random prompts from each file
+  # Sample 100 random prompts from each split
   python abliterate.py --model_path ./my_model --output_path ./abliterated_model --num_prompts 100
-
-  # With custom prompt files
-  python abliterate.py \\
-    --model_path ./my_model \\
-    --output_path ./abliterated_model \\
-    --harmful_prompts /path/to/harmful.json \\
-    --harmless_prompts /path/to/harmless.json
 
   # Target specific layers only
   python abliterate.py \\
@@ -3250,22 +3196,11 @@ Examples:
         help="Path to save the abliterated model",
     )
     parser.add_argument(
-        "--harmful_prompts",
-        type=str,
-        default=get_default_prompts_path("harmful.txt"),
-        help="Path to JSON or text file with harmful prompts (default: <package>/prompts/harmful.txt)",
-    )
-    parser.add_argument(
-        "--harmless_prompts",
-        type=str,
-        default=get_default_prompts_path("harmless.txt"),
-        help="Path to JSON or text file with harmless prompts (default: <package>/prompts/harmless.txt)",
-    )
-    parser.add_argument(
         "--num_prompts",
         type=int,
         default=30,
-        help="Number of prompts to randomly sample from each file (default: use all)",
+        help="Number of prompts to sample from each RevivifAI/derestriction "
+        "split (default: 30).",
     )
     parser.add_argument(
         "--target_layers",
@@ -3383,8 +3318,6 @@ Examples:
     config = AbliterationConfig(
         model_path=args.model_path,
         output_path=args.output_path,
-        harmful_prompts_path=args.harmful_prompts,
-        harmless_prompts_path=args.harmless_prompts,
         num_prompts=args.num_prompts,
         target_layers=args.target_layers,
         extraction_layer_indices=args.extraction_layers,

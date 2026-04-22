@@ -9,7 +9,7 @@ provides statistics for dynamic threshold calibration.
 Usage:
     python -m utils.refusal_calibration \
         --model google/gemma-2-9b-it \
-        --prompts prompts/harmful.txt \
+        --split harmful \
         --output calibration_results.json
 
 The output includes:
@@ -40,7 +40,7 @@ class CalibrationConfig:
     """Configuration for calibration run."""
 
     model_path: str
-    prompt_file: str
+    split: str = "harmful"
     output_path: str = "calibration_results.json"
     batch_size: int = 4
     max_new_tokens: int = 128
@@ -205,14 +205,14 @@ class RefusalCalibrator:
         print(f"Model loaded: {type(self.model).__name__}")
 
     def load_prompts(self) -> list[str]:
-        """Load prompts from file."""
-        with open(self.config.prompt_file, "r", encoding="utf-8") as f:
-            prompts = [line.strip() for line in f if line.strip()]
+        """Load prompts from the given split of RevivifAI/derestriction."""
+        from src.dataset_loader import load_split
 
+        prompts = load_split(self.config.split)
         if self.config.limit:
             prompts = prompts[:self.config.limit]
 
-        print(f"Loaded {len(prompts)} prompts from {self.config.prompt_file}")
+        print(f"Loaded {len(prompts)} prompts from RevivifAI/derestriction/{self.config.split}")
         return prompts
 
     def format_prompt(self, prompt: str) -> str:
@@ -458,7 +458,7 @@ class RefusalCalibrator:
         calibration_result = CalibrationResult(
             config={
                 "model_path": self.config.model_path,
-                "prompt_file": self.config.prompt_file,
+                "split": self.config.split,
                 "num_anchors": len(self.config.refusal_anchors),
                 "anchors": list(self.config.refusal_anchors),
                 "max_new_tokens": self.config.max_new_tokens,
@@ -543,10 +543,11 @@ def main():
         help="Model path or HuggingFace model ID"
     )
     parser.add_argument(
-        "-p", "--prompts",
+        "-s", "--split",
         type=str,
-        required=True,
-        help="Path to prompt file (one per line, prompts that should be refused)"
+        default="harmful",
+        choices=["harmful", "harmless", "preservation"],
+        help="RevivifAI/derestriction split to calibrate against (default: harmful).",
     )
     parser.add_argument(
         "-o", "--output",
@@ -618,7 +619,7 @@ def main():
     # Build config
     config = CalibrationConfig(
         model_path=args.model,
-        prompt_file=args.prompts,
+        split=args.split,
         output_path=args.output,
         batch_size=args.batch_size,
         max_new_tokens=args.max_tokens,

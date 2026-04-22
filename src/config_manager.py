@@ -41,7 +41,6 @@ DEFAULT_SETTINGS = {
     "use_float64_subtraction": True,
     # Null-space
     "use_null_space": False,
-    "preservation_prompts_path": None,
     "null_space_rank_ratio": 0.95,
     # Adaptive weighting
     "use_adaptive_weighting": False,
@@ -65,7 +64,6 @@ DEFAULT_SETTINGS = {
     "hybrid_skip_state_proj": False,
     # KL divergence monitoring
     "use_kl_monitoring": False,
-    "kl_reference_prompts_path": None,
     "kl_num_reference_prompts": 50,
     "kl_top_k": 200,
     "kl_batch_size": 4,

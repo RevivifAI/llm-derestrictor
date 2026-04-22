@@ -44,9 +44,10 @@ logger = logging.getLogger(__name__)
 class NullSpaceConfig:
     """Configuration for null-space constrained abliteration."""
 
-    # Preservation prompts - inputs whose outputs should be preserved
+    # Preservation prompts - inputs whose outputs should be preserved. When
+    # empty, the ``preservation`` split of ``RevivifAI/derestriction`` is
+    # loaded at compute time.
     preservation_prompts: list[str] = field(default_factory=list)
-    preservation_prompts_path: Optional[str] = None
 
     # Null-space computation parameters
     regularization: float = 1e-4  # Tikhonov regularization for numerical stability
@@ -519,17 +520,17 @@ def compute_null_space_projectors(
     """
     logger.info("Computing null-space projectors for capability preservation...")
 
-    # Load preservation prompts
     prompts = config.preservation_prompts.copy()
-    if config.preservation_prompts_path:
-        prompts.extend(load_preservation_prompts(config.preservation_prompts_path))
-
     if not prompts:
-        # Use defaults if no prompts provided
-        prompts = create_default_preservation_prompts()
-        logger.info(f"Using {len(prompts)} default preservation prompts")
+        from src.dataset_loader import load_split
+
+        prompts = load_split("preservation")
+        logger.info(
+            f"Using {len(prompts)} preservation prompts from "
+            "RevivifAI/derestriction"
+        )
     else:
-        logger.info(f"Using {len(prompts)} preservation prompts")
+        logger.info(f"Using {len(prompts)} caller-supplied preservation prompts")
 
     # Extract activations
     extractor = NullSpaceActivationExtractor(model, tokenizer, device, dtype)
@@ -588,103 +589,3 @@ def compute_null_space_projectors(
     )
 
 
-def load_preservation_prompts(path: str) -> list[str]:
-    """Load preservation prompts from file."""
-    import json
-
-    path = Path(path)
-    if not path.exists():
-        logger.warning(f"Preservation prompts file not found: {path}")
-        return []
-
-    content = path.read_text(encoding="utf-8")
-
-    if path.suffix == ".json":
-        data = json.loads(content)
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and "prompts" in data:
-            return data["prompts"]
-    else:
-        # Text file: one prompt per line, ignore comments starting with #
-        prompts = []
-        for line in content.split("\n"):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                prompts.append(line)
-        return prompts
-
-    return []
-
-
-def create_default_preservation_prompts() -> list[str]:
-    """
-    Create a default set of preservation prompts covering diverse capabilities.
-
-    These prompts are designed to capture activations for:
-    - General knowledge and reasoning
-    - Code generation
-    - Creative writing
-    - Math and logic
-    - Helpful assistant behavior
-    """
-    return [
-        # General knowledge
-        "What is the capital of France?",
-        "Explain how photosynthesis works.",
-        "Who wrote Romeo and Juliet?",
-        "What causes the seasons on Earth?",
-        "Describe the water cycle.",
-
-        # Reasoning and analysis
-        "Compare and contrast democracy and authoritarianism.",
-        "What are the pros and cons of renewable energy?",
-        "Analyze the causes of World War I.",
-        "Explain the scientific method.",
-        "What factors should I consider when making a major decision?",
-
-        # Coding and technical
-        "Write a Python function to calculate factorial.",
-        "Explain the difference between a list and a dictionary in Python.",
-        "How does a binary search algorithm work?",
-        "What is object-oriented programming?",
-        "Explain what an API is and how it works.",
-
-        # Creative and writing
-        "Write a short poem about nature.",
-        "Help me brainstorm ideas for a birthday party.",
-        "Describe a peaceful forest scene.",
-        "Write a professional email requesting time off.",
-        "Create a simple recipe for pasta.",
-
-        # Math and logic
-        "Solve the equation 2x + 5 = 15.",
-        "What is the Pythagorean theorem?",
-        "Explain probability using a coin flip example.",
-        "How do you calculate the area of a circle?",
-        "What is the difference between mean and median?",
-
-        # Helpful assistant
-        "How can I improve my study habits?",
-        "What are some tips for better sleep?",
-        "How do I start learning a new language?",
-        "Suggest some healthy breakfast options.",
-        "How can I be more productive at work?",
-
-        # Complex multi-step
-        "Plan a week-long trip to Japan including must-see attractions.",
-        "Explain how to start a small business step by step.",
-        "Create a workout routine for a beginner.",
-        "How do I write a good resume?",
-        "Explain machine learning to a 10-year-old.",
-    ]
-
-
-def get_default_preservation_prompts_path() -> str:
-    """Get the path to the default preservation prompts file.
-
-    Checks user prompts directory (~/.abliterate/prompts/) first,
-    then falls back to the package prompts directory.
-    """
-    from src.cli_components import get_prompts_path
-    return str(get_prompts_path("preservation.txt"))
