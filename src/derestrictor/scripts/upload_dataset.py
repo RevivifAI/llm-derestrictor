@@ -22,7 +22,8 @@ from huggingface_hub import create_repo, upload_file
 
 load_dotenv()
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# src/derestrictor/scripts/upload_dataset.py → repo root is four parents up.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BUILD_DIR = PROJECT_ROOT / "build" / "derestriction"
 REPO_ID = "RevivifAI/derestriction"
 
@@ -77,11 +78,16 @@ by [RevivifAI](https://huggingface.co/RevivifAI) for the
 
 ## Safety notice
 
-> The `harmful` split contains prompts designed to elicit genuinely harmful
-> content. It exists for **alignment / abliteration / red-team research only**
-> — do **not** fine-tune models toward these prompts. Prompts that mention,
-> target, or involve children (including teenagers and students) have been
-> removed via a two-stage keyword + semantic filter before sampling.
+> The `harmful` split contains prompts designed to elicit refusal from
+> aligned language models. It exists for **alignment / abliteration /
+> red-team research only** — do **not** fine-tune models toward these
+> prompts. Two categories are removed via a two-stage keyword + semantic
+> filter before sampling:
+>
+> 1. Prompts that mention, target, or involve children (including teenagers
+>    and students).
+> 2. Prompts that request graphic sexual acts, pornography, erotica, or
+>    other sexually explicit depictions.
 
 ## Schema
 
@@ -97,15 +103,23 @@ Every row in every split has exactly two columns:
 All three splits contain exactly **10,000** rows, deduplicated case-insensitively
 both within and across splits (no prompt appears in more than one split).
 
-### harmful — AdvBench-style refusal-target prompts
+### harmful — refusal-target prompts (AdvBench-style + Chinese sensitive topics)
 
 {harmful}
 
-Filter: prompts are passed through a two-stage harm filter before sampling —
-a keyword regex for child-related terms plus a semantic cosine-similarity
-pass against child-harm anchor prompts using
+The split blends classic AdvBench-style harmful behaviors with the
+**Chinese Sensitive Topics** prompts (CCP Sensitive + DeCCP splits) from
+[`MultiverseComputingCAI/llm-refusal-evaluation`](https://huggingface.co/datasets/MultiverseComputingCAI/llm-refusal-evaluation).
+The latter are not harmful per se — they are non-harmful but politically
+sensitive prompts that China-aligned instruct models currently refuse — so
+they are useful for computing and evaluating refusal directions.
+
+Filter: prompts are passed through a two-stage harm filter before sampling.
+For each of two categories (child-related content and sexual acts /
+depictions), a keyword regex is run first, then a semantic
+cosine-similarity pass against category anchor prompts using
 `sentence-transformers/all-MiniLM-L6-v2` at threshold 0.55. See
-[`utils/harm_filter.py`](https://github.com/RevivifAI/llm-derestrictor/blob/main/utils/harm_filter.py)
+[`src/derestrictor/data/harm_filter.py`](https://github.com/RevivifAI/llm-derestrictor/blob/main/src/derestrictor/data/harm_filter.py)
 for the full keyword list and anchors.
 
 ### harmless — benign instruction prompts (Alpaca-style)

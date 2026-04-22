@@ -32,7 +32,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# src/derestrictor/scripts/build_dataset.py → repo root is four parents up.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BUILD_DIR = PROJECT_ROOT / "build" / "derestriction"
 AUDIT_DROPS_PATH = PROJECT_ROOT / "build" / "harm_filter_drops.jsonl"
 AUDIT_HIST_PATH = PROJECT_ROOT / "build" / "harm_filter_histogram.json"
@@ -132,6 +133,24 @@ HARMFUL_SOURCES: list[SourceSpec] = [
         column="prompt",
         filter_fn=lambda r: r.get("language") == "en",
     ),
+    # Chinese Sensitive Topics from the Multiverse Computing refusal-evaluation
+    # benchmark. These prompts are treated as "harmful" here only in the sense
+    # that China-aligned instruct models currently *refuse* them, so they feed
+    # the refusal-direction computation. They are not harmful per se.
+    SourceSpec(
+        name="MultiverseComputingCAI/llm-refusal-evaluation:ccp_sensitive",
+        dataset_id="MultiverseComputingCAI/llm-refusal-evaluation",
+        config=None,
+        split="ccp_sensitive",
+        column="prompt",
+    ),
+    SourceSpec(
+        name="MultiverseComputingCAI/llm-refusal-evaluation:deccp_censored",
+        dataset_id="MultiverseComputingCAI/llm-refusal-evaluation",
+        config=None,
+        split="deccp_censored",
+        column="prompt",
+    ),
 ]
 
 
@@ -173,7 +192,6 @@ PRESERVATION_BUDGETS: dict[str, int] = {
     "allenai/ai2_arc": 2000,
     "HuggingFaceH4/MATH-500": 500,
     "openai/openai_humaneval": 164,
-    "llm-derestrictor/preservation.txt": 10_000,  # take all curated (<300)
     "tatsu-lab/alpaca": 10_000,  # top-up source
 }
 
