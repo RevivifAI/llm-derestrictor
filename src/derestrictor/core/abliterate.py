@@ -858,6 +858,46 @@ class AbliterationConfig:
     use_biprojection: bool = False  # Enable biprojection (measure at high-quality layers, apply across range)
     use_per_neuron_norm: bool = False  # Use per-neuron norm preservation instead of Frobenius
 
+    # Ablation kernel selector (overrides ``norm_preservation`` and
+    # ``use_per_neuron_norm`` when set). One of:
+    #   - ``"per_neuron"`` — per-row decomposition with per-output-neuron renorm
+    #     (grimjim's norm-preserving biprojected abliteration).
+    #   - ``"frobenius"`` — orthogonal projection with optional Frobenius rescale.
+    #   - ``"householder"`` — geodesic rotation (Rodrigues), isometric by
+    #     construction. With ``tgt = -src`` (the default), this is the
+    #     Householder reflection that nullifies the refusal component
+    #     without touching row norms — no Frobenius / per-row renorm needed.
+    #   - ``"directional"`` — rank-1 directional scaling
+    #     ``W + (scale - 1) * (W * s) (x) s`` with double-tap cancellation and
+    #     per-row renormalization. ``scale_factor`` semantics match jim-plus:
+    #     ``1.0`` = full ablation, ``0.0`` = identity, ``-1.0`` = amplification.
+    # Default ``None`` falls through to the legacy ``use_per_neuron_norm`` /
+    # ``norm_preservation`` boolean dispatch for backward compatibility.
+    ablation_kernel: str | None = None
+
+    # Two-pass orthogonalization in ``orthogonalize_against_harmless`` and
+    # ``compute_biprojected_direction``. Costs one extra dot product per call
+    # and recovers numerical precision lost to float cancellation when harmful
+    # and harmless means have very high cosine similarity (e.g., Gemma 3).
+    # Strictly more stable than one pass, so default-on.
+    two_pass_orthogonalization: bool = True
+
+    # ``invert_ablation`` flips the sign of ``direction_multiplier`` at the
+    # kernel boundary. Combined with the ``"directional"`` kernel this gives
+    # the jim-plus ``--invert`` behavior (induction / amplification of refusal),
+    # but it composes with all four kernels. ``1.0`` = full removal,
+    # ``0.0`` = identity, ``-1.0`` = amplification.
+    invert_ablation: bool = False
+
+    # Magnitude sparsification of the refusal direction itself. Keeps the top
+    # ``direction_sparsity`` fraction of entries by absolute magnitude and
+    # zeroes the rest, then renormalizes. ``0.0`` disables. Applied per layer
+    # after orthogonalization and before the kernel call.
+    # ``per_layer_sparsity`` overrides ``direction_sparsity`` on listed layers
+    # (matches Jim Lai's "sparsity 0.001 on layers 35-41" Gemma3 pattern).
+    direction_sparsity: float = 0.0
+    per_layer_sparsity: dict[int, float] | None = None
+
     # Biprojection configuration
     measurement_layers: list[int] | None = None  # Layers to measure refusal direction (auto if None)
     intervention_layers: list[int] | None = None  # Layers to apply ablation (auto if None)
@@ -1093,6 +1133,10 @@ class ActivationExtractor:
         self.config = config
         self.activations: dict[int, list[torch.Tensor]] = {}
         self.hooks = []
+        # Layers selected for hooking (also used by the generate-based
+        # extraction path to know which layers to slice from the
+        # ``hidden_states`` tuple, since hooks are short-circuited there).
+        self.hooked_layer_indices: list[int] = []
         # Welford accumulators for streaming mean computation
         self.welford_accumulators: dict[int, WelfordMeanAccumulator] = {}
         self.use_welford = config.use_welford_mean
@@ -1181,17 +1225,23 @@ class ActivationExtractor:
         """
 
         def hook(module, input, output):  # noqa: ARG001 - torch forward-hook signature
-            # Handle different output formats
             hidden_states = output[0] if isinstance(output, tuple) else output
 
-            # Extract based on token position config
-            if self.config.token_position == "last":  # noqa: S105 - enum string, not a credential
-                # Get the last non-padding token
+            # The ``first_generated`` / ``second_generated`` modes route
+            # through ``_extract_via_generate`` which captures hidden states
+            # directly from ``model.generate`` output. The hook is a no-op
+            # in that path so the prompt's last-token forward pass that
+            # generate triggers internally doesn't pollute the activations.
+            tp = self.config.token_position
+            if tp in {"first_generated", "second_generated"}:
+                return
+
+            if tp == "last":
                 extracted = hidden_states[:, -1, :]
-            elif self.config.token_position == "mean":  # noqa: S105 - enum string, not a credential
+            elif tp == "mean":
                 extracted = hidden_states.mean(dim=1)
-            elif isinstance(self.config.token_position, int):
-                extracted = hidden_states[:, self.config.token_position, :]
+            elif isinstance(tp, int):
+                extracted = hidden_states[:, tp, :]
             else:
                 extracted = hidden_states[:, -1, :]
 
@@ -1225,19 +1275,23 @@ class ActivationExtractor:
             # Default to middle-to-later layers where refusal is typically encoded
             layer_indices = list(range(num_layers // 4, 3 * num_layers // 4))
 
+        registered: list[int] = []
         for idx in layer_indices:
             if 0 <= idx < num_layers:
                 hook = layers[idx].register_forward_hook(self._create_hook(idx))
                 self.hooks.append(hook)
+                registered.append(idx)
+        self.hooked_layer_indices = registered
 
-        logger.info(f"Registered hooks on layers: {layer_indices}")
-        return layer_indices
+        logger.info(f"Registered hooks on layers: {registered}")
+        return registered
 
     def remove_hooks(self):
         """Remove all registered hooks."""
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
+        self.hooked_layer_indices = []
 
     def clear_activations(self):
         """Clear stored activations and Welford accumulators."""
@@ -1253,6 +1307,9 @@ class ActivationExtractor:
             If use_welford is enabled, means are computed via Welford's algorithm but
             full activations are still returned for quality score computation.
         """
+        if self.config.token_position in ("first_generated", "second_generated"):
+            return self._extract_via_generate(prompts)
+
         self.clear_activations()
         self.model.eval()
 
@@ -1302,6 +1359,102 @@ class ActivationExtractor:
             Dict mapping layer_idx to mean activation [hidden_dim]
         """
         return {layer_idx: acc.get_mean() for layer_idx, acc in self.welford_accumulators.items()}
+
+    @torch.no_grad()
+    def _extract_via_generate(self, prompts: list[str]) -> dict[int, torch.Tensor]:
+        """Extract hidden states at the first or second generated token position.
+
+        Mirrors upstream ``jim-plus/llm-abliteration`` measurement at the
+        generated-token position. Calls ``model.generate(...,
+        return_dict_in_generate=True, output_hidden_states=True)`` and slices
+        ``hidden_states[step][layer + 1][:, -1, :]`` for the requested step
+        (``step = 0`` → first generated, ``step = 1`` → second generated).
+
+        Forward hooks are short-circuited for these token positions in
+        :meth:`_create_hook` so the prompt's last-token forward pass that
+        ``generate`` triggers internally does not pollute the activations.
+
+        Args:
+            prompts: Raw user prompts; chat template is applied if available.
+
+        Returns:
+            Same shape as :meth:`extract_activations` — per-layer concatenated
+            activations of shape ``[num_prompts, hidden_dim]``. Per-layer
+            Welford accumulators are updated alongside.
+        """
+        self.clear_activations()
+        self.model.eval()
+
+        token_step = 1 if self.config.token_position == "second_generated" else 0  # noqa: S105 - enum string
+        max_new_tokens = max(token_step + 1, getattr(self.config, "max_new_tokens", 1) or 1)
+
+        layers = self._get_layers()
+        num_layers = len(layers)
+        # ``hooked_layer_indices`` is set by :meth:`register_hooks`; the
+        # ``generate`` path captures all layers, so we use that list to
+        # decide which layers to keep. Fall back to the standard
+        # middle-to-later range when nothing was registered.
+        target_layers = list(self.hooked_layer_indices)
+        if not target_layers:
+            target_layers = list(range(num_layers // 4, 3 * num_layers // 4))
+
+        gen_kwargs: dict[str, object] = {
+            "max_new_tokens": max_new_tokens,
+            "return_dict_in_generate": True,
+            "output_hidden_states": True,
+            "do_sample": False,
+        }
+        if getattr(self.tokenizer, "pad_token_id", None) is not None:
+            gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+
+        desc = f"Extracting activations ({self.config.token_position})"
+        for i in tqdm(range(0, len(prompts), self.config.batch_size), desc=desc):
+            batch_prompts = prompts[i : i + self.config.batch_size]
+
+            if hasattr(self.tokenizer, "apply_chat_template"):
+                formatted_prompts = []
+                for prompt in batch_prompts:
+                    messages = [{"role": "user", "content": prompt}]
+                    formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    formatted_prompts.append(formatted)
+            else:
+                formatted_prompts = batch_prompts
+
+            original_padding_side = self.tokenizer.padding_side
+            self.tokenizer.padding_side = "left"
+            inputs = self.tokenizer(
+                formatted_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048,
+            ).to(self.config.device)
+            self.tokenizer.padding_side = original_padding_side
+
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+
+            # ``hidden_states`` is a tuple of length ``max_new_tokens``;
+            # each entry is a tuple of ``num_layers + 1`` tensors (the
+            # leading +1 is the embedding layer). For the very first step
+            # the per-layer tensor is shaped ``[batch, prompt_len, hidden]``;
+            # for subsequent steps ``[batch, 1, hidden]``. Either way we
+            # want the last-position slice.
+            step_hidden = outputs.hidden_states[token_step]
+            for layer_idx in target_layers:
+                # +1 to skip the embedding layer.
+                layer_h = step_hidden[layer_idx + 1]
+                extracted = layer_h[:, -1, :].detach().to(torch.float32).cpu()
+
+                self.activations.setdefault(layer_idx, []).append(extracted)
+                if self.use_welford:
+                    if layer_idx not in self.welford_accumulators:
+                        accum_dtype = torch.float64 if self.config.use_float64_subtraction else torch.float32
+                        self.welford_accumulators[layer_idx] = WelfordMeanAccumulator(
+                            hidden_dim=extracted.shape[-1], device="cpu", dtype=accum_dtype
+                        )
+                    self.welford_accumulators[layer_idx].update(extracted)
+
+        return {layer_idx: torch.cat(acts, dim=0) for layer_idx, acts in self.activations.items()}
 
 
 # Adaptive Layer Weighting
@@ -1654,6 +1807,7 @@ def compute_refusal_direction_float64(
 def orthogonalize_against_harmless(
     refusal_dir: torch.Tensor,
     harmless_mean: torch.Tensor,
+    two_pass: bool = True,
 ) -> torch.Tensor:
     """Orthogonalize refusal direction against harmless direction.
 
@@ -1672,22 +1826,54 @@ def orthogonalize_against_harmless(
     Args:
         refusal_dir: Raw refusal direction [hidden_dim]
         harmless_mean: Mean activation for harmless prompts [hidden_dim]
+        two_pass: When True, apply the projection a second time. Catches the
+            residual ``r·ĥ`` component that float cancellation leaves behind
+            after the first subtraction on models with very high cosine
+            similarity between harmful and harmless means (e.g., Gemma 3).
+            One extra dot product, strictly more stable.
 
     Returns:
         Orthogonalized refusal direction (perpendicular to harmless) [hidden_dim]
     """
-    # Work in float32 for consistency
     refusal_float = refusal_dir.float()
     harmless_float = harmless_mean.float()
 
-    # Normalize harmless direction to unit vector
     harmless_normalized = F.normalize(harmless_float, dim=0)
 
-    # Compute projection onto harmless direction
-    projection_scalar = refusal_float @ harmless_normalized
+    result = refusal_float - (refusal_float @ harmless_normalized) * harmless_normalized
+    if two_pass:
+        result = result - (result @ harmless_normalized) * harmless_normalized
+    return result
 
-    # Remove parallel component (keep only perpendicular)
-    return refusal_float - projection_scalar * harmless_normalized
+
+def magnitude_sparsify(tensor: torch.Tensor, fraction: float) -> torch.Tensor:
+    """Keep the top ``fraction · numel`` entries by absolute magnitude, zero the rest.
+
+    Mirrors ``jim-plus/llm-abliteration/sharded_ablate.magnitude_sparsify``.
+    The threshold is the smallest magnitude in the kept set, so ties at the
+    boundary are preserved (matches the upstream ``>= threshold`` semantics).
+
+    Args:
+        tensor: Refusal direction (or any tensor); operates element-wise.
+        fraction: Fraction of entries to retain. ``0.0`` zeros everything;
+            ``>= 1.0`` returns the input unchanged. Out-of-range values are
+            clamped silently so callers can pass a config value verbatim.
+
+    Returns:
+        A new tensor of the same shape and dtype with ``(1 − fraction)`` of
+        its entries replaced by zero.
+    """
+    if fraction >= 1.0:
+        return tensor
+    if fraction <= 0.0:
+        return torch.zeros_like(tensor)
+    k = int(tensor.numel() * fraction)
+    if k == 0:
+        return torch.zeros_like(tensor)
+    flat = tensor.flatten()
+    threshold = torch.topk(flat.abs(), k, largest=True, sorted=False).values.min()
+    mask = tensor.abs() >= threshold
+    return tensor * mask
 
 
 def compute_biprojected_direction(
@@ -2068,7 +2254,11 @@ def compute_refusal_directions(
             # This removes the "general helpfulness magnitude" confound, keeping only
             # the mechanistically-specific refusal component
             if config.use_projected_refusal:
-                direction = orthogonalize_against_harmless(direction, harmless_mean)
+                direction = orthogonalize_against_harmless(
+                    direction,
+                    harmless_mean,
+                    two_pass=config.two_pass_orthogonalization,
+                )
 
             if config.normalize_directions:
                 direction = F.normalize(direction, dim=0)
@@ -2487,6 +2677,208 @@ def apply_per_neuron_norm_preserving_projection(
     W_new = W_norm * W_direction_new
 
     return W_new.to(original_dtype)
+
+
+def apply_householder_rotation(
+    weight: torch.Tensor,
+    src_dir: torch.Tensor,
+    tgt_dir: torch.Tensor | None = None,
+    scale_factor: float = 1.0,
+    direction_space: str | None = None,
+) -> torch.Tensor:
+    """Geodesic Rodrigues rotation kernel — isometric by construction.
+
+    Faithful transcription of
+    ``jim-plus/llm-abliteration/sharded_ablate.modify_tensor_householder``,
+    rewritten for PyTorch's ``[out_features, in_features]`` weight layout
+    and our ``direction_space`` resolver. The rotation is the great-circle
+    arc from ``src_dir`` to ``tgt_dir``; passing ``tgt_dir = -src_dir``
+    (the default) collapses to the antipodal Householder reflection
+    ``W − 2 (W·s) ⊗ s``, which nullifies the refusal component without
+    perturbing per-row norms.
+
+    Three exact operating points (intermediate values are interpolated
+    along the geodesic via the trig-free cos/sin derivation):
+
+    * ``scale_factor = 0.0`` → identity.
+    * ``scale_factor = 1.0`` → full rotation src → tgt (or full
+      suppression at the antipode).
+    * ``scale_factor = 2.0`` → reflection through the hyperplane
+      orthogonal to ``s``.
+
+    The post-op renorm clamp is a numerical safety net only; isometry
+    keeps it inactive on well-conditioned inputs.
+
+    Args:
+        weight: ``[out_features, in_features]`` weight matrix.
+        src_dir: Source direction. Length must equal one of
+            ``out_features`` (output-space, e.g. ``o_proj``) or
+            ``in_features`` (input-space, e.g. ``q_proj``).
+        tgt_dir: Target direction. Defaults to ``-src_dir`` (antipodal /
+            Householder reflection). Must live in the same space as
+            ``src_dir``.
+        scale_factor: Interpolation coefficient (see operating points).
+        direction_space: Optional ``"input"`` / ``"output"`` override
+            forwarded to :func:`_resolve_project_input`. Disambiguates
+            square attention projections.
+
+    Returns:
+        Modified weight tensor, same shape and dtype as ``weight``.
+    """
+    if tgt_dir is None:
+        tgt_dir = -src_dir
+
+    original_dtype = weight.dtype
+    weight_float = weight.float()
+    src = F.normalize(src_dir.to(device=weight.device, dtype=torch.float32).view(-1), dim=0)
+    tgt = F.normalize(tgt_dir.to(device=weight.device, dtype=torch.float32).view(-1), dim=0)
+
+    project_input = _resolve_project_input(
+        refusal_shape=src.shape[0],
+        weight_shape=weight_float.shape,
+        direction_space=direction_space,
+    )
+    if project_input is None:
+        logger.warning(
+            f"Direction shape {src.shape} doesn't match weight shape {weight_float.shape}, skipping rotation"
+        )
+        return weight
+
+    # Project along the axis the direction lives on. We work on a view that
+    # keeps the projected axis as the last dim (matches the upstream
+    # transposed [In, Out] convention) so the rank-1 updates are uniform.
+    # Input-space direction lives along axis 1 of [Out, In] so matmul on
+    # the last axis already targets it; output-space requires a transpose.
+    W_working = weight_float if project_input else weight_float.T
+
+    # Trig-free cos/sin from vector geometry.
+    cos_t = (src @ tgt).clamp(-1.0, 1.0)
+    sin_t = torch.sqrt((1.0 - cos_t**2).clamp(min=0.0))
+    cos_t_m1 = -2.0 * ((1.0 - cos_t) / 2.0)
+
+    is_antipodal = bool(cos_t < -(1.0 - 1e-6))
+
+    W_norms_sq_before = (W_working * W_working).sum(dim=-1, keepdim=True)
+    valid_rows = W_norms_sq_before > 1e-24
+
+    proj_s = W_working @ src
+
+    if is_antipodal:
+        # cos_t_m1 = -2 → Householder reflection through hyperplane ⟂ src.
+        W_working = W_working + scale_factor * cos_t_m1 * proj_s.unsqueeze(-1) * src
+    else:
+        t_perp = tgt - cos_t * src
+        t_perp_norm = t_perp.norm()
+        if t_perp_norm < 1e-6:
+            # src ≈ tgt: rotation angle ≈ 0, nothing to do.
+            return weight
+        e2 = t_perp / t_perp_norm
+        # Double-tap orthogonalization against src (mirrors upstream).
+        e2 = e2 - (e2 @ src) * src
+        e2 = e2 - (e2 @ src) * src
+        e2 = F.normalize(e2, dim=0)
+
+        proj_e2 = W_working @ e2
+        s_factor = scale_factor
+        W_working = (
+            W_working
+            + s_factor * cos_t_m1 * proj_s.unsqueeze(-1) * src
+            + s_factor * cos_t_m1 * proj_e2.unsqueeze(-1) * e2
+            + s_factor * sin_t * proj_s.unsqueeze(-1) * e2
+            - s_factor * sin_t * proj_e2.unsqueeze(-1) * src
+        )
+
+    # Numerical safety renorm clamp (no-op for well-conditioned inputs).
+    W_norms_sq_after = (W_working * W_working).sum(dim=-1, keepdim=True)
+    renorm = torch.where(
+        valid_rows,
+        (W_norms_sq_before / W_norms_sq_after).clamp(min=1.0 - 1e-12, max=1.0 + 1e-12).sqrt(),
+        torch.ones_like(W_norms_sq_after),
+    )
+    W_working = W_working * renorm
+
+    result = W_working if project_input else W_working.T
+    return result.to(original_dtype)
+
+
+def apply_directional_scaling(
+    weight: torch.Tensor,
+    direction: torch.Tensor,
+    scale_factor: float = 1.0,
+    direction_space: str | None = None,
+) -> torch.Tensor:
+    """Rank-1 directional scaling kernel with per-row norm preservation.
+
+    Faithful transcription of
+    ``jim-plus/llm-abliteration/sharded_ablate.modify_tensor_directional_scaling``,
+    rewritten for PyTorch's ``[out_features, in_features]`` layout and the
+    ``direction_space`` resolver. Applies the rank-1 update
+
+    .. code-block:: text
+
+        W_new = W + (alpha − 1) · (W·s) ⊗ s    with alpha = 1 − scale_factor
+
+    along the projected axis, plus a double-tap pass to remove the residual
+    ``s`` component left by float cancellation, plus a per-row renorm clamp
+    so downstream activation magnitudes are unchanged. Operating points
+    (abliteration convention):
+
+    * ``scale_factor = 1.0`` → full ablation, ``W_new · s = 0``.
+    * ``scale_factor = 0.0`` → identity.
+    * ``scale_factor = -1.0`` → amplification (doubles the ``s`` component).
+
+    Equivalent to a rank-1 LoRA update derived analytically from ``s``
+    rather than learned; the only error source is in the measurement of
+    ``s`` itself.
+
+    Args:
+        weight: ``[out_features, in_features]`` weight matrix.
+        direction: Direction vector. Need not be unit norm; normalized
+            internally. Length must match either weight axis.
+        scale_factor: Scaling coefficient. See operating points.
+        direction_space: Optional ``"input"`` / ``"output"`` override
+            forwarded to :func:`_resolve_project_input`.
+
+    Returns:
+        Modified weight tensor, same shape and dtype as ``weight``.
+    """
+    original_dtype = weight.dtype
+    weight_float = weight.float()
+    s = F.normalize(direction.to(device=weight.device, dtype=torch.float32).view(-1), dim=0)
+
+    project_input = _resolve_project_input(
+        refusal_shape=s.shape[0],
+        weight_shape=weight_float.shape,
+        direction_space=direction_space,
+    )
+    if project_input is None:
+        logger.warning(f"Direction shape {s.shape} doesn't match weight shape {weight_float.shape}, skipping scaling")
+        return weight
+
+    W_working = weight_float if project_input else weight_float.T
+
+    W_norms_before = W_working.norm(dim=-1, keepdim=True)
+    valid_rows = W_norms_before > 1e-12
+
+    alpha_m1 = -scale_factor
+
+    proj_s = W_working @ s
+    W_working = W_working + alpha_m1 * proj_s.unsqueeze(-1) * s
+    proj_s = W_working @ s
+    W_working = W_working + alpha_m1 * proj_s.unsqueeze(-1) * s
+
+    # Per-row renorm with double-tap.
+    for _ in range(2):
+        W_norms_after = W_working.norm(dim=-1, keepdim=True)
+        renorm = torch.where(
+            valid_rows & (W_norms_after > 1e-12),
+            W_norms_before / W_norms_after,
+            torch.ones_like(W_norms_after),
+        )
+        W_working = W_working * renorm
+
+    result = W_working if project_input else W_working.T
+    return result.to(original_dtype)
 
 
 # Model Abliteration
@@ -2928,8 +3320,48 @@ def abliterate_model(
 
         direction_space = infer_direction_space(name)
 
+        # Per-layer magnitude sparsification of the refusal direction.
+        # ``per_layer_sparsity`` overrides the global default for listed
+        # layers (Jim Lai's Gemma3 "0.001 on layers 35-41" pattern).
+        sparsity = config.direction_sparsity
+        if config.per_layer_sparsity and layer_idx is not None and layer_idx in config.per_layer_sparsity:
+            sparsity = config.per_layer_sparsity[layer_idx]
+        if 0.0 < sparsity < 1.0:
+            direction = magnitude_sparsify(direction, sparsity)
+            if config.normalize_directions:
+                direction = F.normalize(direction.float(), dim=0).to(config.dtype)
+
+        # ``invert_ablation`` flips the kernel sign for any kernel:
+        # ``1.0`` = full removal, ``0.0`` = identity, ``-1.0`` = amplification.
+        kernel_multiplier = -effective_multiplier if config.invert_ablation else effective_multiplier
+
+        # Resolve the kernel selector. ``ablation_kernel`` is authoritative
+        # when set; otherwise fall through to the legacy boolean dispatch
+        # so existing configs and the null-space combined path keep working.
+        if config.ablation_kernel:
+            kernel = config.ablation_kernel
+        elif config.use_per_neuron_norm:
+            kernel = "per_neuron"
+        else:
+            kernel = "frobenius"
+
         try:
-            if config.use_per_neuron_norm:
+            if kernel == "householder":
+                new_weight = apply_householder_rotation(
+                    weight,
+                    direction,
+                    tgt_dir=None,
+                    scale_factor=kernel_multiplier,
+                    direction_space=direction_space,
+                )
+            elif kernel == "directional":
+                new_weight = apply_directional_scaling(
+                    weight,
+                    direction,
+                    scale_factor=kernel_multiplier,
+                    direction_space=direction_space,
+                )
+            elif kernel == "per_neuron":
                 null_V = None
                 if null_space_projector is not None:
                     null_V = null_space_projector.get_projector_for_layer(layer_idx)
@@ -2937,14 +3369,13 @@ def abliterate_model(
                 new_weight = apply_per_neuron_norm_preserving_projection(
                     weight,
                     direction,
-                    scale_factor=effective_multiplier,
+                    scale_factor=kernel_multiplier,
                     harmless_dir=harmless_dir,
                     clamp_ratio=config.harmless_clamp_ratio,
                     null_space_V=null_V,
                     direction_space=direction_space,
                 )
             elif null_space_projector is not None:
-                # Null-space constrained (legacy/combined mode)
                 from derestrictor.core.null_space import apply_null_space_constrained_projection
 
                 null_V = null_space_projector.get_projector_for_layer(layer_idx)
@@ -2953,14 +3384,14 @@ def abliterate_model(
                     direction,
                     null_space_V=null_V,
                     preserve_norm=config.norm_preservation,
-                    multiplier=effective_multiplier,
+                    multiplier=kernel_multiplier,
                 )
             else:
                 new_weight = apply_norm_preserving_projection(
                     weight,
                     direction,
                     preserve_norm=config.norm_preservation,
-                    multiplier=effective_multiplier,
+                    multiplier=kernel_multiplier,
                     direction_space=direction_space,
                 )
 
@@ -3428,6 +3859,12 @@ def run_abliteration(config: AbliterationConfig):
         "use_adaptive_weighting": config.use_adaptive_weighting,
         "adaptive_position_center": config.adaptive_position_center if config.use_adaptive_weighting else None,
         "adaptive_position_sigma": config.adaptive_position_sigma if config.use_adaptive_weighting else None,
+        # Ablation kernel selection
+        "ablation_kernel": config.ablation_kernel,
+        "invert_ablation": config.invert_ablation,
+        "two_pass_orthogonalization": config.two_pass_orthogonalization,
+        "direction_sparsity": config.direction_sparsity if config.direction_sparsity > 0.0 else None,
+        "per_layer_sparsity": config.per_layer_sparsity,
         # Biprojection options
         "use_biprojection": config.use_biprojection,
         "use_per_neuron_norm": config.use_per_neuron_norm,
@@ -3590,8 +4027,65 @@ Examples:
         "--token_position",
         type=str,
         default="last",
-        help="Token position for activation extraction: 'last', 'mean', or integer",
+        help=(
+            "Token position for activation extraction. One of: 'last' (default), "
+            "'mean', 'first_generated', 'second_generated', or an integer index. "
+            "The two ``*_generated`` modes route through ``model.generate`` and "
+            "match the upstream jim-plus measurement convention."
+        ),
     )
+    parser.add_argument(
+        "--ablation_kernel",
+        type=str,
+        default=None,
+        choices=["per_neuron", "frobenius", "householder", "directional"],
+        help=(
+            "Ablation kernel selector. Defaults fall through to the legacy "
+            "boolean dispatch (``--per_layer_directions`` / norm preservation). "
+            "Use ``householder`` for isometric Rodrigues rotation and "
+            "``directional`` for rank-1 directional scaling with double-tap."
+        ),
+    )
+    parser.add_argument(
+        "--invert",
+        dest="invert_ablation",
+        action="store_true",
+        help=(
+            "Flip the kernel sign (``1.0`` = removal, ``0.0`` = identity, "
+            "``-1.0`` = amplification). Useful with ``--ablation_kernel "
+            "directional`` for jim-plus-style induction."
+        ),
+    )
+    parser.add_argument(
+        "--no-invert",
+        dest="invert_ablation",
+        action="store_false",
+        help="Disable ablation inversion (default).",
+    )
+    parser.set_defaults(invert_ablation=False)
+    parser.add_argument(
+        "--direction_sparsity",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of refusal-direction entries to keep by absolute "
+            "magnitude (0.0 disables; e.g. 0.001 keeps the top 0.1%%, "
+            "matching Jim Lai's Gemma 3 pattern)."
+        ),
+    )
+    parser.add_argument(
+        "--two_pass_orthogonalization",
+        dest="two_pass_orthogonalization",
+        action="store_true",
+        help="Two-pass Gram-Schmidt in orthogonalize_against_harmless and biprojection (default).",
+    )
+    parser.add_argument(
+        "--no_two_pass_orthogonalization",
+        dest="two_pass_orthogonalization",
+        action="store_false",
+        help="Use single-pass orthogonalization (faster, less stable).",
+    )
+    parser.set_defaults(two_pass_orthogonalization=True)
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -3642,9 +4136,10 @@ Examples:
         "float32": torch.float32,
     }
 
-    # Parse token position
-    token_pos = args.token_position
-    if token_pos.isdigit():
+    # Parse token position. Accepts the new ``first_generated`` and
+    # ``second_generated`` enums alongside the legacy ``last``/``mean``/<int>.
+    token_pos: str | int = args.token_position
+    if isinstance(token_pos, str) and token_pos.lstrip("-").isdigit():
         token_pos = int(token_pos)
 
     config = AbliterationConfig(
@@ -3666,6 +4161,10 @@ Examples:
         token_position=token_pos,
         filter_harmful_prompts=not args.no_filter_prompts,
         refusal_test_max_tokens=args.refusal_test_tokens,
+        ablation_kernel=args.ablation_kernel,
+        invert_ablation=args.invert_ablation,
+        direction_sparsity=args.direction_sparsity,
+        two_pass_orthogonalization=args.two_pass_orthogonalization,
     )
 
     model, tokenizer = run_abliteration(config)

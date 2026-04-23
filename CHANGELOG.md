@@ -5,6 +5,105 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-04-22
+
+### Added
+
+- New `apply_householder_rotation` ablation kernel. Geodesic Rodrigues
+  rotation transcribed from `jim-plus/llm-abliteration`, with the trig-free
+  cos/sin derivation, antipodal special case, and post-op renorm clamp.
+  Isometric by construction. Operating points: `scale_factor=0` is identity,
+  `1.0` is full rotation `s -> t` (or full reflection at the antipode),
+  `2.0` is reflection through the hyperplane orthogonal to `s`. The
+  rank-1 form avoids materializing a `[D, D]` rotation matrix.
+- New `apply_directional_scaling` ablation kernel. Rank-1 directional
+  scaling `W + (alpha - 1) * (W * s) ⊗ s` with double-tap cancellation
+  for exact projection and per-row renormalization. Negative
+  `scale_factor` amplifies along `s` instead of attenuating, giving the
+  upstream `--invert` / induction behavior for any kernel via the new
+  `invert_ablation` flag.
+- `AbliterationConfig.ablation_kernel` selector (`"per_neuron"`,
+  `"frobenius"`, `"householder"`, `"directional"`). When set, this is
+  authoritative; when `None` (the default), the legacy
+  `use_per_neuron_norm` / `norm_preservation` boolean dispatch is
+  preserved unchanged.
+- `AbliterationConfig.invert_ablation` flag flips the kernel multiplier
+  sign at the call boundary so `1.0` = removal, `0.0` = identity,
+  `-1.0` = amplification, composing with all four kernels.
+- `magnitude_sparsify` helper plus `AbliterationConfig.direction_sparsity`
+  and `AbliterationConfig.per_layer_sparsity` config fields. The refusal
+  direction is sparsified per layer after orthogonalization and before
+  the kernel call (renormalized after), enabling Jim Lai's
+  "sparsity 0.001 on layers 35-41" Gemma 3 pattern via an explicit
+  per-layer dict override.
+- `orthogonalize_against_harmless` and `compute_biprojected_direction`
+  now accept a `two_pass` argument (default-on via the new
+  `AbliterationConfig.two_pass_orthogonalization` field). The second
+  pass kills the residual `r * h_hat` component left by float
+  cancellation when harmful and harmless means have very high cosine
+  similarity (e.g., Gemma 3). One extra dot product, strictly more
+  stable.
+- `token_position` now accepts `"first_generated"` and
+  `"second_generated"`. Routes through `model.generate(...,
+  return_dict_in_generate=True, output_hidden_states=True)` and slices
+  the per-layer hidden state at the requested generated step, matching
+  the upstream `welford_gpu_batched_multilayer_float32` measurement
+  convention.
+- `--ablation-kernel`, `--invert` / `--no-invert`,
+  `--direction-sparsity`, `--two-pass-orthogonalization` /
+  `--no-two-pass-orthogonalization`, and the expanded `--token-position`
+  enum are wired through `derestrictor.core.abliterate.main` and the
+  interactive wizard's settings dict; all new fields round-trip into
+  `abliteration_config.json`.
+
+### Fixed
+
+- `WelfordMeanAccumulator` now defaults to `torch.float64` and tracks
+  `AbliterationConfig.use_float64_subtraction`. Previously the
+  accumulator hard-coded `float32`, silently truncating means before
+  `compute_refusal_direction_float64` could promote them — the f64
+  subtraction path was a no-op on the dominant code path.
+- Outlier Winsorization and magnitude clipping now propagate into the
+  Welford means consumed downstream. Previously, with the default
+  `use_welford_mean=True`, clipping was applied to a list the refusal
+  direction never read, while the quality scores and harmless boundary
+  signals DID read it — leaving the three signals internally
+  inconsistent. Both clipping helpers also now upcast to float64
+  internally per the precision policy and downcast back to the input
+  dtype on return.
+- `apply_per_neuron_norm_preserving_projection`'s output-space branch
+  (e.g., `o_proj` / `down_proj`) now decomposes per-row instead of
+  per-column so per-output-neuron magnitudes are preserved as
+  grimjim's [norm-preserving biprojected
+  abliteration](https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration)
+  sample requires. The pre-fix kernel preserved per-input-neuron norms
+  — exactly opposite to the cited reference.
+- Square attention projections (`hidden_size == num_heads * head_dim`)
+  no longer fall through to the wrong projection axis. Both projection
+  helpers accept an explicit `direction_space` override, and
+  `abliterate_model` resolves it from the layer name via the new
+  `infer_direction_space` helper, forcing the output-space branch for
+  `o_proj` / `down_proj` / `lm_head` / `out_proj` / `c_proj` / `fc2`
+  / `w2`. Pre-fix, the legacy shape heuristic always took the
+  input-axis branch on those, silently corrupting `o_proj` semantics.
+- Cross-layer biprojection now matches grimjim's per-L formulation
+  instead of the layer-ensemble mean it was masquerading as. New
+  `compute_biprojected_direction` helper implements
+  `r_bi(M, L) = r_M - (r_M * h_hat_L) * h_hat_L` with the optional
+  two-pass step, and `compute_biprojection_mapping` resolves each
+  intervention layer `L` to its source measurement layer `M` via a
+  `"nearest"` (default), `"single"`, or explicit-dict policy
+  (`AbliterationConfig.biprojection_mapping`). Harmless means at
+  intervention layers are now always computed when biprojection is
+  enabled. The legacy ensemble path is preserved behind
+  `AbliterationConfig.use_direction_ensemble` for opt-in
+  reproducibility. Resolved policy and `L -> M` map round-trip into
+  `abliteration_config.json` for audit.
+- `AbliterationConfig.min_quality_threshold` is now wired into
+  `select_biprojection_layers` to drop low-quality candidates before
+  the top-N ranking. Previously the field had no reader anywhere in
+  the repo.
+
 ## [2.0.0] - 2026-04-22
 
 ### Changed
