@@ -507,7 +507,7 @@ wheels = [
 
 [[package]]
 name = "derestrictor"
-version = "2.3.0"
+version = "2.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -524,10 +524,12 @@ dependencies = [
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "psutil" },
+    { name = "pyarrow" },
     { name = "python-dotenv" },
     { name = "questionary" },
     { name = "rich" },
     { name = "safetensors" },
+    { name = "sentence-transformers" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -536,11 +538,9 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pre-commit" },
-    { name = "pyarrow" },
     { name = "pyfiglet" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "sentence-transformers" },
 ]
 
 [package.metadata]
@@ -556,23 +556,24 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "psutil", specifier = ">=5.9.0" },
+    { name = "pyarrow", specifier = ">=24.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "questionary", specifier = ">=2.0.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "safetensors", specifier = ">=0.4.0" },
+    { name = "sentence-transformers", specifier = ">=2.7.0" },
+    { name = "sentence-transformers", specifier = ">=5.4.1" },
     { name = "torch", specifier = ">=2.0.0" },
     { name = "tqdm", specifier = ">=4.65.0" },
-    { name = "transformers", specifier = ">=4.30.0" },
+    { name = "transformers", specifier = ">=4.57.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pre-commit", specifier = ">=4.6.0" },
-    { name = "pyarrow", specifier = ">=15.0.0" },
     { name = "pyfiglet", specifier = ">=1.0.4" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "ruff", specifier = ">=0.15.11" },
-    { name = "sentence-transformers", specifier = ">=2.7.0" },
 ]
 
 [[package]]

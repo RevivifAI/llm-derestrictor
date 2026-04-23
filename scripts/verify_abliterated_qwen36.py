@@ -53,6 +53,9 @@ def _resolve_base_path() -> str:
     nothing for a Hub id string. Passing the snapshot directory lets the
     fallback fire and avoids ``transformers``' 10 GB caching-allocator warmup
     from OOMing the 12 GB GPU.
+
+    Returns:
+        Absolute path to the cached local snapshot directory for ``BASE_MODEL_ID``.
     """
     return huggingface_hub.snapshot_download(repo_id=BASE_MODEL_ID, local_files_only=True)
 

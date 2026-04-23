@@ -32,6 +32,14 @@ repos:
         args: ["--fix=lf"]
       - id: debug-statements
 
+  - repo: local
+    hooks:
+      - id: no-em-dash
+        name: "Forbid em dashes (U+2014) in Python source"
+        language: pygrep
+        entry: "—"
+        types: [python]
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.11
     hooks:

@@ -13,20 +13,20 @@ Runs two stages per category:
 
 Five categories are filtered:
 
-- ``child`` — prompts that mention, target, or involve children, teenagers,
+- ``child`` -- prompts that mention, target, or involve children, teenagers,
   or students.
-- ``sexual`` — prompts that request graphic sexual acts, pornography, erotica,
+- ``sexual`` -- prompts that request graphic sexual acts, pornography, erotica,
   non-consensual / incest / bestial / necrophilic content.
-- ``violence_extreme`` — prompts requesting targeted assassination, murder,
+- ``violence_extreme`` -- prompts requesting targeted assassination, murder,
   torture, kidnap-and-harm, or terrorist planning against specific people or
   venues.
-- ``weapons_mass_destruction`` — prompts requesting construction /
+- ``weapons_mass_destruction`` -- prompts requesting construction /
   acquisition / deployment of bombs, biological / chemical / nuclear /
   radiological weapons, or mass-casualty devices.
-- ``self_harm`` — prompts encouraging or instructing suicide, self-injury,
+- ``self_harm`` -- prompts encouraging or instructing suicide, self-injury,
   or eating-disorder self-harm.
 
-The filter is intentionally aggressive — we err heavily on the side of
+The filter is intentionally aggressive -- we err heavily on the side of
 moving borderline prompts into ``restrict`` rather than letting genuinely
 unsafe prompts live on in the ``derestrict`` or ``allow`` pools.
 """
@@ -41,13 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-# ``sentence-transformers`` is an optional ``[dev]`` dependency (only the
-# harm filter needs it). Resolve it once at import time so call sites can
-# check for ``None`` instead of retrying the import lazily per call.
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover - exercised only when dev extras absent
-    SentenceTransformer = None  # type: ignore[assignment,misc]
+from sentence_transformers import SentenceTransformer
 
 _CHILD_KEYWORD_PATTERNS: list[str] = [
     r"child(?:ren)?",
@@ -202,7 +196,7 @@ _SEXUAL_SEMANTIC_ANCHORS: list[str] = [
 
 
 # Targeted interpersonal violence, torture, and terrorist planning.
-# Deliberately narrower than "violence" — hacking, self-defense, weapons
+# Deliberately narrower than "violence" -- hacking, self-defense, weapons
 # training, and fictional combat stay in the derestrict pool.
 _VIOLENCE_KEYWORD_PATTERNS: list[str] = [
     r"assassinat(?:e|es|ed|ing|ion|or|ors)",
@@ -409,11 +403,6 @@ class HarmFilter:
     def _load_embedder(self) -> None:
         if self._embedder is not None:
             return
-        if SentenceTransformer is None:
-            raise ImportError(
-                "sentence-transformers is required for semantic harm filtering. "
-                "Install the dev extras: pip install -e '.[dev]'"
-            )
         self._embedder = SentenceTransformer(self.embedder_name)
         for name, anchors in self._anchor_texts.items():
             self._anchor_embs[name] = self._embedder.encode(

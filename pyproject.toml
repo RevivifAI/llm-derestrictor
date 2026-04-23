@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "derestrictor"
-version = "2.3.0"
+version = "2.3.1"
 description = "Remove refusal behavior from language models using norm-preserving orthogonal projection"
 readme = "README.md"
 license = "MIT"
@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
-    "transformers>=4.30.0",
+    "transformers>=4.57.0",
     "tqdm>=4.65.0",
     "psutil>=5.9.0",
     "rich>=13.0.0",
@@ -32,6 +32,7 @@ dependencies = [
     "huggingface-hub>=0.20.0",
     "safetensors>=0.4.0",
     "datasets>=2.19.0",
+    "sentence-transformers>=2.7.0",
     "python-dotenv>=1.0.0",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
@@ -83,6 +84,8 @@ dependencies = [
     "flash-linear-attention>=0.2.0",
     "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
     "mistral-common>=1.11.0",
+    "sentence-transformers>=5.4.1",
+    "pyarrow>=24.0.0",
 ]
 
 [project.scripts]
@@ -100,8 +103,6 @@ dev = [
     "pytest>=7.0.0",
     "ruff>=0.15.11",
     "pre-commit>=4.6.0",
-    "sentence-transformers>=2.7.0",
-    "pyarrow>=15.0.0",
     "pyfiglet>=1.0.4",
 ]
 
@@ -117,6 +118,7 @@ packages = ["src/derestrictor"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+preview = true
 extend-exclude = [
     "build",
     "dist",
@@ -158,6 +160,7 @@ select = [
     "Q",      # flake8-quotes
     "S",      # flake8-bandit (security)
     "D",      # pydocstyle
+    "DOC",    # pydoclint (docstring ↔ signature consistency)
 ]
 ignore = [
     "D100",    # Missing module docstring (internal modules don't need them everywhere)
@@ -171,6 +174,7 @@ ignore = [
     "PLR0911", # Too many return statements (decision-heavy ML code)
     "PLR0913", # Too many arguments (common in ML configs)
     "PLR0912", # Too many branches
+    "PLR0914", # Too many local variables (research scripts routinely exceed 15)
     "PLR0915", # Too many statements
     "PLR2004", # Magic value used in comparison (noisy for numeric ML code)
     "S101",    # Use of assert (fine in research/tests)
@@ -182,11 +186,52 @@ ignore = [
     "N803",    # Argument names follow linear-algebra conventions (X, W, Q, ...)
     "N806",    # Local variable names follow linear-algebra conventions (W, U, S, V, D, Q, ...)
     "N812",    # Conventional aliases (e.g. `import torch.nn.functional as F`)
-    "RUF002",  # Ambiguous Unicode in docstrings: intentional typography (em-dash, non-breaking hyphen)
 ]
-unfixable = [
-    "ERA001",  # Don't auto-delete commented-out code; surface it for review
-    "F401",    # Don't auto-delete unused imports; imports may be intentional re-exports
+# Unicode characters that are intentionally used in math/formula notation and should not be
+# flagged as confusable with their ASCII lookalikes (RUF001/RUF002/RUF003).
+allowed-confusables = [
+    # Arithmetic operators
+    "−",  # U+2212 MINUS SIGN (vs hyphen-minus)
+    "×",  # U+00D7 MULTIPLICATION SIGN (vs letter x)
+    "·",  # U+00B7 MIDDLE DOT / dot-product (vs full stop)
+    "÷",  # U+00F7 DIVISION SIGN
+    # Relational operators
+    "≈",  # U+2248 ALMOST EQUAL TO
+    "≠",  # U+2260 NOT EQUAL TO
+    "≤",  # U+2264 LESS-THAN OR EQUAL TO
+    "≥",  # U+2265 GREATER-THAN OR EQUAL TO
+    # Set / logic notation
+    "∈",  # U+2208 ELEMENT OF
+    "∉",  # U+2209 NOT AN ELEMENT OF
+    # Calculus / linear-algebra operators
+    "∑",  # U+2211 N-ARY SUMMATION
+    "∏",  # U+220F N-ARY PRODUCT
+    "√",  # U+221A SQUARE ROOT
+    "∞",  # U+221E INFINITY
+    "∂",  # U+2202 PARTIAL DIFFERENTIAL
+    "∇",  # U+2207 NABLA (gradient operator)
+    # Greek lowercase — hyperparameters, statistics, eigenvalues
+    "α",  # U+03B1 alpha  (learning rate, scale factor)
+    "β",  # U+03B2 beta   (hyperparameter, RLHF reward)
+    "γ",  # U+03B3 gamma  (discount factor)
+    "δ",  # U+03B4 delta  (small perturbation)
+    "ε",  # U+03B5 epsilon (gradient clipping, numerical stability)
+    "θ",  # U+03B8 theta  (model parameters)
+    "λ",  # U+03BB lambda (eigenvalue, regularisation)
+    "μ",  # U+03BC mu     (mean)
+    "ν",  # U+03BD nu     (frequency / learning-rate schedules)
+    "σ",  # U+03C3 sigma  (standard deviation, sigmoid)
+    "τ",  # U+03C4 tau    (temperature, soft-update coefficient)
+    "φ",  # U+03C6 phi    (feature map)
+    "ω",  # U+03C9 omega  (angular frequency / weight decay)
+    # Greek uppercase — matrix notation
+    "Σ",  # U+03A3 Sigma  (covariance / sum)
+    "Π",  # U+03A0 Pi     (product)
+    "Δ",  # U+0394 Delta  (finite difference)
+    "Γ",  # U+0393 Gamma  (gamma function)
+    "Λ",  # U+039B Lambda (diagonal eigenvalue matrix)
+    "Θ",  # U+0398 Theta  (parameter set)
+    "Ω",  # U+03A9 Omega  (weight matrix / total parameter space)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -214,7 +259,6 @@ unfixable = [
 "scripts/*.py" = [
     "T201",    # print() is acceptable in CLI/research utilities
     "D",       # docstring coverage is not required for one-off scripts
-    "RUF001",  # allow Unicode characters (em-dashes etc.) in user-facing strings
     "S603",
     "S607",
 ]

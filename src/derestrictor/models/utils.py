@@ -21,31 +21,8 @@ from typing import Literal
 
 import torch
 import transformers
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# Optional / version-gated transformers symbols. Older transformers releases
-# may not ship these classes, so we resolve them once at import time and fall
-# back to ``None`` — call sites check for ``None`` and surface a clear
-# ``ImportError`` with an upgrade hint instead of a cryptic ``AttributeError``.
-try:
-    from transformers import BitsAndBytesConfig
-except ImportError:  # pragma: no cover - depends on transformers build
-    BitsAndBytesConfig = None  # type: ignore[assignment,misc]
-
-try:
-    from transformers import Mistral3ForConditionalGeneration
-except ImportError:  # pragma: no cover - requires transformers >= 4.48.0
-    Mistral3ForConditionalGeneration = None  # type: ignore[assignment,misc]
-
-try:
-    from transformers import FineGrainedFP8Config
-except ImportError:  # pragma: no cover - requires recent transformers + mistral-common
-    FineGrainedFP8Config = None  # type: ignore[assignment,misc]
-
-try:
-    from transformers import AutoModelForImageTextToText
-except ImportError:  # pragma: no cover - requires transformers >= 4.57.0
-    AutoModelForImageTextToText = None  # type: ignore[assignment,misc]
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
+from transformers import BitsAndBytesConfig, FineGrainedFP8Config, Mistral3ForConditionalGeneration
 
 # Fix Windows encoding issues - set preferred encoding for file I/O
 if sys.platform == "win32":
@@ -290,14 +267,9 @@ def detect_model_type(model_path: str) -> dict:
 def _build_bnb_quantization_config(quantization: Literal["none", "4bit", "8bit"], dtype: torch.dtype):
     """Build a ``BitsAndBytesConfig`` for measurement-only quant loads.
 
-    Returns ``None`` when ``quantization == "none"`` or bitsandbytes is not
-    importable (caller falls back to the normal full-precision path and
-    logs a warning).
+    Returns ``None`` when ``quantization == "none"``.
     """
     if quantization == "none":
-        return None
-    if BitsAndBytesConfig is None:
-        logger.warning("bitsandbytes / transformers BitsAndBytesConfig unavailable; falling back to full precision")
         return None
     if quantization == "4bit":
         return BitsAndBytesConfig(
@@ -371,7 +343,7 @@ def load_model_and_tokenizer(
     # (``quant_state.offset`` lives on a ``meta`` device and crashes inside
     # ``Linear4bit._save_to_state_dict``), so when the model is too large to
     # fit in VRAM at 4-bit we *prefer* skipping bnb entirely and using BF16
-    # with native accelerate offload — slower but actually works end-to-end.
+    # with native accelerate offload -- slower but actually works end-to-end.
     needs_auto_device_map = quant_config is not None
     offload_folder: str | None = None
     if device != "cpu" and torch.cuda.is_available():
@@ -462,40 +434,22 @@ def load_model_and_tokenizer(
         # Mistral3 VL models require special handling
         if is_mistral3:
             logger.info("Loading Mistral3 VL model...")
-            if Mistral3ForConditionalGeneration is None:
-                raise ImportError(
-                    "Mistral3ForConditionalGeneration requires transformers >= 4.48.0. "
-                    "Please upgrade with: pip install --upgrade transformers"
-                )
             if is_fp8:
                 # Mistral3 FP8 models require FineGrainedFP8Config with dequantize=True
                 # We explicitly set torch_dtype to ensure consistent output dtype
-                if FineGrainedFP8Config is not None:
-                    logger.info("Using FineGrainedFP8Config for Mistral3 FP8 model...")
-                    quant_config = FineGrainedFP8Config(dequantize=True)
-                    model = Mistral3ForConditionalGeneration.from_pretrained(
-                        model_path,
-                        quantization_config=quant_config,
-                        torch_dtype=dtype,  # Ensure consistent dtype after dequantization
-                        device_map=device,
-                        trust_remote_code=trust_remote_code,
-                    )
-                    # Fix weight tying for FP8 dequantized models
-                    # The lm_head.weight may not be properly tied after dequantization
-                    model = _fix_weight_tying(model, model_path)
-                    logger.info(f"Model loaded with dtype={dtype} after FP8 dequantization")
-                else:
-                    logger.warning(
-                        "FineGrainedFP8Config not available. Install mistral-common or upgrade transformers."
-                    )
-                    model = Mistral3ForConditionalGeneration.from_pretrained(
-                        model_path,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=False,
-                        trust_remote_code=trust_remote_code,
-                    )
-                    if device != "cpu":
-                        model = model.to(device)
+                logger.info("Using FineGrainedFP8Config for Mistral3 FP8 model...")
+                quant_config = FineGrainedFP8Config(dequantize=True)
+                model = Mistral3ForConditionalGeneration.from_pretrained(
+                    model_path,
+                    quantization_config=quant_config,
+                    torch_dtype=dtype,  # Ensure consistent dtype after dequantization
+                    device_map=device,
+                    trust_remote_code=trust_remote_code,
+                )
+                # Fix weight tying for FP8 dequantized models
+                # The lm_head.weight may not be properly tied after dequantization
+                model = _fix_weight_tying(model, model_path)
+                logger.info(f"Model loaded with dtype={dtype} after FP8 dequantization")
             else:
                 model = Mistral3ForConditionalGeneration.from_pretrained(
                     model_path,
@@ -505,11 +459,6 @@ def load_model_and_tokenizer(
                 )
         else:
             logger.info("Loading VL model with AutoModelForImageTextToText...")
-            if AutoModelForImageTextToText is None:
-                raise ImportError(
-                    "AutoModelForImageTextToText requires transformers >= 4.57.0. "
-                    "Please upgrade with: pip install --upgrade transformers"
-                )
             if is_fp8:
                 # FP8 models: load without device_map, then move to device
                 model = AutoModelForImageTextToText.from_pretrained(
@@ -647,9 +596,9 @@ _MOE_MODULE_MARKERS = ("block_sparse_moe", "mlp.experts", ".experts.")
 #
 # ``qwen3_5_moe`` (and its ``_text`` text-config sibling, plus ``qwen3_omni_moe``)
 # store fused experts as ``nn.Parameter([E, OUT, IN])`` per the transformers
-# 5.5 ``Qwen3_5MoeExperts`` / ``Qwen3OmniMoeThinkerTextExperts`` source —
-# ``gate_up_proj`` is ``[E, 2*moe_intermediate, hidden]`` and ``down_proj``
-# is ``[E, hidden, moe_intermediate]`` — which is the same EOI layout as
+    # 5.5 ``Qwen3_5MoeExperts`` / ``Qwen3OmniMoeThinkerTextExperts`` source --
+    # ``gate_up_proj`` is ``[E, 2*moe_intermediate, hidden]`` and ``down_proj``
+    # is ``[E, hidden, moe_intermediate]`` -- which is the same EOI layout as
 # Mixtral. Without this hint the shape-only fallback in
 # :func:`_resolve_expert_axes` would mis-classify ``down_proj`` as EIO
 # (because its ``in`` axis is smaller than ``out``) and ablate the wrong

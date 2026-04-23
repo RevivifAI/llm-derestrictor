@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-04-23
+
+### Changed
+
+- `sentence-transformers` promoted from a dev-only dependency to a core runtime
+  dependency; the try/except import guard and `SentenceTransformer is None` check
+  in `harm_filter._load_embedder` have been removed.
+- `transformers` minimum version bumped from `>=4.30.0` to `>=4.57.0` to cover
+  all symbols now imported unconditionally (`AutoModelForImageTextToText`,
+  `Mistral3ForConditionalGeneration`, `FineGrainedFP8Config`,
+  `BitsAndBytesConfig`). The four version-gated try/except blocks in
+  `models.utils` and their `None`-guard call sites have been removed.
+
 ## [2.3.0] - 2026-04-22
 
 ### Added
