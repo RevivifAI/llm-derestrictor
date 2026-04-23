@@ -864,6 +864,19 @@ class AbliterationConfig:
     num_measurement_layers: int = 2  # How many top-quality layers for measurement
     intervention_range: tuple[float, float] = (0.25, 0.95)  # Depth range for intervention as fraction
 
+    # Biprojection mapping policy: how each intervention layer L picks its
+    # source measurement layer M for the per-L biprojection r_bi(M, L).
+    # ``"nearest"`` is the recommended default per the grimjim article comments
+    # ("closer-is-better", Nabbers1999). ``"single"`` collapses to the
+    # top-ranked M (cheap baseline, closest to the original abliteration
+    # paper). A ``dict[int, int]`` is an explicit override useful for
+    # reproducing jim-plus YAML configs.
+    biprojection_mapping: object = "nearest"
+    # Legacy ensemble mode: collapse measurement layers into one mean direction
+    # before applying it (old behavior of this repo). Off by default — the new
+    # per-L biprojection is more faithful to grimjim's formulation.
+    use_direction_ensemble: bool = False
+
     # Layer type targeting
     target_layer_types: list[str] | None = None  # e.g., ['o_proj', 'down_proj'], None = all types
 
@@ -1187,12 +1200,17 @@ class ActivationExtractor:
                 self.activations[layer_idx] = []
             self.activations[layer_idx].append(extracted.detach().cpu())
 
-            # Additionally update Welford accumulators for more stable mean computation
+            # Additionally update Welford accumulators for more stable mean computation.
+            # H1: track the configured precision policy so that
+            # ``use_float64_subtraction`` is not silently nullified by an
+            # upstream f32 truncation. Default to f64 to match the upstream
+            # ``jim-plus/llm-abliteration`` implementation.
             if self.use_welford:
                 if layer_idx not in self.welford_accumulators:
                     dim = extracted.shape[-1]
+                    accum_dtype = torch.float64 if self.config.use_float64_subtraction else torch.float32
                     self.welford_accumulators[layer_idx] = WelfordMeanAccumulator(
-                        hidden_dim=dim, device="cpu", dtype=torch.float32
+                        hidden_dim=dim, device="cpu", dtype=accum_dtype
                     )
                 self.welford_accumulators[layer_idx].update(extracted.detach().cpu())
 
@@ -1466,21 +1484,25 @@ def winsorize_activations(
 
     Critical for models like Gemma 3 where high-magnitude outliers
     can obscure the true refusal direction. Computes thresholds
-    independently for each dimension.
+    independently for each dimension. Per the project precision policy,
+    quantiles and clipping are computed in ``float64`` to keep large-tail
+    outlier statistics from saturating the f16/bf16 representable range.
 
     Args:
         activations: [num_samples, hidden_dim] activation tensor
         percentile: Clip values above this percentile (default: 0.995)
 
     Returns:
-        Winsorized activations with outliers clipped per-dimension
+        Winsorized activations with outliers clipped per-dimension, returned
+        in the input dtype.
     """
-    # Compute per-dimension thresholds based on absolute values
-    abs_acts = activations.abs()
-    thresholds = torch.quantile(abs_acts.float(), percentile, dim=0)
+    original_dtype = activations.dtype
+    activations_f64 = activations.double()
+    abs_acts = activations_f64.abs()
+    thresholds = torch.quantile(abs_acts, percentile, dim=0)
 
-    # Clip to thresholds (both positive and negative)
-    return torch.clamp(activations, -thresholds, thresholds)
+    clipped = torch.clamp(activations_f64, -thresholds, thresholds)
+    return clipped.to(original_dtype)
 
 
 def magnitude_clip_activations(
@@ -1501,15 +1523,12 @@ def magnitude_clip_activations(
         Clipped activations with extreme values clamped
     """
     original_dtype = activations.dtype
-    activations_float = activations.float()
+    activations_f64 = activations.double()
 
-    # Compute global threshold across all values
-    abs_activations = torch.abs(activations_float)
+    abs_activations = activations_f64.abs()
     threshold = torch.quantile(abs_activations.flatten(), percentile)
 
-    # Symmetric clipping
-    clipped = torch.clamp(activations_float, min=-threshold, max=threshold)
-
+    clipped = torch.clamp(activations_f64, min=-threshold, max=threshold)
     return clipped.to(original_dtype)
 
 
@@ -1526,13 +1545,19 @@ class WelfordMeanAccumulator:
     corrected sums of squares and products"
     """
 
-    def __init__(self, hidden_dim: int, device: str = "cpu", dtype: torch.dtype = torch.float32):
+    def __init__(self, hidden_dim: int, device: str = "cpu", dtype: torch.dtype = torch.float64):
         """Initialize the accumulator.
 
         Args:
             hidden_dim: Dimension of the activation vectors
             device: Device to store running statistics
-            dtype: Data type for accumulation (recommend float32 for stability)
+            dtype: Data type for accumulation. Defaults to ``torch.float64`` to
+                match the upstream ``jim-plus/llm-abliteration`` convention
+                (``welford_gpu_batched_multilayer_float32`` accumulates in
+                ``double()`` despite the file name) and to preserve precision
+                when downstream consumers later subtract two near-equal means.
+                Pass ``torch.float32`` only when the caller has explicitly
+                opted out of the float64 subtraction path.
         """
         self.count = 0
         self.mean = torch.zeros(hidden_dim, device=device, dtype=dtype)
@@ -1583,6 +1608,7 @@ def compute_mean_welford(
     activations_list: list[torch.Tensor],
     hidden_dim: int,
     device: str = "cpu",
+    dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
     """Compute mean using Welford's online algorithm for numerical stability.
 
@@ -1590,11 +1616,12 @@ def compute_mean_welford(
         activations_list: List of [batch_size, hidden_dim] tensors
         hidden_dim: Dimension of activation vectors
         device: Device for computation
+        dtype: Accumulation dtype (default float64; pass float32 to opt out).
 
     Returns:
-        Mean activation vector [hidden_dim]
+        Mean activation vector [hidden_dim] in the accumulation dtype.
     """
-    accumulator = WelfordMeanAccumulator(hidden_dim, device=device, dtype=torch.float32)
+    accumulator = WelfordMeanAccumulator(hidden_dim, device=device, dtype=dtype)
 
     for batch in activations_list:
         accumulator.update(batch)
@@ -1661,6 +1688,82 @@ def orthogonalize_against_harmless(
 
     # Remove parallel component (keep only perpendicular)
     return refusal_float - projection_scalar * harmless_normalized
+
+
+def compute_biprojected_direction(
+    refusal_dir: torch.Tensor,
+    harmless_mean: torch.Tensor,
+    two_pass: bool = True,
+) -> torch.Tensor:
+    """Cross-layer biprojection: remove a target layer's harmless component from a measurement layer's refusal direction.
+
+    Implements grimjim's biprojection per
+    https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration:
+    the refusal vector ``r_M`` is measured at a high-quality source layer ``M``
+    and projected against the harmless mean ``ĥ_L`` of the *target* layer ``L``
+    where the ablation will actually be applied. This keeps the rank-1 update
+    from disturbing layer ``L``'s local harmless subspace.
+
+    The optional second pass mirrors the upstream ``e2 = e2 - (e2·s)·s``
+    double-tap and catches residual float cancellation that a single pass
+    leaves behind on near-collinear pairs (notably on Gemma 3).
+
+    Args:
+        refusal_dir: Source-layer refusal direction ``r_M`` (any non-zero norm).
+        harmless_mean: Target-layer harmless mean ``h_L`` (any non-zero norm).
+        two_pass: Run the projection twice for numerical robustness.
+
+    Returns:
+        Unit-norm biprojected direction ``r_bi`` orthogonal to ``ĥ_L`` to within
+        floating-point precision.
+    """
+    refusal_float = refusal_dir.float()
+    h_L_hat = F.normalize(harmless_mean.float(), dim=0)
+
+    proj = (refusal_float @ h_L_hat) * h_L_hat
+    r_bi = refusal_float - proj
+    if two_pass:
+        r_bi = r_bi - (r_bi @ h_L_hat) * h_L_hat
+    return F.normalize(r_bi, dim=0)
+
+
+def compute_biprojection_mapping(
+    intervention_layers: list[int] | set[int],
+    measurement_layers: list[int],
+    policy: object,
+) -> dict[int, int]:
+    """Resolve each intervention layer ``L`` to a source measurement layer ``M``.
+
+    Args:
+        intervention_layers: Layers where ablation will be applied.
+        measurement_layers: Layers ranked by direction quality (descending,
+            so ``measurement_layers[0]`` is the top-quality layer).
+        policy: Either the literal string ``"single"`` (all ``L`` use the
+            top-ranked ``M``), the literal string ``"nearest"`` (each ``L``
+            picks the ``M`` minimizing ``|L − M|``, ties broken by smaller
+            ``M``), or an explicit ``dict[int, int]`` ``L → M`` mapping.
+
+    Returns:
+        Dictionary ``{L: M}`` for every ``L`` in ``intervention_layers`` that
+        can be mapped. Layers in an explicit dict that are missing from the
+        intervention set are dropped; layers in the intervention set that are
+        absent from an explicit dict are not mapped (caller falls back).
+    """
+    if not measurement_layers:
+        return {}
+
+    intervention_sorted = sorted(intervention_layers)
+
+    if isinstance(policy, dict):
+        return {L: M for L, M in policy.items() if L in intervention_sorted}
+
+    if policy == "single":
+        return dict.fromkeys(intervention_sorted, measurement_layers[0])
+
+    if policy == "nearest":
+        return {L: min(measurement_layers, key=lambda M: (abs(L - M), M)) for L in intervention_sorted}
+
+    raise ValueError(f"Unknown biprojection_mapping policy: {policy!r}")
 
 
 # Biprojection: SNR-Based Layer Quality Scoring
@@ -1737,26 +1840,38 @@ def select_biprojection_layers(
     num_layers: int,
     num_measurement_layers: int = 2,
     intervention_range: tuple[float, float] = (0.25, 0.95),
+    min_quality_threshold: float = 0.0,
 ) -> tuple[list[int], list[int]]:
     """Select measurement and intervention layers for biprojection.
 
     Strategy:
-        1. Measurement layers: Top N layers by quality score (where refusal is clearest)
-        2. Intervention layers: Range from 25% to 95% of model depth
+        1. Measurement layers: Top N layers by quality score (where refusal is
+           clearest), excluding any layer whose quality is strictly below
+           ``min_quality_threshold``.
+        2. Intervention layers: Range from 25% to 95% of model depth.
 
     Args:
         quality_scores: Per-layer quality scores from compute_direction_quality_scores()
         num_layers: Total number of transformer layers
         num_measurement_layers: How many top-quality layers to use for measurement (default: 2)
         intervention_range: (start, end) as fraction of depth for intervention
+        min_quality_threshold: Drop candidates with quality below this value
+            before ranking (default: 0.0 keeps the legacy behavior).
 
     Returns:
         (measurement_layers, intervention_layers)
     """
-    # Sort layers by quality score (descending)
     sorted_layers = sorted(quality_scores.items(), key=lambda x: x[1]["quality"], reverse=True)
 
-    # Top layers for measurement
+    if min_quality_threshold > 0.0:
+        before = len(sorted_layers)
+        sorted_layers = [pair for pair in sorted_layers if pair[1]["quality"] >= min_quality_threshold]
+        dropped = before - len(sorted_layers)
+        if dropped:
+            logger.info(
+                f"min_quality_threshold={min_quality_threshold:.3f} dropped {dropped}/{before} measurement candidates"
+            )
+
     measurement_layers = [layer_idx for layer_idx, _ in sorted_layers[:num_measurement_layers]]
 
     # Intervention range
@@ -1822,6 +1937,28 @@ def compute_refusal_directions(
     else:
         extraction_layers = config.extraction_layer_indices
 
+    # Per-L biprojection (H5) needs the harmless mean ĥ_L at every intervention
+    # layer L, not just at the measurement layers. Expand the extraction set to
+    # cover the configured intervention range when biprojection is enabled and
+    # the user did not pin extraction_layer_indices manually.
+    if (
+        config.use_biprojection
+        and not config.use_direction_ensemble
+        and config.extraction_layer_indices is None
+        and not config.dynamic_layer_targeting
+    ):
+        if config.intervention_layers:
+            intervention_for_extraction = list(config.intervention_layers)
+        else:
+            start_layer = int(config.intervention_range[0] * num_layers)
+            end_layer = int(config.intervention_range[1] * num_layers)
+            intervention_for_extraction = list(range(start_layer, end_layer + 1))
+        extraction_layers = sorted(set(extraction_layers) | set(intervention_for_extraction))
+        logger.info(
+            f"Biprojection per-L mode: expanded extraction to {len(extraction_layers)} layers "
+            f"covering the intervention range"
+        )
+
     extractor.register_hooks(extraction_layers)
 
     # Store Welford means if enabled (computed during extraction)
@@ -1850,7 +1987,7 @@ def compute_refusal_directions(
     finally:
         extractor.remove_hooks()
 
-    # Apply outlier clipping if enabled
+    # Apply outlier clipping if enabled.
     # Option 1: Per-dimension Winsorization
     if config.use_winsorization:
         logger.info(f"Applying per-dimension Winsorization (percentile={config.winsorize_percentile})...")
@@ -1873,6 +2010,25 @@ def compute_refusal_directions(
         for layer_idx in harmless_activations:
             harmless_activations[layer_idx] = magnitude_clip_activations(
                 harmless_activations[layer_idx], config.magnitude_clip_percentile
+            )
+
+    # H2: when clipping is enabled, the Welford means captured during the
+    # forward hook were accumulated from raw (unclipped) activations and so
+    # disagree with the clipped activation tensors that downstream consumers
+    # (quality scores, harmless boundary, projected/orthogonalize step) read.
+    # Rebuild the Welford means from the clipped tensors so all downstream
+    # signals are internally consistent.
+    if config.use_welford_mean and (config.use_winsorization or config.use_magnitude_clipping):
+        accum_dtype = torch.float64 if config.use_float64_subtraction else torch.float32
+        rebuild_msg = "winsorization" if config.use_winsorization else "magnitude clipping"
+        logger.info(f"Rebuilding Welford means from clipped activations (after {rebuild_msg})...")
+        for layer_idx, acts in harmful_activations.items():
+            harmful_welford_means[layer_idx] = compute_mean_welford(
+                [acts], hidden_dim=acts.shape[-1], device="cpu", dtype=accum_dtype
+            )
+        for layer_idx, acts in harmless_activations.items():
+            harmless_welford_means[layer_idx] = compute_mean_welford(
+                [acts], hidden_dim=acts.shape[-1], device="cpu", dtype=accum_dtype
             )
 
     # Log numerical stability and projection settings
@@ -1940,42 +2096,62 @@ def compute_refusal_directions(
             harmless_activations,
             hybrid_info=hybrid_info,
         )
-        # Log top quality layers
         if quality_scores:
             top_layers = sorted(quality_scores.items(), key=lambda x: x[1]["quality"], reverse=True)[:5]
             for layer_idx, scores in top_layers:
                 logger.info(f"  Layer {layer_idx}: quality={scores['quality']:.3f}, SNR={scores['snr']:.3f}")
 
-    # Biprojection: Store harmless directions for boundary clamping
-    harmless_directions = None
-    if config.use_harmless_boundary:
-        logger.info("Storing harmless directions for boundary clamping...")
+    # Harmless directions ĥ_L. Always populated when biprojection is on (the
+    # per-L biprojection helper consumes them) and when harmless boundary
+    # clamping is on (the per-neuron kernel consumes them). Storing both
+    # paths under a single dict keeps downstream call sites uniform.
+    harmless_directions: dict[int, torch.Tensor] | None = None
+    if config.use_harmless_boundary or config.use_biprojection:
+        if config.use_harmless_boundary:
+            logger.info("Storing harmless directions for boundary clamping...")
+        if config.use_biprojection and not config.use_direction_ensemble:
+            logger.info("Storing harmless directions ĥ_L at intervention layers for biprojection...")
         harmless_directions = {}
         for layer_idx in extraction_layers:
-            if layer_idx in harmless_activations:
-                harmless_mean = harmless_activations[layer_idx].mean(dim=0)
+            if layer_idx in harmless_activations or layer_idx in harmless_welford_means:
+                if config.use_welford_mean and layer_idx in harmless_welford_means:
+                    harmless_mean_layer = harmless_welford_means[layer_idx]
+                else:
+                    harmless_mean_layer = harmless_activations[layer_idx].mean(dim=0)
                 if config.normalize_directions:
-                    harmless_mean = F.normalize(harmless_mean, dim=0)
-                harmless_directions[layer_idx] = harmless_mean.to(config.dtype)
+                    harmless_mean_layer = F.normalize(harmless_mean_layer.float(), dim=0)
+                harmless_directions[layer_idx] = harmless_mean_layer.to(config.dtype)
 
-    # Biprojection: Compute combined direction from measurement layers
+    # Biprojection direction(s). Two modes:
+    #   - Legacy ``use_direction_ensemble``: collapse per-M directions into one
+    #     mean direction up front (the historical behavior of this repo).
+    #   - Default per-L biprojection (H5): leave per-M directions and ĥ_L
+    #     intact; the dispatcher composes ``r_bi(M, L)`` on the fly.
     biprojected_direction = None
     if config.use_biprojection and quality_scores:
-        measurement_layers, _ = select_biprojection_layers(
+        sel_measurement_layers, _ = select_biprojection_layers(
             quality_scores,
             num_layers=num_layers,
             num_measurement_layers=config.num_measurement_layers,
             intervention_range=config.intervention_range,
+            min_quality_threshold=config.min_quality_threshold,
         )
 
-        # Average directions from measurement layers
-        measurement_directions = [directions[layer_idx] for layer_idx in measurement_layers if layer_idx in directions]
-        if measurement_directions:
-            biprojected_direction = torch.stack(measurement_directions).mean(dim=0)
-            if config.normalize_directions:
-                biprojected_direction = F.normalize(biprojected_direction, dim=0)
-            biprojected_direction = biprojected_direction.to(config.dtype)
-            logger.info(f"Computed biprojected direction from layers {measurement_layers}")
+        if config.use_direction_ensemble:
+            measurement_directions = [
+                directions[layer_idx] for layer_idx in sel_measurement_layers if layer_idx in directions
+            ]
+            if measurement_directions:
+                biprojected_direction = torch.stack(measurement_directions).mean(dim=0)
+                if config.normalize_directions:
+                    biprojected_direction = F.normalize(biprojected_direction, dim=0)
+                biprojected_direction = biprojected_direction.to(config.dtype)
+                logger.info(f"Direction-ensemble (legacy biprojection): mean over layers {sel_measurement_layers}")
+        else:
+            logger.info(
+                f"Per-L biprojection: source measurement layers (top quality) = {sel_measurement_layers}; "
+                f"ĥ_L stored for {len(harmless_directions or {})} target layers"
+            )
 
     metadata = {
         "num_harmful_prompts": len(config.harmful_prompts),
@@ -1994,6 +2170,9 @@ def compute_refusal_directions(
         "use_projected_refusal": config.use_projected_refusal,
         # Biprojection metadata
         "use_biprojection": config.use_biprojection,
+        "use_direction_ensemble": config.use_direction_ensemble,
+        "biprojection_mapping": config.biprojection_mapping if config.use_biprojection else None,
+        "min_quality_threshold": config.min_quality_threshold if config.use_quality_selection else None,
         "use_harmless_boundary": config.use_harmless_boundary,
         "num_measurement_layers": config.num_measurement_layers if config.use_biprojection else None,
         "intervention_range": list(config.intervention_range) if config.use_biprojection else None,
@@ -2036,6 +2215,7 @@ def apply_norm_preserving_projection(
     direction: torch.Tensor,
     preserve_norm: bool = True,
     multiplier: float = 1.0,
+    direction_space: str | None = None,
 ) -> torch.Tensor:
     """Apply norm-preserving orthogonal projection to a weight matrix.
 
@@ -2048,6 +2228,9 @@ def apply_norm_preserving_projection(
         direction: The refusal direction vector [hidden_size]
         preserve_norm: Whether to rescale weights to preserve Frobenius norm
         multiplier: Scale factor for ablation strength (1.0 = full ablation)
+        direction_space: Optional ``"input"`` / ``"output"`` override resolved
+            by the caller (see :func:`infer_direction_space`). Disambiguates
+            square attention projections.
 
     Returns:
         Modified weight matrix
@@ -2055,40 +2238,32 @@ def apply_norm_preserving_projection(
     original_dtype = weight.dtype
     original_norm = weight.float().norm()
 
-    # Work in float32 for numerical stability
-    # Ensure both tensors are on the same device and dtype
     weight_float = weight.float()
     direction_float = direction.to(device=weight.device, dtype=torch.float32)
 
-    # Ensure direction is normalized
     direction_float = F.normalize(direction_float, dim=0)
 
-    # Determine which dimension to project based on weight shape
-    # For most linear layers: weight is [out_features, in_features]
-    # The direction typically matches in_features (the hidden dimension being projected)
-
-    if direction_float.shape[0] == weight_float.shape[1]:
-        # Project along input dimension (columns)
-        # W_new = W @ P where P is the projection matrix
-        # Equivalent to: W_new = W - (W @ d) @ d^T
-        proj_coeffs = weight_float @ direction_float  # [out_features]
-        proj_coeffs = proj_coeffs * multiplier
-        adjustment = torch.outer(proj_coeffs, direction_float)  # [out_features, in_features]
-        weight_new = weight_float - adjustment
-
-    elif direction_float.shape[0] == weight_float.shape[0]:
-        # Project along the output dimension (rows): W_new = P @ W,
-        # which is equivalent to W_new = W - d @ (d^T @ W).
-        proj_coeffs = direction_float @ weight_float  # [in_features]
-        proj_coeffs = proj_coeffs * multiplier
-        adjustment = torch.outer(direction_float, proj_coeffs)  # [out_features, in_features]
-        weight_new = weight_float - adjustment
-
-    else:
+    project_input = _resolve_project_input(
+        refusal_shape=direction_float.shape[0],
+        weight_shape=weight_float.shape,
+        direction_space=direction_space,
+    )
+    if project_input is None:
         logger.warning(
             f"Direction shape {direction_float.shape} doesn't match weight shape {weight_float.shape}, skipping"
         )
         return weight
+
+    if project_input:
+        proj_coeffs = weight_float @ direction_float  # [out_features]
+        proj_coeffs = proj_coeffs * multiplier
+        adjustment = torch.outer(proj_coeffs, direction_float)
+        weight_new = weight_float - adjustment
+    else:
+        proj_coeffs = direction_float @ weight_float  # [in_features]
+        proj_coeffs = proj_coeffs * multiplier
+        adjustment = torch.outer(direction_float, proj_coeffs)
+        weight_new = weight_float - adjustment
 
     # Norm preservation: rescale to maintain original Frobenius norm
     if preserve_norm:
@@ -2099,6 +2274,103 @@ def apply_norm_preserving_projection(
     return weight_new.to(original_dtype)
 
 
+# Layer roles in the residual stream. ``input`` layers read the residual
+# stream (refusal arrives along the input axis). ``output`` layers write to
+# it (refusal exits along the output axis). The classification matters
+# whenever a weight matrix is square or its two dims coincidentally agree
+# with the refusal direction's length, where the legacy shape heuristic
+# would otherwise pick the wrong axis (H4).
+_INPUT_SPACE_LAYER_TYPES: frozenset[str] = frozenset(
+    {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "qkv_proj",
+        "gate_proj",
+        "up_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
+        "fc1",
+        "c_attn",
+        "w1",
+        "w3",
+    }
+)
+_OUTPUT_SPACE_LAYER_TYPES: frozenset[str] = frozenset(
+    {
+        "o_proj",
+        "out_proj",
+        "down_proj",
+        "fc2",
+        "c_proj",
+        "w2",
+        "lm_head",
+    }
+)
+
+
+def infer_direction_space(layer_name: str) -> str | None:
+    """Infer whether the refusal direction lives in the layer's input or output space.
+
+    Args:
+        layer_name: Full parameter path, e.g. ``model.layers.10.self_attn.o_proj.weight``.
+
+    Returns:
+        ``"input"`` for layers that read the residual stream,
+        ``"output"`` for layers that write the residual stream,
+        or ``None`` if the role cannot be determined (callers should fall
+        through to the shape heuristic).
+    """
+    layer_type = get_layer_type_from_name(layer_name)
+    if layer_type is None:
+        return None
+    if layer_type in _OUTPUT_SPACE_LAYER_TYPES:
+        return "output"
+    if layer_type in _INPUT_SPACE_LAYER_TYPES:
+        return "input"
+    return None
+
+
+def _resolve_project_input(
+    refusal_shape: int,
+    weight_shape: tuple[int, ...] | torch.Size,
+    direction_space: str | None,
+) -> bool | None:
+    """Pick the projection axis for a per-layer rank-1 ablation.
+
+    When ``direction_space`` is provided it is authoritative — this is how the
+    H4 fix avoids the square-weight ambiguity for ``o_proj``-style attention
+    output projections (where ``hidden_size == num_heads * head_dim``). When
+    omitted, fall back to the legacy shape match.
+
+    Args:
+        refusal_shape: Length of the refusal direction.
+        weight_shape: ``weight.shape`` (``[out_features, in_features]``).
+        direction_space: ``"input"`` / ``"output"`` override, or ``None``.
+
+    Returns:
+        ``True`` to project along the input axis (refusal lives in the layer's
+        input space), ``False`` to project along the output axis, or ``None``
+        when neither dim can host the direction.
+    """
+    out_features, in_features = weight_shape[0], weight_shape[1]
+    matches_input = refusal_shape == in_features
+    matches_output = refusal_shape == out_features
+
+    if direction_space == "input":
+        return True if matches_input else None
+    if direction_space == "output":
+        return False if matches_output else None
+
+    if matches_input:
+        return True
+    if matches_output:
+        return False
+    return None
+
+
 def apply_per_neuron_norm_preserving_projection(
     weight: torch.Tensor,
     refusal_dir: torch.Tensor,
@@ -2106,117 +2378,104 @@ def apply_per_neuron_norm_preserving_projection(
     harmless_dir: torch.Tensor | None = None,
     clamp_ratio: float = 0.1,
     null_space_V: torch.Tensor | None = None,
+    direction_space: str | None = None,
 ) -> torch.Tensor:
     """Ablate only the direction component of W while preserving per-row magnitudes.
 
     Decomposes W into magnitude M (per-row norms) and direction W_hat, ablates the
     direction component, and recombines with the original magnitudes. This preserves
-    per-neuron activation scales better than Frobenius-norm preservation.
+    per-output-neuron activation scales better than Frobenius-norm preservation,
+    matching the per-row decomposition in Jim Lai's grimjim sample
+    (https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration).
 
-    Mathematical formulation:
-        W = M @ W_hat  where M = diag(||W[i,:]||) and W_hat[i,:] = W[i,:] / ||W[i,:]||
+    Mathematical formulation (input-space refusal, e.g. ``q_proj``/``up_proj``):
+        W = M ⊙ W_hat  where M[i] = ||W[i,:]|| and W_hat[i,:] = W[i,:] / M[i]
         refusal_normalized = refusal_dir / ||refusal_dir||
-        projection = W_hat @ refusal_normalized  (per-neuron alignment)
-        W_hat_new = W_hat - scale_factor * outer(refusal_normalized, projection)
-        W_hat_new = normalize(W_hat_new, dim=1)  (re-normalize each row)
-        W_new = M @ W_hat_new  (recombine with original magnitudes)
+        projection = W_hat @ refusal_normalized            # [out_features]
+        W_hat_new  = W_hat − scale_factor · outer(projection, refusal_normalized)
+        W_hat_new  = normalize(W_hat_new, dim=1)
+        W_new      = M ⊙ W_hat_new
+
+    Output-space refusal (e.g. ``o_proj``/``down_proj``/``lm_head``) uses the same
+    per-row decomposition (``W_norm = ||W[i,:]||``) so per-output-neuron magnitudes
+    are preserved, with the rank-1 update written in the orthogonal axis:
+        projection = refusal_normalized @ W_hat            # [in_features]
+        W_hat_new  = W_hat − scale_factor · outer(refusal_normalized, projection)
+        W_hat_new  = normalize(W_hat_new, dim=1)
 
     Args:
-        weight: Weight matrix [out_features, in_features]
-        refusal_dir: Refusal direction vector [in_features] (for o_proj/down_proj)
-        scale_factor: Ablation strength (1.0 = full removal)
-        harmless_dir: Optional harmless direction for boundary clamping
-        clamp_ratio: How much to clamp toward harmless direction (0.1 = 10%)
-        null_space_V: Optional null-space basis for combined mode (applies constraint before re-norm)
+        weight: Weight matrix [out_features, in_features].
+        refusal_dir: Refusal direction vector. Length must equal ``in_features``
+            (input-space) or ``out_features`` (output-space).
+        scale_factor: Ablation strength (1.0 = full removal).
+        harmless_dir: Optional harmless direction for boundary clamping (must
+            live in the same space as ``refusal_dir``).
+        clamp_ratio: How much to clamp toward harmless direction (0.1 = 10%).
+        null_space_V: Optional null-space basis for combined mode (applies
+            constraint before re-normalization).
+        direction_space: Optional ``"input"`` / ``"output"`` override resolved
+            by the caller from the layer's role in the residual stream (see
+            :func:`infer_direction_space`). When ``None``, the legacy shape
+            heuristic picks the first matching axis. Square attention
+            projections (``hidden_size == num_heads * head_dim``) are
+            ambiguous, so callers ablating ``o_proj`` should always pass
+            ``"output"`` explicitly.
 
     Returns:
-        Modified weight matrix with same per-neuron norms as original
+        Modified weight matrix with the same per-output-neuron norms as the
+        original.
     """
     original_dtype = weight.dtype
     weight_float = weight.float()
 
-    # Ensure refusal_dir is on the same device and dtype as the weight
     refusal_dir = refusal_dir.to(device=weight.device, dtype=torch.float32)
 
-    # Determine direction alignment (input vs output dimension)
-    if refusal_dir.shape[0] == weight_float.shape[1]:
-        # Direction aligns with input dimension (typical for o_proj, down_proj)
-        project_input = True
-    elif refusal_dir.shape[0] == weight_float.shape[0]:
-        # Direction aligns with output dimension
-        project_input = False
-    else:
+    project_input = _resolve_project_input(
+        refusal_shape=refusal_dir.shape[0],
+        weight_shape=weight_float.shape,
+        direction_space=direction_space,
+    )
+    if project_input is None:
         logger.warning(f"Direction shape {refusal_dir.shape} doesn't match weight shape {weight_float.shape}, skipping")
         return weight
 
-    # Normalize refusal direction
     refusal_normalized = F.normalize(refusal_dir.float(), dim=0)
 
+    # Per-row decomposition (preserves per-output-neuron magnitudes regardless
+    # of which axis the refusal direction lives in). H3 fix: the legacy
+    # else-branch decomposed per-column and silently preserved per-input-neuron
+    # norms, contradicting the grimjim sample this kernel is meant to mirror.
+    W_norm = torch.norm(weight_float, dim=1, keepdim=True)  # [out_features, 1]
+    W_norm = torch.clamp(W_norm, min=1e-8)
+    W_direction = weight_float / W_norm
+
     if project_input:
-        # Decompose weight: W = M @ W_hat where M is diagonal per-row norms
-        W_norm = torch.norm(weight_float, dim=1, keepdim=True)  # [out_features, 1]
-
-        # Handle zero-norm rows (shouldn't happen but be safe)
-        W_norm = torch.clamp(W_norm, min=1e-8)
-
-        W_direction = weight_float / W_norm  # Normalized direction [out_features, in_features]
-
-        # Per-neuron projection onto the refusal direction:
-        # projection[i] equals the dot product of W_direction[i, :] with refusal_normalized.
         projection = W_direction @ refusal_normalized  # [out_features]
-
-        # Ablate the component along the refusal direction:
-        # W_direction_new[i, :] = W_direction[i, :] - scale_factor * projection[i] * refusal_normalized.
         W_direction_new = W_direction - scale_factor * torch.outer(projection, refusal_normalized)
-
-        # Optional: apply null-space constraint before re-normalization
-        if null_space_V is not None:
-            # Project the adjustment into null space of preservation activations
-            # This ensures we don't affect outputs for preservation prompts
-            adjustment = W_direction - W_direction_new  # What we're removing
-            # Project adjustment into null space: adjustment_constrained = adjustment @ (I - V @ V^T)
-            adjustment_constrained = adjustment - adjustment @ null_space_V @ null_space_V.T
-            W_direction_new = W_direction - adjustment_constrained
-
-        # Optional: clamp toward harmless direction to prevent over-ablation
-        if harmless_dir is not None:
-            harmless_normalized = F.normalize(harmless_dir.to(device=weight.device, dtype=torch.float32), dim=0)
-            # Compute how far we've moved from harmless direction
-            harmless_proj = W_direction @ harmless_normalized  # [out_features]
-            harmless_proj_new = W_direction_new @ harmless_normalized
-
-            # If we've moved away from harmless too much, clamp back
-            moved_away = harmless_proj_new < harmless_proj * (1 - clamp_ratio)
-            if moved_away.any():
-                # Interpolate back toward preserving harmless direction
-                correction_scale = (harmless_proj - harmless_proj_new) * moved_away.float()
-                correction = torch.outer(correction_scale, harmless_normalized)
-                W_direction_new = W_direction_new + clamp_ratio * correction
-
-        # Re-normalize direction (each row should be unit vector)
-        W_direction_new = F.normalize(W_direction_new, dim=1)
-
-        # Recombine with original magnitudes
-        W_new = W_norm * W_direction_new
-
     else:
-        # Project along output dimension (rows) - less common case
-        # Decompose by columns instead
-        W_norm = torch.norm(weight_float, dim=0, keepdim=True)  # [1, in_features]
-        W_norm = torch.clamp(W_norm, min=1e-8)
-        W_direction = weight_float / W_norm
-
         projection = refusal_normalized @ W_direction  # [in_features]
         W_direction_new = W_direction - scale_factor * torch.outer(refusal_normalized, projection)
 
-        if null_space_V is not None:
-            adjustment = W_direction - W_direction_new
+    if null_space_V is not None:
+        adjustment = W_direction - W_direction_new
+        if project_input:
+            adjustment_constrained = adjustment - adjustment @ null_space_V @ null_space_V.T
+        else:
             adjustment_constrained = adjustment - null_space_V @ null_space_V.T @ adjustment
-            W_direction_new = W_direction - adjustment_constrained
+        W_direction_new = W_direction - adjustment_constrained
 
-        if harmless_dir is not None:
-            harmless_normalized = F.normalize(harmless_dir.to(device=weight.device, dtype=torch.float32), dim=0)
-            harmless_proj = harmless_normalized @ W_direction
+    if harmless_dir is not None:
+        harmless_normalized = F.normalize(harmless_dir.to(device=weight.device, dtype=torch.float32), dim=0)
+        if project_input:
+            harmless_proj = W_direction @ harmless_normalized  # [out_features]
+            harmless_proj_new = W_direction_new @ harmless_normalized
+            moved_away = harmless_proj_new < harmless_proj * (1 - clamp_ratio)
+            if moved_away.any():
+                correction_scale = (harmless_proj - harmless_proj_new) * moved_away.float()
+                correction = torch.outer(correction_scale, harmless_normalized)
+                W_direction_new = W_direction_new + clamp_ratio * correction
+        else:
+            harmless_proj = harmless_normalized @ W_direction  # [in_features]
             harmless_proj_new = harmless_normalized @ W_direction_new
             moved_away = harmless_proj_new < harmless_proj * (1 - clamp_ratio)
             if moved_away.any():
@@ -2224,8 +2483,8 @@ def apply_per_neuron_norm_preserving_projection(
                 correction = torch.outer(harmless_normalized, correction_scale)
                 W_direction_new = W_direction_new + clamp_ratio * correction
 
-        W_direction_new = F.normalize(W_direction_new, dim=0)
-        W_new = W_norm * W_direction_new
+    W_direction_new = F.normalize(W_direction_new, dim=1)
+    W_new = W_norm * W_direction_new
 
     return W_new.to(original_dtype)
 
@@ -2458,35 +2717,70 @@ def abliterate_model(
     if config.target_layer_types:
         linear_names = filter_layers_by_type(linear_names, config.target_layer_types)
 
-    # Determine intervention layers for biprojection
     intervention_layers = None
+    biprojection_measurement_layers: list[int] = []
     if config.use_biprojection:
         if config.intervention_layers:
             intervention_layers = set(config.intervention_layers)
-        elif directions.quality_scores:
-            # Estimate num_layers
+        if directions.quality_scores:
             layer_indices = [get_layer_index_from_name(n) for n in linear_names]
             max_layer = max((i for i in layer_indices if i is not None), default=0)
             num_layers = max_layer + 1
 
-            _, auto_intervention = select_biprojection_layers(
+            sel_measurement, auto_intervention = select_biprojection_layers(
                 directions.quality_scores,
                 num_layers=num_layers,
                 num_measurement_layers=config.num_measurement_layers,
                 intervention_range=config.intervention_range,
+                min_quality_threshold=config.min_quality_threshold,
             )
-            intervention_layers = set(auto_intervention)
+            biprojection_measurement_layers = sel_measurement
+            if intervention_layers is None:
+                intervention_layers = set(auto_intervention)
 
-    # Select primary direction
+    # Per-L biprojection mapping. Computed once, then consumed in the per-layer
+    # loop below so each intervention layer L pulls its source measurement
+    # layer M without re-resolving the policy on every iteration.
+    biprojection_layer_map: dict[int, int] = {}
+    if (
+        config.use_biprojection
+        and not config.use_direction_ensemble
+        and biprojection_measurement_layers
+        and intervention_layers is not None
+    ):
+        biprojection_layer_map = compute_biprojection_mapping(
+            intervention_layers=intervention_layers,
+            measurement_layers=biprojection_measurement_layers,
+            policy=config.biprojection_mapping,
+        )
+        if biprojection_layer_map:
+            preview = {L: biprojection_layer_map[L] for L in sorted(biprojection_layer_map)[:6]}
+            logger.info(
+                f"Biprojection L→M mapping (policy={config.biprojection_mapping!r}): "
+                f"{len(biprojection_layer_map)} layers mapped, sample={preview}"
+            )
+            # Persist the resolved mapping into RefusalDirections.metadata so
+            # the run_abliteration save block can round-trip it into
+            # abliteration_metadata.json without needing a return-tuple change.
+            directions.metadata["biprojection_policy"] = (
+                config.biprojection_mapping if isinstance(config.biprojection_mapping, str) else "explicit"
+            )
+            directions.metadata["biprojection_layer_map"] = {int(L): int(M) for L, M in biprojection_layer_map.items()}
+            directions.metadata["biprojection_measurement_layers"] = list(biprojection_measurement_layers)
+
     if config.use_biprojection and directions.biprojected_direction is not None:
+        # Legacy ``use_direction_ensemble`` path: one collapsed direction.
         primary_direction = directions.biprojected_direction.to(config.device)
-        logger.info("Using biprojected direction from measurement layers")
-    elif config.use_mean_direction and directions.mean_direction is not None:
+        logger.info("Using ensemble (collapsed) biprojected direction across measurement layers")
+    elif config.use_mean_direction and directions.mean_direction is not None and not biprojection_layer_map:
         primary_direction = directions.mean_direction.to(config.device)
         logger.info("Using mean direction across layers")
     else:
         primary_direction = None
-        logger.info("Using per-layer directions")
+        if biprojection_layer_map:
+            logger.info("Using per-L biprojected directions r_bi(M, L)")
+        else:
+            logger.info("Using per-layer directions")
 
     # Compute layer weights based on targeting mode
     layer_weights = None
@@ -2553,19 +2847,42 @@ def abliterate_model(
                 skipped_count += 1
                 continue
 
-        # Get direction (biprojected > per-layer > mean fallback)
-        if primary_direction is not None:
-            direction = primary_direction
-        elif layer_idx is not None and layer_idx in directions.directions:
-            direction = directions.directions[layer_idx].to(config.device)
-        elif directions.mean_direction is not None:
-            # Fallback to mean direction for layers outside extraction range
-            direction = directions.mean_direction.to(config.device)
-            logger.debug(f"Using mean direction fallback for {name} (layer {layer_idx} not in extraction range)")
-        else:
-            logger.warning(f"No direction available for {name}, skipping")
-            skipped_count += 1
-            continue
+        # Direction selection priority:
+        #   1. Per-L biprojection (H5): compose r_bi(M, L) from the source
+        #      measurement layer's direction and the target layer's harmless
+        #      mean.
+        #   2. Ensemble/legacy biprojection (one collapsed direction).
+        #   3. Per-layer direction at L if extraction covered L.
+        #   4. Mean direction fallback.
+        direction = None
+        if (
+            biprojection_layer_map
+            and layer_idx is not None
+            and layer_idx in biprojection_layer_map
+            and directions.harmless_directions
+        ):
+            source_M = biprojection_layer_map[layer_idx]
+            r_M = directions.directions.get(source_M)
+            h_L = directions.harmless_directions.get(layer_idx)
+            if r_M is not None and h_L is not None:
+                r_bi = compute_biprojected_direction(
+                    r_M.to(config.device),
+                    h_L.to(config.device),
+                    two_pass=getattr(config, "two_pass_orthogonalization", True),
+                )
+                direction = r_bi.to(config.dtype)
+        if direction is None:
+            if primary_direction is not None:
+                direction = primary_direction
+            elif layer_idx is not None and layer_idx in directions.directions:
+                direction = directions.directions[layer_idx].to(config.device)
+            elif directions.mean_direction is not None:
+                direction = directions.mean_direction.to(config.device)
+                logger.debug(f"Using mean direction fallback for {name} (layer {layer_idx} not in extraction range)")
+            else:
+                logger.warning(f"No direction available for {name}, skipping")
+                skipped_count += 1
+                continue
 
         # Check if direction dimension matches either weight dimension
         if direction.shape[0] not in weight.shape:
@@ -2609,7 +2926,8 @@ def abliterate_model(
             elif layer_idx in hybrid_info.linear_attention_indices:
                 effective_multiplier *= config.hybrid_linear_attn_weight
 
-        # Apply projection based on mode
+        direction_space = infer_direction_space(name)
+
         try:
             if config.use_per_neuron_norm:
                 null_V = None
@@ -2623,6 +2941,7 @@ def abliterate_model(
                     harmless_dir=harmless_dir,
                     clamp_ratio=config.harmless_clamp_ratio,
                     null_space_V=null_V,
+                    direction_space=direction_space,
                 )
             elif null_space_projector is not None:
                 # Null-space constrained (legacy/combined mode)
@@ -2637,12 +2956,12 @@ def abliterate_model(
                     multiplier=effective_multiplier,
                 )
             else:
-                # Standard Frobenius norm preservation
                 new_weight = apply_norm_preserving_projection(
                     weight,
                     direction,
                     preserve_norm=config.norm_preservation,
                     multiplier=effective_multiplier,
+                    direction_space=direction_space,
                 )
 
             module.weight.data = new_weight
@@ -3112,6 +3431,14 @@ def run_abliteration(config: AbliterationConfig):
         # Biprojection options
         "use_biprojection": config.use_biprojection,
         "use_per_neuron_norm": config.use_per_neuron_norm,
+        "use_direction_ensemble": config.use_direction_ensemble,
+        "biprojection_mapping": config.biprojection_mapping if config.use_biprojection else None,
+        "biprojection_layer_map": directions.metadata.get("biprojection_layer_map")
+        if config.use_biprojection
+        else None,
+        "biprojection_measurement_layers": directions.metadata.get("biprojection_measurement_layers")
+        if config.use_biprojection
+        else None,
         "target_layer_types": config.target_layer_types,
         "num_measurement_layers": config.num_measurement_layers if config.use_biprojection else None,
         "measurement_layers": config.measurement_layers,
