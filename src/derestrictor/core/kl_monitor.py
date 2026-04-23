@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from derestrictor.data.loader import load_split
+
 logger = logging.getLogger(__name__)
 
 
@@ -356,7 +358,9 @@ def auto_tune_multiplier(
     Returns:
         AutoTuneResult with best multiplier, search history, convergence status
     """
-    from derestrictor.core.abliterate import abliterate_model, get_linear_layer_names
+    # Lazy: ``abliterate`` imports from this module, so a top-level import
+    # would create a circular import at module load.
+    from derestrictor.core.abliterate import abliterate_model, get_linear_layer_names  # noqa: PLC0415
 
     linear_names = get_linear_layer_names(model)
 
@@ -454,8 +458,6 @@ def auto_tune_multiplier(
 
 def load_reference_prompts(num_prompts: int = 50) -> list[str]:
     """Load reference prompts for KL monitoring from the allow split."""
-    from derestrictor.data.loader import load_split
-
     return load_split("allow", n=num_prompts)
 
 

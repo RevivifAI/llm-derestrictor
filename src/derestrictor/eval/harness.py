@@ -13,6 +13,7 @@ import argparse
 import gc
 import json
 import logging
+import math
 import random
 import subprocess
 import time
@@ -23,6 +24,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from derestrictor.data.loader import DATASET_ID, load_split
 from derestrictor.eval.detector import LogLikelihoodRefusalDetector
 from derestrictor.models.utils import load_model_and_tokenizer
 
@@ -789,8 +791,6 @@ def eval_refusal_rates(
 
     Returns a dict in lm-evaluation-harness compatible format.
     """
-    from derestrictor.data.loader import DATASET_ID, load_split
-
     random.seed(seed)
     start_time = time.perf_counter()
 
@@ -869,8 +869,6 @@ def eval_refusal_rates(
     harmless_compliance_rate = 1 - harmless_refusal_rate
 
     # Calculate stderr (binomial proportion)
-    import math
-
     def stderr(p, n):
         if n == 0:
             return 0

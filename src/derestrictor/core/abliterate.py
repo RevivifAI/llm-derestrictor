@@ -3,8 +3,12 @@ import argparse
 import gc
 import json
 import logging
+import math
 import random
+import re
 import shutil
+import struct
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,13 +16,19 @@ from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from derestrictor.cli.components import get_versioned_path
+from derestrictor.core.null_space import (
+    NullSpaceConfig,
+    apply_null_space_constrained_projection,
+    compute_null_space_projectors,
+)
 from derestrictor.data.loader import load_split
 from derestrictor.eval.detector import LogLikelihoodRefusalDetector, RefusalDetectorConfig
-from derestrictor.models.utils import load_model_and_tokenizer
+from derestrictor.models.utils import is_moe_model, iter_expert_tensors, load_model_and_tokenizer
 
 if TYPE_CHECKING:
     from derestrictor.core.null_space import NullSpaceProjector
@@ -227,8 +237,6 @@ def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.
         output_path: Directory to save to
         target_dtype: Target dtype for weights (default: float16 for GGUF compatibility)
     """
-    from safetensors.torch import save_file
-
     logger.info("Using manual save to bypass weight conversion")
 
     # Clear quantization-related config
@@ -673,8 +681,6 @@ def _has_vision_weights(model_path: Path) -> bool:
     Returns:
         True if vision encoder weights are found
     """
-    import struct
-
     vision_prefixes = [
         "vision_tower",
         "vision_model",
@@ -1162,8 +1168,6 @@ def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
     if len(full_indices) >= 2:
         intervals = [full_indices[i + 1] - full_indices[i] for i in range(len(full_indices) - 1)]
         # Use the most common interval
-        from collections import Counter
-
         interval = Counter(intervals).most_common(1)[0][0]
     elif len(full_indices) == 1:
         interval = len(layer_types_raw)  # Only one full attention layer
@@ -1537,8 +1541,6 @@ def compute_adaptive_layer_weights(
     Returns:
         Dictionary mapping layer indices to weights (0.0 - 1.0)
     """
-    import math
-
     weights = {}
     center_layer = center * (num_layers - 1)
     sigma_layers = sigma * num_layers
@@ -3016,8 +3018,6 @@ def dispatch_2d_kernel(
             direction_space=direction_space,
         )
     if null_space_V is not None:
-        from derestrictor.core.null_space import apply_null_space_constrained_projection
-
         return apply_null_space_constrained_projection(
             weight,
             direction,
@@ -3262,8 +3262,6 @@ def get_layer_index_from_name(name: str) -> int | None:
     (:func:`is_non_lm_stack_tensor`) so their independent ``layers.N``
     numbering doesn't collide with the language-model stack.
     """
-    import re
-
     if is_non_lm_stack_tensor(name):
         return None
 
@@ -3876,8 +3874,6 @@ def abliterate_model(
     # ``nn.Linear`` walker above silently skips these since the experts are
     # stored as a single 3-D ``nn.Parameter`` per layer. Walking them here
     # plugs the correctness gap.
-    from derestrictor.models.utils import is_moe_model, iter_expert_tensors
-
     moe_modified = 0
     moe_skipped = 0
     if is_moe_model(model):
@@ -4250,11 +4246,6 @@ def run_abliteration(config: AbliterationConfig):
     # Compute null-space projectors if enabled (for capability preservation)
     null_space_projector = None
     if config.use_null_space:
-        from derestrictor.core.null_space import (
-            NullSpaceConfig,
-            compute_null_space_projectors,
-        )
-
         # Determine layer indices for null-space computation
         layers = directions.directions.keys()
         if not layers:
@@ -4288,7 +4279,9 @@ def run_abliteration(config: AbliterationConfig):
     kl_result = None
 
     if config.use_kl_monitoring or config.use_kl_auto_tune:
-        from derestrictor.core.kl_monitor import (
+        # Lazy: ``kl_monitor`` imports symbols from this module, so importing
+        # it at top-level creates a circular import at module load.
+        from derestrictor.core.kl_monitor import (  # noqa: PLC0415
             KLDivergenceMonitor,
             KLMonitorConfig,
             auto_tune_multiplier,
@@ -4316,7 +4309,9 @@ def run_abliteration(config: AbliterationConfig):
         kl_monitor.cache_reference_logits(kl_reference_prompts)
 
     # Resolve streaming mode early so we can pick the right pipeline.
-    from derestrictor.core.sharded_ablate import sharded_ablate, should_use_streaming
+    # Lazy: ``sharded_ablate`` imports symbols from this module, so importing
+    # it at top-level creates a circular import at module load.
+    from derestrictor.core.sharded_ablate import sharded_ablate, should_use_streaming  # noqa: PLC0415
 
     use_streaming = False
     streaming_mode_used = "in_memory"

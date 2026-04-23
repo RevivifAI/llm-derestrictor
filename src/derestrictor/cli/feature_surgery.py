@@ -221,8 +221,9 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Import here to avoid slow startup
-    from derestrictor.core.feature_surgery import (
+    # Lazy: defers torch/transformers/SAE loading so ``feature-surgery --help``
+    # stays snappy (otherwise every CLI invocation pays ~2s of import cost).
+    from derestrictor.core.feature_surgery import (  # noqa: PLC0415
         FeatureSpec,
         FeatureSurgeryConfig,
         FeatureSurgeryPipeline,

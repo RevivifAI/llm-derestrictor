@@ -29,7 +29,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from transformers import GenerationConfig
 
+from derestrictor.data.loader import load_split
 from derestrictor.models.utils import load_model_and_tokenizer
 
 
@@ -205,8 +207,6 @@ class RefusalCalibrator:
 
     def load_prompts(self) -> list[str]:
         """Load prompts from the given split of RevivifAI/derestriction."""
-        from derestrictor.data.loader import load_split
-
         prompts = load_split(self.config.split)
         if self.config.limit:
             prompts = prompts[: self.config.limit]
@@ -255,8 +255,6 @@ class RefusalCalibrator:
 
     def generate_response(self, prompt: str) -> str:
         """Generate a response for the prompt."""
-        from transformers import GenerationConfig
-
         formatted = self.format_prompt(prompt)
 
         inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True).to(self.model.device)

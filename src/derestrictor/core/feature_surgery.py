@@ -14,6 +14,7 @@ Key innovations:
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,7 +23,8 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from derestrictor.core.abliterate import clean_model_config_for_save, make_json_serializable
+from derestrictor.core.abliterate import clean_model_config_for_save, make_json_serializable, preserve_model_config
+from derestrictor.sae.loader import SAEConfig, SAELoader
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +145,6 @@ class FeatureAttributionComputer:
     def sae_loader(self):
         """Lazy-load SAE loader."""
         if self._sae_loader is None:
-            from derestrictor.sae.loader import SAEConfig, SAELoader
-
             sae_config = SAEConfig(
                 repo_id=self.config.sae_repo,
                 sae_type=self.config.sae_type,
@@ -809,8 +809,6 @@ class FeatureSurgeryPipeline:
         Raises:
             RuntimeError: If saved model fails architecture verification
         """
-        import shutil
-
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
 
@@ -841,8 +839,6 @@ class FeatureSurgeryPipeline:
                     shutil.copy2(source_config, dest_config)
 
             # Preserve original model config fields that transformers might not save
-            from derestrictor.core.abliterate import preserve_model_config
-
             preserve_model_config(source_path, output_path)
 
         # Verify architecture was preserved correctly

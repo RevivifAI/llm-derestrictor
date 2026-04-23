@@ -9,6 +9,7 @@ import gc
 import json
 import os
 import sys
+import traceback
 
 # Fix Windows encoding issues with tokenizer files
 # Must be set before any file I/O operations
@@ -25,10 +26,14 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+import pandas as pd
 import questionary
 import torch
 from questionary import Style as QStyle
+from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.table import Table
+from transformers import AutoConfig
 
 from derestrictor.cli.components import (
     THEME,
@@ -48,6 +53,7 @@ from derestrictor.cli.components import (
     display_warning,
     find_models,
     get_config_path,
+    get_default_config,
     get_default_direction_multiplier,
     get_default_dtype,
     get_default_num_prompts,
@@ -71,7 +77,38 @@ from derestrictor.config.manager import (
     sanitize_config_name,
     save_training_config,
     settings_from_abliteration_config,
+    update_training_config,
     validate_config_settings,
+)
+from derestrictor.core.abliterate import (
+    AbliterationConfig,
+    abliterate_model,
+    compute_refusal_directions,
+    copy_vision_files,
+    detect_hybrid_architecture,
+    filter_harmful_prompts_by_refusal,
+    is_vision_model,
+    load_layer_target_map,
+    load_prompts,
+    make_json_serializable,
+    preserve_model_config,
+    save_model_safe,
+)
+from derestrictor.core.kl_monitor import (
+    KLDivergenceMonitor,
+    KLMonitorConfig,
+    auto_tune_multiplier,
+    load_reference_prompts,
+    save_kl_report,
+)
+from derestrictor.core.null_space import NullSpaceConfig, compute_null_space_projectors
+from derestrictor.data.loader import DATASET_ID, VALID_SPLITS, refresh_cache, split_size
+from derestrictor.eval.detector import LogLikelihoodRefusalDetector
+from derestrictor.eval.harness import (
+    DEFAULT_TEST_PROMPTS,
+    generate_response,
+    load_model,
+    test_single_model,
 )
 from derestrictor.eval.scanner import RefusalScanner
 from derestrictor.export.gguf import (
@@ -84,6 +121,7 @@ from derestrictor.export.gguf import (
     find_llama_cpp_path,
     has_vision_files,
 )
+from derestrictor.models.utils import is_moe_model, load_model_and_tokenizer
 
 # Questionary custom style (orange theme)
 custom_style = QStyle(
@@ -187,8 +225,6 @@ def get_abliteration_config() -> dict | None:
     config["model_path"] = model_path
 
     # Detect architecture immediately after model selection
-    from derestrictor.core.abliterate import detect_hybrid_architecture
-
     hybrid_info = detect_hybrid_architecture(model_path)
 
     if hybrid_info.is_hybrid:
@@ -497,8 +533,6 @@ def get_abliteration_config() -> dict | None:
 
             if config["layer_target_map_path"]:
                 # Load and validate the target map
-                from derestrictor.core.abliterate import load_layer_target_map
-
                 try:
                     target_map = load_layer_target_map(config["layer_target_map_path"])
 
@@ -696,10 +730,6 @@ def get_abliteration_config() -> dict | None:
     # ``auto`` defaults are safe.
     _moe_detected = False
     try:
-        from transformers import AutoConfig
-
-        from derestrictor.models.utils import is_moe_model
-
         cfg_obj = AutoConfig.from_pretrained(config["model_path"], trust_remote_code=True)
         _moe_detected = is_moe_model(cfg_obj)
     except Exception:
@@ -753,15 +783,6 @@ def get_abliteration_config() -> dict | None:
 
 def run_abliteration(config: dict) -> bool:
     """Run the abliteration process with progress display."""
-    from derestrictor.core.abliterate import (
-        AbliterationConfig,
-        abliterate_model,
-        compute_refusal_directions,
-        filter_harmful_prompts_by_refusal,
-        load_prompts,
-    )
-    from derestrictor.models.utils import load_model_and_tokenizer
-
     dtype_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -880,11 +901,6 @@ def run_abliteration(config: dict) -> bool:
             null_space_projector = None
             if abl_config.use_null_space:
                 progress.update(task, description="Computing null-space projectors...")
-                from derestrictor.core.null_space import (
-                    NullSpaceConfig,
-                    compute_null_space_projectors,
-                )
-
                 layers = list(directions.directions.keys()) or abl_config.extraction_layer_indices or []
 
                 null_config = NullSpaceConfig(
@@ -905,14 +921,6 @@ def run_abliteration(config: dict) -> bool:
 
             if abl_config.use_kl_monitoring or abl_config.use_kl_auto_tune:
                 progress.update(task, description="Caching reference logits for KL monitoring...")
-                from derestrictor.core.kl_monitor import (
-                    KLDivergenceMonitor,
-                    KLMonitorConfig,
-                    auto_tune_multiplier,
-                    load_reference_prompts,
-                    save_kl_report,
-                )
-
                 kl_reference_prompts = load_reference_prompts(
                     num_prompts=abl_config.kl_num_reference_prompts,
                 )
@@ -974,19 +982,10 @@ def run_abliteration(config: dict) -> bool:
             output_path.mkdir(parents=True, exist_ok=True)
 
             # Save model (handles FP8 dequantized models specially)
-            from derestrictor.core.abliterate import save_model_safe
-
             save_model_safe(model, tokenizer, output_path)
             directions.save(str(output_path / "refusal_directions.pt"))
 
             # Preserve original model config fields that transformers might not save
-            from derestrictor.core.abliterate import (
-                copy_vision_files,
-                is_vision_model,
-                make_json_serializable,
-                preserve_model_config,
-            )
-
             source_path = Path(config["model_path"])
             preserve_model_config(source_path, output_path)
 
@@ -1053,8 +1052,6 @@ def run_abliteration(config: dict) -> bool:
         return True
 
     except Exception as e:
-        import traceback
-
         error_msg = str(e) if str(e) else repr(e)
         display_error(f"Abliteration failed: {error_msg}")
         console.print(f"[dim]{traceback.format_exc()}[/dim]")
@@ -1080,8 +1077,6 @@ def run_test_model():
     ).ask()
 
     if test_type == "quick":
-        from derestrictor.eval.harness import DEFAULT_TEST_PROMPTS, test_single_model
-
         results = test_single_model(model_path, DEFAULT_TEST_PROMPTS)
 
         # Display results
@@ -1110,9 +1105,6 @@ def run_test_model():
         ).ask()
 
         if prompt:
-            from derestrictor.eval.detector import LogLikelihoodRefusalDetector
-            from derestrictor.eval.harness import generate_response, load_model
-
             with console.status("Loading model..."):
                 model, tokenizer = load_model(model_path)
                 detector = LogLikelihoodRefusalDetector(model, tokenizer)
@@ -1120,8 +1112,6 @@ def run_test_model():
             with console.status("Detecting refusal and generating response..."):
                 refused = detector.detect_refusal(prompt)
                 response = generate_response(model, tokenizer, prompt)
-
-            from rich.panel import Panel
 
             status = "[red]REFUSED[/red]" if refused else "[green]OK[/green]"
             console.print(
@@ -1209,8 +1199,6 @@ def run_evaluation(model_path: str | None = None):
     prompts_split = "derestrict"
 
     # Display configuration
-    from rich.panel import Panel
-
     config_text = (
         f"Model: [{THEME['primary']}]{model_path}[/{THEME['primary']}]\n"
         f"Prompts: [{THEME['muted']}]RevivifAI/derestriction / {prompts_split}[/{THEME['muted']}]\n"
@@ -1266,8 +1254,6 @@ def run_evaluation(model_path: str | None = None):
         )
 
         # Load results and display summary
-        import pandas as pd
-
         df = pd.read_csv(output_file)
 
         total = len(df)
@@ -1276,8 +1262,6 @@ def run_evaluation(model_path: str | None = None):
 
         # Display results table
         console.print()
-        from rich.table import Table
-
         table = Table(title="Evaluation Results", show_header=True)
         table.add_column("Metric", style=THEME["primary"])
         table.add_column("Value", justify="right")
@@ -1328,8 +1312,6 @@ def run_evaluation(model_path: str | None = None):
 
     except Exception as e:
         display_error(f"Evaluation failed: {e!s}")
-        import traceback
-
         if debug:
             traceback.print_exc()
 
@@ -1356,9 +1338,6 @@ def run_compare_models():
 
     if not prompt:
         return
-
-    from derestrictor.eval.detector import LogLikelihoodRefusalDetector
-    from derestrictor.eval.harness import generate_response, load_model
 
     with console.status("Loading original model..."):
         orig_model, orig_tokenizer = load_model(original_path)
@@ -2090,8 +2069,6 @@ def _edit_training_config():
     if edit_action == "cancel" or edit_action is None:
         return
 
-    from derestrictor.config.manager import update_training_config
-
     if edit_action == "description":
         new_desc = questionary.text(
             "New description:",
@@ -2339,8 +2316,6 @@ def run_settings():
                 style=custom_style,
             ).ask()
             if confirm:
-                from derestrictor.cli.components import get_default_config
-
                 save_config(get_default_config())
                 display_success("Settings reset to defaults!")
 
@@ -2358,8 +2333,6 @@ def _manage_model_paths():
         console.print(f"\n[bold {THEME['primary']}]Model Search Directories[/bold {THEME['primary']}]\n")
 
         # Display current paths
-        from rich.table import Table
-
         table = Table(show_header=True, header_style=f"bold {THEME['primary']}")
         table.add_column("#", style="dim", width=4)
         table.add_column("Path", style=THEME["primary"])
@@ -2494,10 +2467,6 @@ def _manage_eval_results_dir():
 
 def _manage_prompts():
     """Show info about the RevivifAI/derestriction dataset and allow a refresh."""
-    from rich.table import Table
-
-    from derestrictor.data.loader import DATASET_ID, VALID_SPLITS, refresh_cache
-
     console.print(f"\n[bold {THEME['primary']}]Prompts Dataset[/bold {THEME['primary']}]\n")
     console.print(f"Source: [{THEME['primary']}]https://huggingface.co/datasets/{DATASET_ID}[/{THEME['primary']}]")
     console.print(
@@ -2518,8 +2487,6 @@ def _manage_prompts():
 
     for split in VALID_SPLITS:
         try:
-            from derestrictor.data.loader import split_size
-
             rows = f"{split_size(split):,}"
         except Exception as e:
             rows = f"[red]err: {e}[/red]"
@@ -2642,8 +2609,6 @@ def run_first_time_setup():
     clear_screen()
     display_banner()
 
-    from rich.panel import Panel
-
     console.print(
         Panel(
             "[bold]Welcome to the Abliteration Toolkit![/bold]\n\n"
@@ -2688,8 +2653,6 @@ def run_first_time_setup():
         ).ask()
 
     # Build initial config
-    from derestrictor.cli.components import get_default_config
-
     config = get_default_config()
 
     # Prepend custom paths
@@ -3036,8 +2999,6 @@ def cli(
         layer_targeting_mode = "none"
 
         if layer_target_map:
-            from derestrictor.core.abliterate import load_layer_target_map
-
             try:
                 target_map_data = load_layer_target_map(layer_target_map)
                 per_layer_multipliers = target_map_data["per_layer_multipliers"]

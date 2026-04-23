@@ -82,6 +82,7 @@ dependencies = [
     #   (or whichever release carries wheels for the new combination).
     "flash-linear-attention>=0.2.0",
     "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
+    "mistral-common>=1.11.0",
 ]
 
 [project.scripts]
@@ -102,10 +103,6 @@ dev = [
     "pre-commit>=4.6.0",
     "sentence-transformers>=2.7.0",
     "pyarrow>=15.0.0",
-]
-
-mistral = [
-    "mistral-common>=1.8.8",
 ]
 
 [dependency-groups]
@@ -196,7 +193,6 @@ ignore = [
     "N806",    # Local variable names follow linear-algebra conventions (W, U, S, V, D, Q, ...)
     "N812",    # Conventional aliases (e.g. `import torch.nn.functional as F`)
     "RUF002",  # Ambiguous Unicode in docstrings: intentional typography (em-dash, non-breaking hyphen)
-    "PLC0415", # Imports inside functions: used deliberately for heavy/optional ML deps
 ]
 unfixable = [
     "ERA001",  # Don't auto-delete commented-out code; surface it for review

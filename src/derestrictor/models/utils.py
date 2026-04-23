@@ -6,6 +6,7 @@ VL models (like Qwen3-VL) and uses the appropriate AutoModel class.
 It also handles FP8 quantized models that require special loading.
 """
 
+import builtins
 import contextlib
 import json
 import locale
@@ -19,7 +20,32 @@ from pathlib import Path
 from typing import Literal
 
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Optional / version-gated transformers symbols. Older transformers releases
+# may not ship these classes, so we resolve them once at import time and fall
+# back to ``None`` — call sites check for ``None`` and surface a clear
+# ``ImportError`` with an upgrade hint instead of a cryptic ``AttributeError``.
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:  # pragma: no cover - depends on transformers build
+    BitsAndBytesConfig = None  # type: ignore[assignment,misc]
+
+try:
+    from transformers import Mistral3ForConditionalGeneration
+except ImportError:  # pragma: no cover - requires transformers >= 4.48.0
+    Mistral3ForConditionalGeneration = None  # type: ignore[assignment,misc]
+
+try:
+    from transformers import FineGrainedFP8Config
+except ImportError:  # pragma: no cover - requires recent transformers + mistral-common
+    FineGrainedFP8Config = None  # type: ignore[assignment,misc]
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # pragma: no cover - requires transformers >= 4.57.0
+    AutoModelForImageTextToText = None  # type: ignore[assignment,misc]
 
 # Fix Windows encoding issues - set preferred encoding for file I/O
 if sys.platform == "win32":
@@ -270,9 +296,7 @@ def _build_bnb_quantization_config(quantization: Literal["none", "4bit", "8bit"]
     """
     if quantization == "none":
         return None
-    try:
-        from transformers import BitsAndBytesConfig
-    except ImportError:
+    if BitsAndBytesConfig is None:
         logger.warning("bitsandbytes / transformers BitsAndBytesConfig unavailable; falling back to full precision")
         return None
     if quantization == "4bit":
@@ -382,8 +406,6 @@ def load_model_and_tokenizer(
             tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code, use_fast=False)
         except UnicodeDecodeError:
             # Last resort: monkey-patch open to use UTF-8 for text mode only
-            import builtins
-
             original_open = builtins.open
 
             def utf8_open(file, mode="r", *args, **kwargs):
@@ -440,94 +462,82 @@ def load_model_and_tokenizer(
         # Mistral3 VL models require special handling
         if is_mistral3:
             logger.info("Loading Mistral3 VL model...")
-            try:
-                from transformers import Mistral3ForConditionalGeneration
-
-                if is_fp8:
-                    # Mistral3 FP8 models require FineGrainedFP8Config with dequantize=True
-                    # We explicitly set torch_dtype to ensure consistent output dtype
-                    logger.info("Using FineGrainedFP8Config for Mistral3 FP8 model...")
-                    try:
-                        from transformers import FineGrainedFP8Config
-
-                        quant_config = FineGrainedFP8Config(dequantize=True)
-                        model = Mistral3ForConditionalGeneration.from_pretrained(
-                            model_path,
-                            quantization_config=quant_config,
-                            torch_dtype=dtype,  # Ensure consistent dtype after dequantization
-                            device_map=device,
-                            trust_remote_code=trust_remote_code,
-                        )
-                        # Fix weight tying for FP8 dequantized models
-                        # The lm_head.weight may not be properly tied after dequantization
-                        model = _fix_weight_tying(model, model_path)
-                        logger.info(f"Model loaded with dtype={dtype} after FP8 dequantization")
-                    except ImportError:
-                        logger.warning(
-                            "FineGrainedFP8Config not available. Install mistral-common or upgrade transformers."
-                        )
-                        # Fallback: try loading without quantization config
-                        model = Mistral3ForConditionalGeneration.from_pretrained(
-                            model_path,
-                            torch_dtype=dtype,
-                            low_cpu_mem_usage=False,
-                            trust_remote_code=trust_remote_code,
-                        )
-                        if device != "cpu":
-                            model = model.to(device)
-                else:
-                    model = Mistral3ForConditionalGeneration.from_pretrained(
-                        model_path,
-                        torch_dtype=dtype,
-                        device_map=device,
-                        trust_remote_code=trust_remote_code,
-                    )
-            except ImportError as exc:
+            if Mistral3ForConditionalGeneration is None:
                 raise ImportError(
                     "Mistral3ForConditionalGeneration requires transformers >= 4.48.0. "
                     "Please upgrade with: pip install --upgrade transformers"
-                ) from exc
-        else:
-            logger.info("Loading VL model with AutoModelForImageTextToText...")
-            try:
-                from transformers import AutoModelForImageTextToText
-
-                if is_fp8:
-                    # FP8 models: load without device_map, then move to device
-                    model = AutoModelForImageTextToText.from_pretrained(
+                )
+            if is_fp8:
+                # Mistral3 FP8 models require FineGrainedFP8Config with dequantize=True
+                # We explicitly set torch_dtype to ensure consistent output dtype
+                if FineGrainedFP8Config is not None:
+                    logger.info("Using FineGrainedFP8Config for Mistral3 FP8 model...")
+                    quant_config = FineGrainedFP8Config(dequantize=True)
+                    model = Mistral3ForConditionalGeneration.from_pretrained(
+                        model_path,
+                        quantization_config=quant_config,
+                        torch_dtype=dtype,  # Ensure consistent dtype after dequantization
+                        device_map=device,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    # Fix weight tying for FP8 dequantized models
+                    # The lm_head.weight may not be properly tied after dequantization
+                    model = _fix_weight_tying(model, model_path)
+                    logger.info(f"Model loaded with dtype={dtype} after FP8 dequantization")
+                else:
+                    logger.warning(
+                        "FineGrainedFP8Config not available. Install mistral-common or upgrade transformers."
+                    )
+                    model = Mistral3ForConditionalGeneration.from_pretrained(
                         model_path,
                         torch_dtype=dtype,
-                        low_cpu_mem_usage=False,  # Avoid meta tensors
+                        low_cpu_mem_usage=False,
                         trust_remote_code=trust_remote_code,
                     )
                     if device != "cpu":
-                        logger.info(f"Moving FP8 model to {device}...")
                         model = model.to(device)
-                else:
-                    extra_kwargs: dict = {}
-                    if quant_config is not None:
-                        extra_kwargs["quantization_config"] = quant_config
-                    if offload_folder is not None:
-                        extra_kwargs["offload_folder"] = offload_folder
-                    model = AutoModelForImageTextToText.from_pretrained(
-                        model_path,
-                        torch_dtype=dtype,
-                        device_map=quant_device_map,
-                        trust_remote_code=trust_remote_code,
-                        **extra_kwargs,
-                    )
-            except ImportError as exc:
+            else:
+                model = Mistral3ForConditionalGeneration.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                    device_map=device,
+                    trust_remote_code=trust_remote_code,
+                )
+        else:
+            logger.info("Loading VL model with AutoModelForImageTextToText...")
+            if AutoModelForImageTextToText is None:
                 raise ImportError(
                     "AutoModelForImageTextToText requires transformers >= 4.57.0. "
                     "Please upgrade with: pip install --upgrade transformers"
-                ) from exc
+                )
+            if is_fp8:
+                # FP8 models: load without device_map, then move to device
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=False,  # Avoid meta tensors
+                    trust_remote_code=trust_remote_code,
+                )
+                if device != "cpu":
+                    logger.info(f"Moving FP8 model to {device}...")
+                    model = model.to(device)
+            else:
+                extra_kwargs: dict = {}
+                if quant_config is not None:
+                    extra_kwargs["quantization_config"] = quant_config
+                if offload_folder is not None:
+                    extra_kwargs["offload_folder"] = offload_folder
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                    device_map=quant_device_map,
+                    trust_remote_code=trust_remote_code,
+                    **extra_kwargs,
+                )
     elif force_text_class:
         # Load with specific text-only model class to avoid multimodal issues
         logger.info(f"Loading model with specific class: {force_text_class}...")
         try:
-            # Dynamically import the model class from transformers
-            import transformers
-
             model_class = getattr(transformers, force_text_class, None)
             if model_class is None:
                 logger.warning(f"Could not find {force_text_class}, falling back to AutoModelForCausalLM")

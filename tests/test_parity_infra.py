@@ -29,8 +29,10 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from derestrictor.core.abliterate import (
@@ -314,8 +316,6 @@ def test_should_use_streaming_picks_sharded_when_disk_exceeds_fake_vram(
 
     fake_total_ram = max(int(actual_disk * 1.5), 64)  # 0.4x => 0.6x disk size
     fake_vm = SimpleNamespace(total=fake_total_ram)
-    import psutil
-
     monkeypatch.setattr(psutil, "virtual_memory", lambda: fake_vm)
     assert should_use_streaming(tmp_path, cfg) is True
 
@@ -395,8 +395,6 @@ def test_sharded_ablate_two_shard_round_trip_preserves_shapes_and_dtypes(tmp_pat
 
     # Per-shard shapes + dtypes preserved; q_proj actually changed (kernel
     # fired); layernorm bypassed unchanged.
-    from safetensors import safe_open
-
     with safe_open(str(out_shard1), framework="pt", device="cpu") as f:
         for key, original in weights_shard1.items():
             t = f.get_tensor(key)

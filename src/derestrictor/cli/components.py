@@ -12,6 +12,7 @@ Reusable UI components for the interactive CLI including:
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import psutil
@@ -620,8 +621,6 @@ def display_training_config_list(configs: list[dict], title: str = "Saved Traini
         if updated:
             try:
                 # Parse ISO format and display nicely
-                from datetime import datetime
-
                 dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
                 updated = dt.strftime("%Y-%m-%d %H:%M")
             except (ValueError, AttributeError):
@@ -667,8 +666,6 @@ def display_training_config_details(config: dict, title: str = "Config Details")
     created = metadata.get("created_at", "")
     if created:
         try:
-            from datetime import datetime
-
             dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
             created = dt.strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, AttributeError):
@@ -678,8 +675,6 @@ def display_training_config_details(config: dict, title: str = "Config Details")
     updated = metadata.get("updated_at", "")
     if updated:
         try:
-            from datetime import datetime
-
             dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
             updated = dt.strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, AttributeError):

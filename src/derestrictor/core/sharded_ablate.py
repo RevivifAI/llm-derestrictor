@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import psutil
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -187,12 +188,7 @@ def should_use_streaming(input_dir: Path, config: AbliterationConfig) -> bool:
         if total_vram > 0:
             return disk_size > 0.6 * total_vram
 
-    try:
-        import psutil
-
-        total_ram = psutil.virtual_memory().total
-    except ImportError:
-        return False
+    total_ram = psutil.virtual_memory().total
     return disk_size > 0.4 * total_ram
 
 

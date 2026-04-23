@@ -6,6 +6,7 @@ consistent detection across the codebase.
 """
 
 import argparse
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from derestrictor.data.loader import load_split
 from derestrictor.eval.detector import (
     LogLikelihoodRefusalDetector,
     RefusalDetectorConfig,
@@ -93,8 +95,6 @@ class RefusalScanner:
         threshold: float | None = None,
     ):
         """Scan prompts from a RevivifAI/derestriction split and score refusals."""
-        from derestrictor.data.loader import load_split
-
         print(f"Reading prompts from RevivifAI/derestriction split={split}...")
         prompts = load_split(split)
 
@@ -143,8 +143,6 @@ class RefusalScanner:
                         results.append({"prompt": prompt, "is_refusal": is_refusal, "refusal_score": round(r_score, 4)})
                 except Exception as e:
                     print(f"Error processing batch {i}: {e}")
-                    import traceback
-
                     traceback.print_exc()
                     # Add failed results
                     results.extend(

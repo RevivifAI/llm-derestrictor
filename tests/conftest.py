@@ -7,6 +7,11 @@ from collections.abc import Iterator
 
 import pytest
 
+try:
+    import torch
+except ImportError:  # pragma: no cover - torch is a required dep, guard is defensive
+    torch = None  # type: ignore[assignment]
+
 
 @pytest.fixture
 def hf_offline(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -23,12 +28,7 @@ def hf_offline(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Auto-skip tests marked ``requires_cuda`` when no CUDA device is available."""
     _ = config
-    try:
-        import torch
-    except ImportError:
-        cuda_available = False
-    else:
-        cuda_available = torch.cuda.is_available()
+    cuda_available = torch is not None and torch.cuda.is_available()
 
     if cuda_available or os.environ.get("DERESTRICTOR_FORCE_CUDA_TESTS") == "1":
         return

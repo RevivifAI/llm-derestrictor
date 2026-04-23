@@ -41,6 +41,14 @@ from pathlib import Path
 
 import numpy as np
 
+# ``sentence-transformers`` is an optional ``[dev]`` dependency (only the
+# harm filter needs it). Resolve it once at import time so call sites can
+# check for ``None`` instead of retrying the import lazily per call.
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - exercised only when dev extras absent
+    SentenceTransformer = None  # type: ignore[assignment,misc]
+
 _CHILD_KEYWORD_PATTERNS: list[str] = [
     r"child(?:ren)?",
     r"\bkid\b",
@@ -401,8 +409,11 @@ class HarmFilter:
     def _load_embedder(self) -> None:
         if self._embedder is not None:
             return
-        from sentence_transformers import SentenceTransformer
-
+        if SentenceTransformer is None:
+            raise ImportError(
+                "sentence-transformers is required for semantic harm filtering. "
+                "Install the dev extras: pip install -e '.[dev]'"
+            )
         self._embedder = SentenceTransformer(self.embedder_name)
         for name, anchors in self._anchor_texts.items():
             self._anchor_embs[name] = self._embedder.encode(

@@ -30,6 +30,7 @@ import sys
 import time
 from pathlib import Path
 
+import huggingface_hub
 import torch
 
 from derestrictor.data.loader import load_split
@@ -53,8 +54,6 @@ def _resolve_base_path() -> str:
     fallback fire and avoids ``transformers``' 10 GB caching-allocator warmup
     from OOMing the 12 GB GPU.
     """
-    import huggingface_hub
-
     return huggingface_hub.snapshot_download(repo_id=BASE_MODEL_ID, local_files_only=True)
 
 

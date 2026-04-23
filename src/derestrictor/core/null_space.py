@@ -34,6 +34,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from derestrictor.data.loader import load_split
+
 logger = logging.getLogger(__name__)
 
 
@@ -505,8 +507,6 @@ def compute_null_space_projectors(
 
     prompts = config.preservation_prompts.copy()
     if not prompts:
-        from derestrictor.data.loader import load_split
-
         prompts = load_split("allow")
         logger.info(f"Using {len(prompts)} allow prompts from RevivifAI/derestriction for null-space")
     else:
