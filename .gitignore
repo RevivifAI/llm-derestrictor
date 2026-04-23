@@ -221,9 +221,9 @@ __marimo__/
 .env.*
 !.env.example
 
-# Abliterate runtime artifacts
-abliterate/
-abliterated_models/
+# Derestrictor runtime artifacts
+derestrictor/
+derestricted_models/
 outputs/
 eval_results/
 calibration_results.json

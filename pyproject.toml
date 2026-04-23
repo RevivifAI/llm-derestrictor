@@ -7,7 +7,7 @@ name = "derestrictor"
 version = "2.3.0"
 description = "Remove refusal behavior from language models using norm-preserving orthogonal projection"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 keywords = ["llm", "language-models", "abliteration", "refusal", "transformers"]
 classifiers = [
@@ -29,7 +29,7 @@ dependencies = [
     "rich>=13.0.0",
     "questionary>=2.0.0",
     "click>=8.0.0",
-    "huggingface_hub>=0.20.0",
+    "huggingface-hub>=0.20.0",
     "safetensors>=0.4.0",
     "datasets>=2.19.0",
     "python-dotenv>=1.0.0",
@@ -93,17 +93,7 @@ derestrictor-quantize = "derestrictor.scripts.batch_quantize:main"
 derestrictor-build-dataset = "derestrictor.scripts.build_dataset:main"
 derestrictor-upload-dataset = "derestrictor.scripts.upload_dataset:main"
 derestrictor-convert-bf16 = "derestrictor.scripts.convert_to_bf16:main"
-abliterate = "derestrictor.cli.main:cli"
 feature-surgery = "derestrictor.cli.feature_surgery:main"
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "ruff>=0.15.11",
-    "pre-commit>=4.6.0",
-    "sentence-transformers>=2.7.0",
-    "pyarrow>=15.0.0",
-]
 
 [dependency-groups]
 dev = [
@@ -112,13 +102,13 @@ dev = [
     "pre-commit>=4.6.0",
     "sentence-transformers>=2.7.0",
     "pyarrow>=15.0.0",
+    "pyfiglet>=1.0.4",
 ]
 
 [tool.hatch.metadata]
 # Required because the ``accelerate`` and ``causal-conv1d`` deps are pinned
 # to direct URL references (git commit for accelerate, GitHub Releases wheel
-# URL for causal-conv1d; see ``project.dependencies`` and the ``kernels``
-# optional-dep group).
+# URL for causal-conv1d; see ``project.dependencies``).
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
@@ -132,8 +122,8 @@ extend-exclude = [
     "dist",
     ".venv",
     ".hf_cache",
-    "abliterate",
-    "abliterated_models",
+    "derestrictor",
+    "derestricted_models",
     "eval_results",
 ]
 

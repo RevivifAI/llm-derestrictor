@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Training Configuration Manager.
 
-Manages reusable training configurations stored as JSON files in ~/abliterate/configs/.
-Configs contain abliteration settings (excluding model_path/output_path which are
+Manages reusable training configurations stored as JSON files in ~/derestrictor/configs/.
+Configs contain derestriction settings (excluding model_path/output_path which are
 selected at runtime).
 """
 
@@ -80,11 +80,11 @@ DEFAULT_SETTINGS = {
 
 
 def get_configs_dir() -> Path:
-    """Return the path to the configs directory (``~/abliterate/job_configs/``).
+    """Return the path to the configs directory (``~/derestrictor/job_configs/``).
 
     Creates the directory if it doesn't exist.
     """
-    configs_dir = Path.home() / "abliterate" / "job_configs"
+    configs_dir = Path.home() / "derestrictor" / "job_configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
     return configs_dir
 
@@ -223,7 +223,7 @@ def save_training_config(
 
     Args:
         config_name: Name for the config
-        settings: Dict of abliteration settings
+        settings: Dict of derestriction settings
         description: Optional description
         overwrite: If True, overwrite existing config
 

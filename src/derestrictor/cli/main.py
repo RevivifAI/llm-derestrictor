@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive CLI for Abliteration Toolkit.
+"""Interactive CLI for Derestrictor.
 
 A modern terminal interface for removing refusal behavior from language models.
 Supports interactive mode (default) and batch mode for automation.
@@ -148,7 +148,7 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> st
 
     choices = []
     for model in models:
-        prefix = "[A] " if model["is_abliterated"] else "    "
+        prefix = "[D] " if model["is_abliterated"] else "    "
         choices.append(
             questionary.Choice(
                 title=f"{prefix}{model['name']}",
@@ -190,7 +190,7 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> st
 
 
 def get_abliteration_config() -> dict | None:
-    """Interactive configuration for abliteration."""
+    """Interactive configuration for derestriction."""
     config = {}
     loaded_settings = None
 
@@ -200,7 +200,7 @@ def get_abliteration_config() -> dict | None:
         console.print(f"\n[bold {THEME['primary']}]Configuration Source[/bold {THEME['primary']}]\n")
 
         config_choice = questionary.select(
-            "How would you like to configure this abliteration?",
+            "How would you like to configure this run?",
             choices=[
                 questionary.Choice("New config", value="fresh"),
                 questionary.Choice("Load saved config", value="load"),
@@ -219,7 +219,7 @@ def get_abliteration_config() -> dict | None:
 
     # Model selection
     console.print(f"\n[bold {THEME['primary']}]Step 1: Select Base Model[/bold {THEME['primary']}]\n")
-    model_path = select_model("Select the model to abliterate:")
+    model_path = select_model("Select the model to derestrict:")
     if not model_path:
         return None
     config["model_path"] = model_path
@@ -238,7 +238,7 @@ def get_abliteration_config() -> dict | None:
     # Output path
     console.print(f"\n[bold {THEME['primary']}]Step 2: Output Path[/bold {THEME['primary']}]\n")
     output_dir = get_default_output_dir()
-    default_output = f"{output_dir}/{Path(model_path).name}-abliterated"
+    default_output = f"{output_dir}/{Path(model_path).name}-derestricted"
 
     use_default = questionary.confirm(
         f"Use default output path? ({default_output})",
@@ -961,7 +961,7 @@ def run_abliteration(config: dict) -> bool:
                     f"KL={auto_tune_result.best_kl:.4f}, converged={auto_tune_result.converged}[/{THEME['success']}]"
                 )
             else:
-                progress.update(task, description="Applying abliteration to model weights...")
+                progress.update(task, description="Applying derestriction to model weights...")
                 model = abliterate_model(model, directions, abl_config, null_space_projector)
             progress.advance(task, 10)
 
@@ -975,7 +975,7 @@ def run_abliteration(config: dict) -> bool:
                 )
 
             # Save model (with version suffix if path already exists)
-            progress.update(task, description="Saving abliterated model...")
+            progress.update(task, description="Saving derestricted model...")
             output_path = get_versioned_path(config["output_path"])
             if output_path != Path(config["output_path"]):
                 console.print(f"[{THEME['warning']}]Output path exists, using: {output_path.name}[/{THEME['warning']}]")
@@ -1048,12 +1048,12 @@ def run_abliteration(config: dict) -> bool:
                 torch.cuda.empty_cache()
             gc.collect()
 
-        display_success(f"Model abliterated successfully!\n\nOutput saved to: {output_path}")
+        display_success(f"Model derestricted successfully!\n\nOutput saved to: {output_path}")
         return True
 
     except Exception as e:
         error_msg = str(e) if str(e) else repr(e)
-        display_error(f"Abliteration failed: {error_msg}")
+        display_error(f"Derestriction failed: {error_msg}")
         console.print(f"[dim]{traceback.format_exc()}[/dim]")
         return False
 
@@ -1325,7 +1325,7 @@ def run_compare_models():
     if not original_path:
         return
 
-    console.print("\nSelect the [bold]abliterated[/bold] model:")
+    console.print("\nSelect the [bold]derestricted[/bold] model:")
     abliterated_path = select_model()
     if not abliterated_path:
         return
@@ -1352,11 +1352,11 @@ def run_compare_models():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    with console.status("Loading abliterated model..."):
+    with console.status("Loading derestricted model..."):
         abl_model, abl_tokenizer = load_model(abliterated_path)
         abl_detector = LogLikelihoodRefusalDetector(abl_model, abl_tokenizer)
 
-    with console.status("Detecting refusal and generating abliterated response..."):
+    with console.status("Detecting refusal and generating derestricted response..."):
         abl_refused = abl_detector.detect_refusal(prompt)
         abl_response = generate_response(abl_model, abl_tokenizer, prompt)
 
@@ -1366,7 +1366,7 @@ def run_compare_models():
         orig_response,
         abl_response,
         "Original",
-        "Abliterated",
+        "Derestricted",
         orig_refused,
         abl_refused,
     )
@@ -1460,7 +1460,7 @@ def run_gguf_export():
                 f"[{THEME['warning']}]Vision encoder files not found in this model directory[/{THEME['warning']}]"
             )
             console.print(
-                f"[{THEME['muted']}]This appears to be an abliterated model without the original vision files.[/{THEME['muted']}]"
+                f"[{THEME['muted']}]This appears to be a derestricted model without the original vision files.[/{THEME['muted']}]"
             )
             console.print()
 
@@ -1544,7 +1544,7 @@ def run_gguf_export():
             return
 
     # Select output directory
-    default_output = config.get("default_output_dir", "./abliterate/abliterated_models")
+    default_output = config.get("default_output_dir", "./derestrictor/derestricted_models")
     output_dir = questionary.path(
         "Output directory:",
         default=default_output,
@@ -1793,7 +1793,7 @@ def _create_training_config():
 
 
 def _collect_config_settings() -> dict | None:
-    """Collect abliteration settings via questionnaire. Returns None if cancelled."""
+    """Collect derestriction settings via questionnaire. Returns None if cancelled."""
     settings = get_default_settings()
 
     console.print(f"\n[bold {THEME['secondary']}]Basic Settings[/bold {THEME['secondary']}]\n")
@@ -2142,7 +2142,7 @@ def _delete_training_config():
 
 
 def _select_training_config_for_abliteration() -> dict | None:
-    """Select a training config to use for abliteration. Returns config settings or None."""
+    """Select a training config to use for derestriction. Returns config settings or None."""
     configs = list_configs()
 
     if not configs:
@@ -2190,7 +2190,7 @@ def _select_training_config_for_abliteration() -> dict | None:
 
 
 def _prompt_save_config_after_abliteration(config: dict) -> None:
-    """Prompt user to save abliteration settings as a training config.
+    """Prompt user to save derestriction settings as a training config.
 
     Skips the prompt if the config was loaded from a previously saved config.
     """
@@ -2394,12 +2394,12 @@ def _manage_model_paths():
 
 
 def _manage_output_dir():
-    """Manage default output directory for abliterated models."""
+    """Manage default output directory for derestricted models."""
     current_dir = get_default_output_dir()
 
     console.print(f"\n[bold {THEME['primary']}]Model Output Directory[/bold {THEME['primary']}]\n")
     console.print(f"Current directory: [{THEME['primary']}]{current_dir}[/{THEME['primary']}]")
-    console.print(f"[{THEME['muted']}]Abliterated models will be saved here by default.[/{THEME['muted']}]")
+    console.print(f"[{THEME['muted']}]Derestricted models will be saved here by default.[/{THEME['muted']}]")
 
     exists = Path(current_dir).exists()
     status = "[green]exists[/green]" if exists else "[yellow]will be created[/yellow]"
@@ -2611,7 +2611,7 @@ def run_first_time_setup():
 
     console.print(
         Panel(
-            "[bold]Welcome to the Abliteration Toolkit![/bold]\n\n"
+            "[bold]Welcome to Derestrictor![/bold]\n\n"
             "This appears to be your first time running the CLI.\n"
             "Let's set up your configuration.",
             title="[bold cyan]First-Time Setup[/bold cyan]",
@@ -2700,7 +2700,7 @@ def run_first_time_setup():
     console.print(f"\n[bold {THEME['primary']}]Step 4: Default Precision[/bold {THEME['primary']}]\n")
 
     config["default_dtype"] = questionary.select(
-        "Select default precision for abliteration:",
+        "Select default precision for derestriction:",
         choices=[
             questionary.Choice("float16 (faster, less memory)", value="float16"),
             questionary.Choice("bfloat16 (better precision)", value="bfloat16"),
@@ -2746,7 +2746,7 @@ def main_menu():
         display_menu(
             "Main Menu",
             [
-                ("1", "Abliterate Model", "Remove refusal behavior from a model"),
+                ("1", "Derestrict Model", "Remove refusal behavior from a model"),
                 ("2", "Test Model", "Run test prompts on a model"),
                 ("3", "Compare Models", "Side-by-side comparison"),
                 ("4", "Evaluate Refusal", "Full refusal rate evaluation"),
@@ -2769,9 +2769,9 @@ def main_menu():
             config = get_abliteration_config()
             if config:
                 console.print()
-                display_config_panel(config, "Abliteration Configuration")
+                display_config_panel(config, "Derestriction Configuration")
                 confirm = questionary.confirm(
-                    "\nProceed with abliteration?",
+                    "\nProceed with derestriction?",
                     default=True,
                     style=custom_style,
                 ).ask()
@@ -2882,7 +2882,7 @@ def main_menu():
     help="Also skip in_proj_qkv/in_proj_z (more conservative)",
 )
 # KL divergence monitoring
-@click.option("--kl-monitor/--no-kl-monitor", default=False, help="Report KL divergence after abliteration")
+@click.option("--kl-monitor/--no-kl-monitor", default=False, help="Report KL divergence after derestriction")
 @click.option("--kl-num-prompts", type=int, default=50, help="Number of reference prompts for KL (preservation split)")
 @click.option("--kl-top-k", type=int, default=200, help="Top-k tokens for KL approximation")
 @click.option(
@@ -2931,7 +2931,7 @@ def cli(
     kl_search_min,
     kl_search_max,
 ):
-    r"""Abliteration Toolkit - Remove refusal behavior from language models.
+    r"""Derestrictor - Remove refusal behavior from language models.
 
     Run without arguments for interactive mode, or use --batch for automation.
 
@@ -2964,7 +2964,7 @@ def cli(
 
     KL divergence monitoring (capability drift):
     \b
-      --kl-monitor             Report KL divergence after abliteration
+      --kl-monitor             Report KL divergence after derestriction
       --kl-auto-tune           Binary search for best multiplier within KL budget
       --kl-threshold FLOAT     Max mean KL divergence for auto-tune (default: 0.5)
     """
@@ -2986,7 +2986,7 @@ def cli(
         else:
             output_dir = get_default_output_dir()
             model_name = Path(model_path).name
-            effective_output_path = f"{output_dir}/{model_name}-abliterated"
+            effective_output_path = f"{output_dir}/{model_name}-derestricted"
 
         # Parse target layers if provided
         parsed_target_layers = None

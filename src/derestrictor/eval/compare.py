@@ -355,8 +355,8 @@ def compare_results(file1: str, file2: str, file3: str | None = None, show_all: 
         print("\n" + "-" * line_width)
         print("REFUSAL EVAL INTERPRETATION")
         print("-" * line_width)
-        print("For ABLITERATED models (vs base):")
-        print("  - harmful_prompts refusal_rate ↓ = abliteration working (less refusals)")
+        print("For DERESTRICTED models (vs base):")
+        print("  - harmful_prompts refusal_rate ↓ = derestriction working (less refusals)")
         print("  - harmless_prompts refusal_rate ~ = no over-refusal introduced")
 
     # Print metadata comparison
@@ -414,9 +414,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python compare_evals.py base.json abliterated.json
+  python compare_evals.py base.json derestricted.json
   python compare_evals.py base.json model_a.json model_b.json  # Compare two models against base
-  python compare_evals.py --all base.json abliterated.json     # Include stderr
+  python compare_evals.py --all base.json derestricted.json     # Include stderr
         """,
     )
     parser.add_argument("file1", help="Base/reference results JSON file")

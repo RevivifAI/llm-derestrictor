@@ -1,4 +1,4 @@
-"""Streaming sharded abliteration.
+"""Streaming sharded derestriction.
 
 Reads one safetensors shard at a time from ``input_dir``, applies the
 ablation kernel on the loaded device, and writes the modified tensor into
@@ -335,7 +335,7 @@ def sharded_ablate(
     Args:
         input_dir: Path to the original model directory (must contain
             ``model.safetensors`` or ``model.safetensors.index.json``).
-        output_dir: Path to write the abliterated model. Created if missing.
+        output_dir: Path to write the derestricted model. Created if missing.
         directions: Computed refusal directions (loaded into memory once).
         config: Active :class:`AbliterationConfig` (drives kernel,
             layouts, biprojection mapping, etc.).
@@ -440,7 +440,7 @@ def sharded_ablate(
                     else:
                         new_tensor = tensor
                 except Exception as exc:
-                    logger.warning(f"Failed to abliterate {key}: {exc}")
+                    logger.warning(f"Failed to derestrict {key}: {exc}")
                     new_tensor = tensor
                     skipped_count += 1
 

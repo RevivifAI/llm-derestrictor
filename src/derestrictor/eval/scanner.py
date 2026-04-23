@@ -102,7 +102,7 @@ class RefusalScanner:
             prompts = prompts[:limit]
 
         if output_file == "refusal_results.csv" and model_name:
-            output_dir = Path("eval_abliterated")
+            output_dir = Path("eval_derestricted")
             output_dir.mkdir(exist_ok=True)
 
             clean_name = Path(model_name).name.replace("/", "_").replace("\\", "_")

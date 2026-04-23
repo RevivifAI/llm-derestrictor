@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rich CLI Components for Abliteration Toolkit.
+"""Rich CLI Components for Derestrictor.
 
 Reusable UI components for the interactive CLI including:
 - ASCII art banner with gradient colors
@@ -40,7 +40,7 @@ from rich.theme import Theme
 
 def get_config_dir() -> Path:
     """Get the configuration directory path."""
-    config_dir = Path.home() / "abliterate"
+    config_dir = Path.home() / "derestrictor"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
@@ -152,20 +152,20 @@ def set_eval_results_dir(path: str) -> None:
 
 
 def get_default_output_dir() -> str:
-    """Get the configured default output directory for abliterated models."""
+    """Get the configured default output directory for derestricted models."""
     config = load_config()
     return config.get("default_output_dir", get_default_config()["default_output_dir"])
 
 
 def set_default_output_dir(path: str) -> None:
-    """Set the default output directory for abliterated models."""
+    """Set the default output directory for derestricted models."""
     config = load_config()
     config["default_output_dir"] = str(Path(path).resolve())
     save_config(config)
 
 
 def get_default_num_prompts() -> int:
-    """Get the configured default number of prompts for abliteration."""
+    """Get the configured default number of prompts for derestriction."""
     config = load_config()
     return config.get("default_num_prompts", get_default_config()["default_num_prompts"])
 
@@ -177,7 +177,7 @@ def get_default_direction_multiplier() -> float:
 
 
 def get_default_dtype() -> str:
-    """Get the configured default dtype for abliteration."""
+    """Get the configured default dtype for derestriction."""
     config = load_config()
     return config.get("default_dtype", get_default_config()["default_dtype"])
 
@@ -255,14 +255,14 @@ custom_theme = Theme(
 
 # ASCII Art Banner
 BANNER = r"""
- _______  ______   _       __________________ _______  _______  _______ _________ _______
-(  ___  )(  ___ \ ( \      \__   __/\__   __/(  ____ \(  ____ )(  ___  )\__   __/(  ____ \
-| (   ) || (   ) )| (         ) (      ) (   | (    \/| (    )|| (   ) |   ) (   | (    \/
-| (___) || (__/ / | |         | |      | |   | (__    | (____)|| (___) |   | |   | (__
-|  ___  ||  __ (  | |         | |      | |   |  __)   |     __)|  ___  |   | |   |  __)
-| (   ) || (  \ \ | |         | |      | |   | (      | (\ (   | (   ) |   | |   | (
-| )   ( || )___) )| (____/\___) (___   | |   | (____/\| ) \ \__| )   ( |   | |   | (____/\
-|/     \||/ \___/ (_______/\_______/   )_(   (_______/|/   \__/|/     \|   )_(   (_______/
+ ______   _______  _______  _______  _______ _________ _______ _________ _______ _________ _______  _______
+(  __  \ (  ____ \(  ____ )(  ____ \(  ____ \\__   __/(  ____ )\__   __/(  ____ \\__   __/(  ___  )(  ____ )
+| (  \  )| (    \/| (    )|| (    \/| (    \/   ) (   | (    )|   ) (   | (    \/   ) (   | (   ) || (    )|
+| |   ) || (__    | (____)|| (__    | (_____    | |   | (____)|   | |   | |         | |   | |   | || (____)|
+| |   | ||  __)   |     __)|  __)   (_____  )   | |   |     __)   | |   | |         | |   | |   | ||     __)
+| |   ) || (      | (\ (   | (            ) |   | |   | (\ (      | |   | |         | |   | |   | || (\ (
+| (__/  )| (____/\| ) \ \__| (____/\/\____) |   | |   | ) \ \_____) (___| (____/\   | |   | (___) || ) \ \__
+(______/ (_______/|/   \__/(_______/\_______)   )_(   |/   \__/\_______/(_______/   )_(   (_______)|/   \__/
 """
 
 # Console with black background styling
@@ -295,7 +295,7 @@ def display_banner():
 
     # Subtitle
     subtitle = Text()
-    subtitle.append("Language Model Abliteration", style=f"bold {THEME['muted']}")
+    subtitle.append("Language Model Derestriction", style=f"bold {THEME['muted']}")
     console.print(Align.center(subtitle))
     console.print()
 
@@ -393,7 +393,7 @@ def find_models(search_paths: list[Path] | None = None) -> list[dict]:
                     model_info = {
                         "path": str(item),
                         "name": item.name,
-                        "is_abliterated": (item / "abliteration_config.json").exists(),
+                        "is_abliterated": (item / "derestriction_config.json").exists() or (item / "abliteration_config.json").exists(),
                     }
                     models.append(model_info)
                     seen_paths.add(item.resolve())
@@ -410,7 +410,7 @@ def display_model_list(models: list[dict], title: str = "Available Models") -> N
     table.add_column("Path", style="dim")
 
     for idx, model in enumerate(models, 1):
-        model_type = "[green]Abliterated[/green]" if model["is_abliterated"] else "Base"
+        model_type = "[green]Derestricted[/green]" if model["is_abliterated"] else "Base"
         table.add_row(
             str(idx),
             model["name"],
@@ -498,7 +498,7 @@ def display_comparison_panel(
     response1: str,
     response2: str,
     label1: str = "Original",
-    label2: str = "Abliterated",
+    label2: str = "Derestricted",
     refused1: bool = False,
     refused2: bool = False,
 ) -> None:

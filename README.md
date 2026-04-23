@@ -1,8 +1,16 @@
-# Abliterator
+# Derestrictor
 
-### Orthogonal Projection Abliteration toolkit featuring Norm-Preservation, Null-Space Constaints, Winsorization, and Adaptive Layer Weighting
+### Orthogonal Projection Derestriction toolkit featuring Norm-Preservation, Null-Space Constraints, Winsorization, and Adaptive Layer Weighting
 
-![abliterator cli](docs/assets/cli_example.jpg)
+![derestrictor cli](docs/assets/cli_example.jpg)
+
+> **What makes this different from abliteration?**
+> Mechanically, derestriction and abliteration are identical — both project weight matrices orthogonally to remove a learned refusal direction.
+> The difference is in the prompt dataset used to measure that direction.
+> Abliteration tools typically extract refusal directions from explicitly harmful or illegal prompts (CSAM, bioweapons, targeted violence, etc.), which means those categories lose their refusal signal along with everything else.
+> Derestrictor uses the [RevivifAI/derestriction](https://huggingface.co/datasets/RevivifAI/derestriction) dataset, which deliberately excludes genuinely dangerous topics (`restrict` split) from the direction-extraction pool.
+> The result is a model that still refuses requests in those categories while becoming less over-restrictive for everything else.
+> Put simply: **derestriction targets over-refusal; abliteration targets all refusal.**
 
 ## Installation
 
@@ -46,7 +54,7 @@ HuggingFace dataset, partitioned into three splits with a
 | Split | Role |
 |---|---|
 | `restrict` | Genuinely harmful prompts the model **should** continue to refuse (child harm, targeted violence, WMD, graphic sexual, self-harm). Carries `Restriction_Category`. |
-| `derestrict` | Refusal-target prompts the abliteration run should **unlock** (AdvBench / JailbreakBench minus the restricted subset, Chinese sensitive topics, and the non-genuinely-harmful subcategories of WildGuardMix — benign-but-refused, cyberattack, fraud, copyright, privacy / whistleblower, hate speech, stereotypes, political disinformation). |
+| `derestrict` | Refusal-target prompts the derestriction run should **unlock** (AdvBench / JailbreakBench minus the restricted subset, Chinese sensitive topics, and the non-genuinely-harmful subcategories of WildGuardMix — benign-but-refused, cyberattack, fraud, copyright, privacy / whistleblower, hate speech, stereotypes, political disinformation). |
 | `allow` | Benign instructions and capability-preservation prompts (Alpaca, MMLU, GSM8K, ARC, MATH-500, HumanEval, JailbreakBench benign). |
 
 Splits are loaded lazily by `derestrictor.data.loader.load_split` and cached
@@ -87,15 +95,15 @@ access to the `RevivifAI` org.
 
 ## Using the CLI
 
-### Abliterate Model
+### Derestrict Model
 
 The main workflow. Select a model from discovered directories (or enter a path manually), configure your options, and let it run.
 
 **Step 1: Select Base Model**
-The CLI scans your configured directories and shows available models. Already-abliterated models are marked with `[A]`.
+The CLI scans your configured directories and shows available models. Already-derestricted models are marked with `[D]`.
 
 **Step 2: Output Path**
-Defaults to `./abliterate/abliterated_models/{model-name}-abliterated`. Change it if you like.
+Defaults to `./derestrictor/derestricted_models/{model-name}-derestricted`. Change it if you like.
 
 **Step 3: Configuration**
 - **Number of prompts**: How many `derestrict`/`allow` pairs to use (default: 30)
@@ -122,18 +130,18 @@ Quick sanity checks:
 
 ### Compare Models
 
-Load an original and abliterated model side-by-side, enter a prompt, and see both responses. Useful for spot-checking behavior changes.
+Load an original and derestricted model side-by-side, enter a prompt, and see both responses. Useful for spot-checking behavior changes.
 
 ### Evaluate Refusal
 
 Runs the model against `derestrict` and `allow` prompt sets, computing refusal rates for each. Results are saved as timestamped JSON files to your configured eval directory.
 
-- **Harmful refusal rate**: Lower = more abliterated
+- **Harmful refusal rate**: Lower = more derestricted
 - **Harmless refusal rate**: Lower = fewer false positives
 
 ### Export to GGUF
 
-Converts abliterated models to GGUF format for llama.cpp, Ollama, or LM Studio. Supports Q4_K_M, Q5_K_M, Q8_0, and F16 quantization types. Vision-language models get automatic mmproj export.
+Converts derestricted models to GGUF format for llama.cpp, Ollama, or LM Studio. Supports Q4_K_M, Q5_K_M, Q8_0, and F16 quantization types. Vision-language models get automatic mmproj export.
 
 ### Settings
 

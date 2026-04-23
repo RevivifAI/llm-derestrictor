@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Abliteration Parameter Search.
+"""Derestriction Parameter Search.
 
-Iteratively searches for optimal abliteration parameters by:
+Iteratively searches for optimal derestriction parameters by:
 1. Establishing baseline scores on the original model
-2. Running abliteration with various parameter combinations
-3. Evaluating each abliterated model with lm-evaluation-harness
+2. Running derestriction with various parameter combinations
+3. Evaluating each derestricted model with lm-evaluation-harness
 4. Comparing accuracy deltas and refusal rates to find optimal settings
 """
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SearchConfig:
-    """Configuration for abliteration parameter search."""
+    """Configuration for derestriction parameter search."""
 
     base_model_path: str
     output_dir: str
@@ -328,10 +328,10 @@ def run_single_abliteration(
     device: str = "cuda",
     dtype: str = "float16",
 ) -> str:
-    """Run abliteration with specific parameters against RevivifAI/derestriction.
+    """Run derestriction with specific parameters against RevivifAI/derestriction.
 
     Returns:
-        Path to the abliterated model.
+        Path to the derestricted model.
     """
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
@@ -401,7 +401,7 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
 
         try:
             # Run abliteration
-            logger.info("Running abliteration...")
+            logger.info("Running derestriction...")
             run_single_abliteration(
                 base_model_path=config.base_model_path,
                 output_path=str(trial_path),
@@ -412,7 +412,7 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
             )
 
             # Evaluate
-            logger.info("Evaluating abliterated model...")
+            logger.info("Evaluating derestricted model...")
             scores = run_lm_eval(
                 model_path=str(trial_path),
                 tasks=config.eval_tasks,
@@ -509,7 +509,7 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
 def print_summary(results: list[EvalResult], config: SearchConfig):
     """Print a summary of all search results."""
     print("\n" + "=" * 80)
-    print("ABLITERATION PARAMETER SEARCH SUMMARY")
+    print("DERESTRICTION PARAMETER SEARCH SUMMARY")
     print("=" * 80)
 
     passed = [r for r in results if r.passed]
@@ -565,9 +565,9 @@ def print_summary(results: list[EvalResult], config: SearchConfig):
 
 
 def main():
-    """Command-line entry point for grid-searching abliteration parameters."""
+    """Command-line entry point for grid-searching derestriction parameters."""
     parser = argparse.ArgumentParser(
-        description="Search for optimal abliteration parameters",
+        description="Search for optimal derestriction parameters",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -594,13 +594,13 @@ Examples:
         "--base_model",
         type=str,
         required=True,
-        help="Path to the base model to abliterate",
+        help="Path to the base model to derestrict",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         required=True,
-        help="Directory to save search results and abliterated models",
+        help="Directory to save search results and derestricted models",
     )
     parser.add_argument(
         "--baseline_scores",

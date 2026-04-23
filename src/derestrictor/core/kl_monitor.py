@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """KL Divergence Monitor & Auto-Tune Multiplier.
 
-Measures distribution drift between original and abliterated model outputs
+Measures distribution drift between original and derestricted model outputs
 on reference prompts (typically preservation/harmless prompts). Uses top-k
 approximation for efficient KL computation without full vocab softmax.
 
 Provides:
-- KL monitoring: post-abliteration quality signal reporting distribution drift
+- KL monitoring: post-derestriction quality signal reporting distribution drift
 - Auto-tune: binary search over direction_multiplier to find highest value
   that keeps KL below a user-specified threshold
 """
@@ -141,12 +141,12 @@ class WeightSnapshot:
 
 
 class KLDivergenceMonitor:
-    """Monitors KL divergence between original and abliterated model distributions.
+    """Monitors KL divergence between original and derestricted model distributions.
 
     Usage:
         1. Create monitor with original model
-        2. Call cache_reference_logits() BEFORE abliteration
-        3. After abliteration, call compute_kl_divergence() to measure drift
+        2. Call cache_reference_logits() BEFORE derestriction
+        3. After derestriction, call compute_kl_divergence() to measure drift
 
     Uses top-k approximation: only computes KL over the top-k tokens from the
     original distribution, capturing >99% of probability mass while avoiding
@@ -217,9 +217,9 @@ class KLDivergenceMonitor:
             self.tokenizer.padding_side = original_padding_side
 
     def cache_reference_logits(self, prompts: list[str]):
-        """Cache top-k log probabilities from the original (pre-abliteration) model.
+        """Cache top-k log probabilities from the original (pre-derestriction) model.
 
-        Must be called BEFORE abliteration since the model is modified in-place.
+        Must be called BEFORE derestriction since the model is modified in-place.
 
         Args:
             prompts: Reference prompts (typically preservation or harmless prompts)
@@ -254,7 +254,7 @@ class KLDivergenceMonitor:
 
         Args:
             prompts: Same reference prompts used for caching (in same order)
-            multiplier: The direction_multiplier that was used for abliteration
+            multiplier: The direction_multiplier that was used for derestriction
 
         Returns:
             KLResult with mean/median/max/std KL and per-prompt breakdown
@@ -340,13 +340,13 @@ def auto_tune_multiplier(
 ) -> AutoTuneResult:
     """Binary-search ``direction_multiplier`` for the largest KL-safe value.
 
-    Each iteration restores the model weights, abliterates with the candidate
+    Each iteration restores the model weights, derestricts with the candidate
     multiplier, and measures KL divergence. The KL-divergence threshold is read
     from ``kl_config``. The search terminates once the bracket converges, and
-    the model is left abliterated with the best multiplier found.
+    the model is left derestricted with the best multiplier found.
 
     Args:
-        model: The model (pre-abliteration weights expected)
+        model: The model (pre-derestriction weights expected)
         tokenizer: Tokenizer
         directions: Computed RefusalDirections
         config: AbliterationConfig (modified in-place with best multiplier)
@@ -384,7 +384,7 @@ def auto_tune_multiplier(
         # Restore original weights
         snapshot.restore(model)
 
-        # Abliterate with candidate multiplier
+        # Derestrict with candidate multiplier
         original_multiplier = config.direction_multiplier
         config.direction_multiplier = candidate
         abliterate_model(model, directions, config, null_space_projector)
@@ -432,7 +432,7 @@ def auto_tune_multiplier(
             "Consider lowering kl_search_min or raising kl_threshold."
         )
 
-    # Final application: restore and abliterate with best multiplier
+    # Final application: restore and derestrict with best multiplier
     logger.info(f"Applying best multiplier: {best_multiplier:.4f} (KL={best_kl:.4f})")
     snapshot.restore(model)
     config.direction_multiplier = best_multiplier

@@ -1,4 +1,4 @@
-"""Derestrictor: norm-preserving orthogonal-projection abliteration toolkit.
+"""Derestrictor: norm-preserving orthogonal-projection derestriction toolkit.
 
 Removes refusal behavior from transformer language models via null-space
 constrained, adaptively weighted orthogonal projection onto the refusal

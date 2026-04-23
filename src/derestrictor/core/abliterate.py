@@ -3608,9 +3608,9 @@ def abliterate_model(
         mode_parts.append("hybrid-aware")
 
     if mode_parts:
-        logger.info(f"Applying abliteration with: {', '.join(mode_parts)}")
+        logger.info(f"Applying derestriction with: {', '.join(mode_parts)}")
     else:
-        logger.info("Applying standard Frobenius norm-preserving abliteration...")
+        logger.info("Applying standard Frobenius norm-preserving derestriction...")
 
     linear_names = get_linear_layer_names(model)
     logger.info(f"Found {len(linear_names)} linear layers")
@@ -3710,7 +3710,7 @@ def abliterate_model(
     modified_count = 0
     skipped_count = 0
 
-    for name in tqdm(linear_names, desc="Abliterating layers"):
+    for name in tqdm(linear_names, desc="Derestricting layers"):
         # Get the module
         parts = name.split(".")
         module = model
@@ -3867,7 +3867,7 @@ def abliterate_model(
             modified_count += 1
 
         except Exception as e:
-            logger.warning(f"Failed to abliterate {name}: {e}")
+            logger.warning(f"Failed to derestrict {name}: {e}")
             skipped_count += 1
 
     # Fused MoE expert tensors (Mixtral, Qwen2.5-MoE, GPT-OSS). The standard
@@ -3881,7 +3881,7 @@ def abliterate_model(
         expert_infos = list(iter_expert_tensors(model, family_hint=family_hint))
         if expert_infos:
             logger.info(f"Found {len(expert_infos)} fused MoE expert tensors")
-        for info in tqdm(expert_infos, desc="Abliterating MoE experts"):
+        for info in tqdm(expert_infos, desc="Derestricting MoE experts"):
             parts = info.name.split(".")
             owner = model
             for part in parts[:-1]:
@@ -3941,7 +3941,7 @@ def abliterate_model(
                     param.data = new_param
                 moe_modified += 1
             except Exception as e:
-                logger.warning(f"Failed to abliterate MoE expert {info.name}: {e}")
+                logger.warning(f"Failed to derestrict MoE expert {info.name}: {e}")
                 moe_skipped += 1
 
     if moe_modified or moe_skipped:
@@ -4151,7 +4151,7 @@ def run_abliteration(config: AbliterationConfig):
         logger.info("Dynamic layer targeting enabled: using per-layer directions")
 
     logger.info("=" * 60)
-    features = ["Norm-Preserving Abliteration"]
+    features = ["Norm-Preserving Derestriction"]
     if hybrid_info.is_hybrid and config.hybrid_strategy == "auto":
         features.append("Hybrid-Aware")
     if config.dynamic_layer_targeting:
@@ -4418,7 +4418,7 @@ def run_abliteration(config: AbliterationConfig):
         output_path = get_versioned_path(config.output_path)
         if output_path != Path(config.output_path):
             logger.info(f"Output path exists, using versioned path: {output_path}")
-        logger.info(f"Saving abliterated model to {output_path}...")
+        logger.info(f"Saving derestricted model to {output_path}...")
         output_path.mkdir(parents=True, exist_ok=True)
 
         # Save model and tokenizer (handles FP8 dequantized models specially)
@@ -4558,7 +4558,7 @@ def run_abliteration(config: AbliterationConfig):
         save_kl_report(output_path, kl_result=kl_result, auto_tune_result=auto_tune_result)
 
     logger.info("=" * 60)
-    logger.info("Abliteration complete!")
+    logger.info("Derestriction complete!")
     logger.info(f"Output saved to: {output_path}")
     logger.info("=" * 60)
 
@@ -4566,22 +4566,22 @@ def run_abliteration(config: AbliterationConfig):
 
 
 def main():
-    """Command-line entry point for norm-preserving orthogonal projection abliteration."""
+    """Command-line entry point for norm-preserving orthogonal projection derestriction."""
     parser = argparse.ArgumentParser(
-        description="Norm-Preserving Orthogonal Projection Abliteration",
+        description="Norm-Preserving Orthogonal Projection Derestriction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic usage (loads RevivifAI/derestriction from HuggingFace)
-  python abliterate.py --model_path ./my_model --output_path ./abliterated_model
+  python abliterate.py --model_path ./my_model --output_path ./derestricted_model
 
   # Sample 100 random prompts from each split
-  python abliterate.py --model_path ./my_model --output_path ./abliterated_model --num_prompts 100
+  python abliterate.py --model_path ./my_model --output_path ./derestricted_model --num_prompts 100
 
   # Target specific layers only
   python abliterate.py \\
     --model_path ./my_model \\
-    --output_path ./abliterated_model \\
+    --output_path ./derestricted_model \\
     --target_layers 10 11 12 13 14 15
         """,
     )
@@ -4596,7 +4596,7 @@ Examples:
         "--output_path",
         type=str,
         required=True,
-        help="Path to save the abliterated model",
+        help="Path to save the derestricted model",
     )
     parser.add_argument(
         "--num_prompts",
@@ -4609,7 +4609,7 @@ Examples:
         type=int,
         nargs="+",
         default=None,
-        help="Specific layer indices to abliterate (default: all layers)",
+        help="Specific layer indices to derestrict (default: all layers)",
     )
     parser.add_argument(
         "--extraction_layers",

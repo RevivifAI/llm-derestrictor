@@ -423,7 +423,7 @@ def load_model_and_tokenizer(
                 raise RuntimeError(
                     f"Failed to load tokenizer due to encoding issues: {final_error}\n"
                     "On Windows, try running with UTF-8 mode:\n"
-                    "  set PYTHONUTF8=1 && abliterate\n"
+                    "  set PYTHONUTF8=1 && derestrictor\n"
                     "Or: python -X utf8 -m derestrictor"
                 ) from final_error
             finally:
