@@ -31,11 +31,15 @@ if sys.platform == "win32":
 
 logger = logging.getLogger(__name__)
 
-# VL architecture patterns - maps model_type to known architecture class names
+# VL architecture patterns - maps model_type to known architecture class names.
+# Both the top-level multimodal model_type and its text_config.model_type are
+# listed where applicable so detect_model_type matches whichever is reported.
 VL_ARCHITECTURES = {
     "qwen3_5": ["Qwen3_5ForConditionalGeneration"],
+    "qwen3_5_moe": ["Qwen3_5MoeForConditionalGeneration"],
     "qwen3_vl": ["Qwen3VLForConditionalGeneration"],
     "qwen3_vl_moe": ["Qwen3VLMoeForConditionalGeneration"],
+    "qwen3_omni_moe": ["Qwen3OmniMoeForConditionalGeneration"],
     "qwen2_vl": ["Qwen2VLForConditionalGeneration"],
     "qwen2_vl_moe": ["Qwen2VLMoeForConditionalGeneration"],
     "llava": ["LlavaForConditionalGeneration"],
@@ -50,7 +54,15 @@ VL_ARCHITECTURES = {
 # These use ForConditionalGeneration but can be loaded with the text-only model class.
 # Note: Gemma3ForConditionalGeneration is intentionally absent because forcing the
 # text-only class would drop ~400M vision encoder parameters.
-FORCE_TEXT_MODEL_ARCHITECTURES: dict[str, str] = {}
+#
+# Qwen3.5-MoE / Qwen3-Omni-MoE are listed because their vision/audio towers are
+# multi-billion-parameter modules that play no role in refusal mediation; loading
+# the text-only causal LM class shrinks the measurement-phase footprint
+# substantially (e.g. ~13B vision parameters skipped for Qwen3.6-35B-A3B).
+FORCE_TEXT_MODEL_ARCHITECTURES: dict[str, str] = {
+    "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+    "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniMoeForCausalLM",
+}
 
 # Patterns that indicate FP8 quantization (scale factors)
 FP8_SCALE_PATTERNS = [
@@ -269,9 +281,18 @@ def _build_bnb_quantization_config(quantization: Literal["none", "4bit", "8bit"]
             bnb_4bit_compute_dtype=dtype,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
+            # Despite the misleading name, this flag governs CPU offload for
+            # both 8-bit and 4-bit loads. Without it, accelerate's
+            # ``device_map="auto"`` raises if any module is dispatched to CPU
+            # because the quantized footprint exceeds VRAM (common for >20B
+            # models on consumer GPUs).
+            llm_int8_enable_fp32_cpu_offload=True,
         )
     if quantization == "8bit":
-        return BitsAndBytesConfig(load_in_8bit=True)
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
     return None
 
 
@@ -309,6 +330,46 @@ def load_model_and_tokenizer(
             f"Loading model with bitsandbytes {quantization} quantization "
             "(measurement-only path; ablation should stream the original weights)"
         )
+
+    # Decide on the ``device_map`` we hand to ``from_pretrained``. Two cases
+    # force ``device_map="auto"`` (so accelerate plans CPU/disk offload):
+    #
+    #   1. bnb quantization is active. The literal ``"cuda"`` placement asks
+    #      accelerate to pin everything on GPU which OOMs on consumer GPUs for
+    #      >20B models even at 4-bit.
+    #
+    #   2. The on-disk model footprint exceeds available VRAM. Without
+    #      quantization the BF16 weights need genuine multi-tier offload
+    #      (GPU + CPU + disk) which only ``"auto"`` plus an ``offload_folder``
+    #      arranges correctly.
+    #
+    # Note: bnb 4-bit + CPU offload is broken in current upstream releases
+    # (``quant_state.offset`` lives on a ``meta`` device and crashes inside
+    # ``Linear4bit._save_to_state_dict``), so when the model is too large to
+    # fit in VRAM at 4-bit we *prefer* skipping bnb entirely and using BF16
+    # with native accelerate offload — slower but actually works end-to-end.
+    needs_auto_device_map = quant_config is not None
+    offload_folder: str | None = None
+    if device != "cpu" and torch.cuda.is_available():
+        try:
+            free_vram, _ = torch.cuda.mem_get_info()
+        except Exception:
+            free_vram = 0
+        try:
+            disk_size = sum(f.stat().st_size for f in Path(model_path).iterdir() if f.suffix == ".safetensors")
+        except Exception:
+            disk_size = 0
+        # 0.85 leaves headroom for activations, KV cache, and optimizer-style
+        # bookkeeping accelerate keeps pinned on GPU.
+        if disk_size > 0 and free_vram > 0 and disk_size > 0.85 * free_vram:
+            needs_auto_device_map = True
+            logger.info(
+                f"Model footprint ({disk_size / 1e9:.1f} GB) exceeds 0.85x free VRAM "
+                f"({free_vram / 1e9:.1f} GB); using device_map='auto' with disk offload"
+            )
+            offload_folder = str(Path(model_path).parent / "_accelerate_offload")
+            Path(offload_folder).mkdir(parents=True, exist_ok=True)
+    quant_device_map = "auto" if (needs_auto_device_map and device != "cpu") else device
 
     # Load tokenizer (same for both VL and text models for abliteration purposes)
     logger.info(f"Loading tokenizer from {model_path}...")
@@ -369,8 +430,13 @@ def load_model_and_tokenizer(
     # Check if this is a Mistral3 model (requires special handling for FP8)
     is_mistral3 = any("Mistral3" in arch for arch in model_info.get("architectures", []))
 
-    # Load model with appropriate class
-    if model_info["is_vl"]:
+    # Load model with appropriate class.
+    #
+    # ``force_text_class`` (e.g. mapping ``Qwen3_5MoeForConditionalGeneration``
+    # -> ``Qwen3_5MoeForCausalLM``) takes precedence over the VL branch so that
+    # multimodal models whose vision/audio towers are irrelevant to refusal
+    # mediation skip those parameters entirely during the measurement load.
+    if model_info["is_vl"] and not force_text_class:
         # Mistral3 VL models require special handling
         if is_mistral3:
             logger.info("Loading Mistral3 VL model...")
@@ -438,11 +504,17 @@ def load_model_and_tokenizer(
                         logger.info(f"Moving FP8 model to {device}...")
                         model = model.to(device)
                 else:
+                    extra_kwargs: dict = {}
+                    if quant_config is not None:
+                        extra_kwargs["quantization_config"] = quant_config
+                    if offload_folder is not None:
+                        extra_kwargs["offload_folder"] = offload_folder
                     model = AutoModelForImageTextToText.from_pretrained(
                         model_path,
                         torch_dtype=dtype,
-                        device_map=device,
+                        device_map=quant_device_map,
                         trust_remote_code=trust_remote_code,
+                        **extra_kwargs,
                     )
             except ImportError as exc:
                 raise ImportError(
@@ -472,11 +544,17 @@ def load_model_and_tokenizer(
                     logger.info(f"Moving FP8 model to {device}...")
                     model = model.to(device)
             else:
+                extra_kwargs = {}
+                if quant_config is not None:
+                    extra_kwargs["quantization_config"] = quant_config
+                if offload_folder is not None:
+                    extra_kwargs["offload_folder"] = offload_folder
                 model = model_class.from_pretrained(
                     model_path,
                     torch_dtype=dtype,
-                    device_map=device,
+                    device_map=quant_device_map,
                     trust_remote_code=trust_remote_code,
+                    **extra_kwargs,
                 )
         except Exception as e:
             logger.warning(f"Failed to load with {force_text_class}: {e}, falling back to AutoModelForCausalLM")
@@ -490,11 +568,17 @@ def load_model_and_tokenizer(
                 if device != "cpu":
                     model = model.to(device)
             else:
+                extra_kwargs = {}
+                if quant_config is not None:
+                    extra_kwargs["quantization_config"] = quant_config
+                if offload_folder is not None:
+                    extra_kwargs["offload_folder"] = offload_folder
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path,
                     torch_dtype=dtype,
-                    device_map=device,
+                    device_map=quant_device_map,
                     trust_remote_code=trust_remote_code,
+                    **extra_kwargs,
                 )
     else:
         logger.info("Loading model with AutoModelForCausalLM...")
@@ -514,10 +598,12 @@ def load_model_and_tokenizer(
             extra_kwargs = {}
             if quant_config is not None:
                 extra_kwargs["quantization_config"] = quant_config
+            if offload_folder is not None:
+                extra_kwargs["offload_folder"] = offload_folder
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=dtype,
-                device_map=device,
+                device_map=quant_device_map,
                 trust_remote_code=trust_remote_code,
                 **extra_kwargs,
             )
@@ -548,12 +634,26 @@ _MOE_MODULE_MARKERS = ("block_sparse_moe", "mlp.experts", ".experts.")
 
 # Known model-family layout hints, consumed when ``moe_fused_layout="auto"``
 # can't disambiguate from shape alone (e.g. when both axes equal hidden_size).
+#
+# ``qwen3_5_moe`` (and its ``_text`` text-config sibling, plus ``qwen3_omni_moe``)
+# store fused experts as ``nn.Parameter([E, OUT, IN])`` per the transformers
+# 5.5 ``Qwen3_5MoeExperts`` / ``Qwen3OmniMoeThinkerTextExperts`` source —
+# ``gate_up_proj`` is ``[E, 2*moe_intermediate, hidden]`` and ``down_proj``
+# is ``[E, hidden, moe_intermediate]`` — which is the same EOI layout as
+# Mixtral. Without this hint the shape-only fallback in
+# :func:`_resolve_expert_axes` would mis-classify ``down_proj`` as EIO
+# (because its ``in`` axis is smaller than ``out``) and ablate the wrong
+# axis, silently corrupting the MLP.
 MOE_FAMILY_LAYOUT: dict[str, Literal["eoi", "eio"]] = {
     "mixtral": "eoi",
     "qwen2_moe": "eio",
     "qwen3_moe": "eio",
     "qwen3_vl_moe": "eio",
     "qwen2_vl_moe": "eio",
+    "qwen3_5_moe": "eoi",
+    "qwen3_5_moe_text": "eoi",
+    "qwen3_omni_moe": "eoi",
+    "qwen3_omni_moe_text": "eoi",
     "gpt_oss": "eio",
     "gptoss": "eio",
 }

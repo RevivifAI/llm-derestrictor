@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "derestrictor"
-version = "2.2.0"
+version = "2.3.0"
 description = "Remove refusal behavior from language models using norm-preserving orthogonal projection"
 readme = "README.md"
 license = {text = "MIT"}
@@ -35,6 +35,53 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
+    "bitsandbytes>=0.49.2",
+    # Accelerate 1.13.0 (latest tag at time of writing) crashes with
+    # ``TypeError: Params4bit.__new__() got an unexpected keyword argument
+    # '_is_hf_initialized'`` whenever bnb 4-bit / 8-bit quantized weights are
+    # offloaded by ``device_map="auto"``. Upstream fix landed on ``main`` in
+    # commit 13640d3242 ("Fix is_hf_initialized attribute", PR #3976,
+    # 2026-03-17) but is not yet part of any release. Pin to the post-fix
+    # ``main`` HEAD until accelerate 1.14 ships.
+    "accelerate @ git+https://github.com/huggingface/accelerate.git@f1e6505b9025739917df26ffb47456ae947b35d4",
+    # CUDA kernels for hybrid linear-attention models (Qwen3.5-MoE /
+    # Qwen3.6-A3B, Mamba-style architectures). Without them transformers
+    # logs "The fast path is not available because one of the required
+    # library is not installed. Falling back to torch implementation." and
+    # uses a slower pure-PyTorch linear-attention path during activation
+    # extraction.
+    #
+    # - ``flash-linear-attention`` is pure Triton + Python, so it installs
+    #   cleanly on any modern CUDA + torch combo without a C++/NVCC build.
+    #
+    # - ``causal-conv1d`` is a CUDA C++ extension. Its ``setup.py``
+    #   hard-codes a gencode list covering ~10 GPU architectures (sm_62
+    #   through sm_121 on CUDA 13.0) and does **not** honor
+    #   ``TORCH_CUDA_ARCH_LIST``, so a source build invokes ``nvcc`` on the
+    #   full matrix and OOM-kills on machines with <30 GB RAM (observed:
+    #   RTX 4070 Ti host, 32 GB RAM, nvcc killed with exit 255). Upstream
+    #   publishes prebuilt wheels on GitHub Releases keyed by
+    #   ``cu{major}torch{major}.{minor}cxx11abi{TRUE|FALSE}-cp{python}-{arch}``;
+    #   the ``setup.py``'s ``CachedWheelsCommand`` tries to download the
+    #   matching wheel before falling back to source, **but** 1.6.1's
+    #   default release has zero assets attached — only ``v1.6.1.post4``
+    #   carries the full wheel set. So we pin the URL of the matching
+    #   prebuilt wheel directly, skipping both the source build and the
+    #   download-guessing logic.
+    #
+    #   The pin below is for ``torch 2.11.0+cu130`` / ``python 3.12`` /
+    #   ``linux_x86_64``. The upstream didn't ship a ``cu13torch2.11``
+    #   wheel for 1.6.1.post4 (the closest is ``cu13torch2.10``), but the
+    #   CUDA major and the CXX11 ABI match and torch 2.10 → 2.11 is
+    #   ABI-compatible for this extension's surface (verified:
+    #   ``causal_conv1d_fn`` forward pass on sm_89 with ``bfloat16`` inputs
+    #   against torch 2.11.0+cu130, 2026-04-22). If the project's torch /
+    #   CUDA / Python pins move, update this URL to the matching wheel
+    #   from
+    #   https://github.com/Dao-AILab/causal-conv1d/releases/tag/v1.6.1.post4
+    #   (or whichever release carries wheels for the new combination).
+    "flash-linear-attention>=0.2.0",
+    "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
 ]
 
 [project.scripts]
@@ -69,6 +116,13 @@ dev = [
     "sentence-transformers>=2.7.0",
     "pyarrow>=15.0.0",
 ]
+
+[tool.hatch.metadata]
+# Required because the ``accelerate`` and ``causal-conv1d`` deps are pinned
+# to direct URL references (git commit for accelerate, GitHub Releases wheel
+# URL for causal-conv1d; see ``project.dependencies`` and the ``kernels``
+# optional-dep group).
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/derestrictor"]
@@ -167,7 +221,17 @@ unfixable = [
     "S607",    # start-process with partial path: fine for tooling
 ]
 "src/derestrictor/eval/harness.py" = ["S", "D", "PLR", "ARG", "T201"]
-"tests/**/*.py" = ["S", "D", "PLR", "ARG"]
+"tests/**/*.py" = ["S", "D", "PLR", "ARG", "N801"]
+# Top-level ``scripts/`` mirrors ``src/derestrictor/scripts/`` — research
+# utilities that print directly to stdout and don't need full docstring
+# coverage. (The Qwen3.5 class-name underscore pattern also triggers N801.)
+"scripts/*.py" = [
+    "T201",    # print() is acceptable in CLI/research utilities
+    "D",       # docstring coverage is not required for one-off scripts
+    "RUF001",  # allow Unicode characters (em-dashes etc.) in user-facing strings
+    "S603",
+    "S607",
+]
 "**/__init__.py" = ["F401", "D"]
 
 [tool.ruff.lint.isort]

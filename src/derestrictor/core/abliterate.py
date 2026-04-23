@@ -3173,9 +3173,99 @@ def get_linear_layer_names(model: AutoModelForCausalLM) -> list[str]:
     return linear_names
 
 
+# Parameter prefixes / segments that belong to model components OUTSIDE the
+# language-model decoder stack and therefore must not receive refusal-direction
+# ablation:
+#
+# * ``model.visual.`` / ``visual.`` — vision encoders and the vision-to-text
+#   merger (Qwen3-VL family). Their hidden states are not in the residual
+#   stream that mediates refusal.
+# * ``mtp.`` — Multi-Token Prediction heads (Qwen3.5-MoE / Qwen3.6-A3B).
+#   These are parallel prediction stacks with their own ``layers.N``
+#   numbering; without an explicit skip the unanchored ``layers\.(\d+)\.``
+#   regex below would silently re-use LM layer-N directions on them.
+# * ``audio_tower.`` / ``audio.`` — audio encoders on omni / audio-text
+#   variants.
+#
+# The list is matched with both ``startswith`` (to catch top-level prefixes
+# like ``mtp.``) and a substring check (to catch nested ones like
+# ``model.visual.``); see :func:`is_non_lm_stack_tensor`.
+_NON_LM_STACK_PREFIXES: tuple[str, ...] = (
+    "mtp.",
+    "model.visual.",
+    "visual.",
+    "model.audio_tower.",
+    "audio_tower.",
+    "model.audio.",
+)
+
+
+def is_non_lm_stack_tensor(name: str) -> bool:
+    """Return True when ``name`` belongs to a non-LM-decoder component.
+
+    Used as the first check in the ablation dispatcher so vision encoders,
+    audio towers, and Multi-Token Prediction heads are passed through to
+    the output unmodified instead of being treated as if they lived in
+    the language-model residual stream.
+    """
+    return any(name.startswith(prefix) or f".{prefix}" in name for prefix in _NON_LM_STACK_PREFIXES)
+
+
+# Parameter name *suffixes* for LM-stack tensors that sit at the residual-stream
+# boundary (token embedding lookup and final logit projection). They are part
+# of the language model proper but are not internal residual-stream layers, so
+# orthogonal-projection ablation does not apply cleanly:
+#
+# * ``lm_head.weight`` ``[vocab, hidden]`` — output projection. The refusal
+#   direction lives in ``hidden``-space; projecting it out of the
+#   ``vocab``-space output axis is undefined. The kernel currently catches
+#   this via a shape-mismatch warning (see
+#   ``"Direction shape ... doesn't match weight shape ..."``); this skip
+#   makes the intent explicit and silences the warning.
+# * ``embed_tokens.weight`` ``[vocab, hidden]`` — input projection (lookup).
+#   The reference Arditi et al. methodology only orthogonalizes the
+#   per-layer ``W_in`` (``q/k/v_proj``, ``gate/up_proj``) and ``W_out``
+#   (``o_proj``, ``down_proj``) inside the residual stream; embeddings are
+#   pre-residual and intentionally left alone.
+#
+# Both names are checked as exact tensor-suffix matches (after the final
+# dot) to avoid accidentally matching a fused MoE expert that happens to
+# have ``embed`` in a sub-path.
+_RESIDUAL_BOUNDARY_TENSOR_SUFFIXES: frozenset[str] = frozenset(
+    {
+        "lm_head.weight",
+        "embed_tokens.weight",
+    }
+)
+
+
+def is_residual_boundary_tensor(name: str) -> bool:
+    """Return True for ``embed_tokens.weight`` / ``lm_head.weight``.
+
+    These tensors are part of the language model but sit at the
+    residual-stream boundary (input/output projections to/from
+    ``hidden_size``). They cannot receive a hidden-space refusal-direction
+    projection that's also dimensionally consistent with their
+    ``vocab_size`` axis, and the reference Arditi et al. methodology does
+    not include them. Skipping them in the dispatcher prevents both the
+    silent input-space mutation of ``embed_tokens`` and the noisy
+    shape-mismatch warning previously raised inside the kernel for
+    ``lm_head``.
+    """
+    return any(name == suffix or name.endswith(f".{suffix}") for suffix in _RESIDUAL_BOUNDARY_TENSOR_SUFFIXES)
+
+
 def get_layer_index_from_name(name: str) -> int | None:
-    """Extract layer index from a parameter name."""
+    """Extract LM-decoder layer index from a parameter name.
+
+    Returns ``None`` for parameters in non-LM-stack components
+    (:func:`is_non_lm_stack_tensor`) so their independent ``layers.N``
+    numbering doesn't collide with the language-model stack.
+    """
     import re
+
+    if is_non_lm_stack_tensor(name):
+        return None
 
     # Common patterns: layers.0., h.0., decoder.layers.0., etc.
     patterns = [
@@ -3360,6 +3450,28 @@ def resolve_ablation_for_tensor(
         "layer_type": layer_type,
         "skip": True,
     }
+
+    # Vision / audio encoders and Multi-Token Prediction heads live outside
+    # the LM residual stream that mediates refusal. Skip them unconditionally,
+    # before any shape / direction matching, since some of their projection
+    # layers (e.g. Qwen3-VL ``model.visual.merger.linear_fc2.weight`` at
+    # ``[hidden_size, 4*hidden_size]``) coincidentally share an axis with the
+    # LM hidden_size and would otherwise pass the shape-mismatch guard below
+    # and get silently mutated.
+    if is_non_lm_stack_tensor(name):
+        return _ResolvedAblationContext(**skip_kwargs, skip_reason="non-LM-stack tensor (vision/audio/mtp)")
+
+    # Embedding lookup (``embed_tokens.weight``) and output logit projection
+    # (``lm_head.weight``) sit at the residual-stream boundary. Neither admits
+    # a hidden-space orthogonal projection that's also consistent with their
+    # ``vocab_size`` axis, and the reference Arditi-et-al. methodology omits
+    # them. Skip explicitly so ``lm_head`` does not reach the kernel only to
+    # trip the ``"Direction shape ... doesn't match weight shape ..."``
+    # warning, and so ``embed_tokens`` (which previously matched the legacy
+    # input-axis fallback because ``get_layer_type_from_name`` returns
+    # ``None`` for it) is not silently mutated.
+    if is_residual_boundary_tensor(name):
+        return _ResolvedAblationContext(**skip_kwargs, skip_reason="residual-stream boundary (embed/lm_head)")
 
     if intervention_layers is not None and layer_idx is not None and layer_idx not in intervention_layers:
         return _ResolvedAblationContext(**skip_kwargs, skip_reason="not in intervention_layers")

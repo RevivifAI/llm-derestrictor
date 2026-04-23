@@ -5,6 +5,74 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-04-22
+
+### Added
+
+- Architecture support for the Qwen3.5 / Qwen3.6 fused-MoE family
+  (`Qwen/Qwen3.6-35B-A3B`, multimodal hybrid Mamba+attention, 256 routed
+  experts + 1 shared expert per layer). `qwen3_5_moe`, `qwen3_5_moe_text`,
+  `qwen3_omni_moe`, and `qwen3_omni_moe_text` are now registered in
+  `MOE_FAMILY_LAYOUT` with the verified-correct `eoi` layout
+  (`gate_up_proj` is `[E, 2*moe_intermediate, hidden]` and `down_proj`
+  is `[E, hidden, moe_intermediate]` per the transformers 5.5
+  `Qwen3_5MoeExperts` source). Without this entry the shape-only
+  fallback in `_resolve_expert_axes` mis-classifies `down_proj` as EIO
+  (because its `in` axis is smaller than `out`) and ablates the wrong
+  axis, silently corrupting the MLP.
+- `Qwen3_5MoeForConditionalGeneration` (and the omni variant) added to
+  `VL_ARCHITECTURES` so `load_model_and_tokenizer` routes through
+  `AutoModelForImageTextToText` instead of `AutoModelForCausalLM`.
+- `is_non_lm_stack_tensor` helper plus `_NON_LM_STACK_PREFIXES` table
+  in `derestrictor.core.abliterate`. Vision encoders (`model.visual.*`),
+  audio towers (`model.audio_tower.*`), and Multi-Token Prediction
+  heads (`mtp.*`) are now passed through `sharded_ablate` and the
+  in-memory dispatcher unchanged. Previously `mtp.layers.N.*` would
+  collide with the LM stack's `layers.N` numbering and re-use the
+  wrong refusal direction, and projections like
+  `model.visual.merger.linear_fc2.weight` (whose `[hidden, 4*hidden]`
+  shape coincidentally shares an axis with the LM `hidden_size`)
+  could pass the shape-mismatch guard and get silently mutated.
+- `tests/test_qwen3_5_moe_arch.py` pinning the new layer-name parsing,
+  non-LM-stack pass-through, fused-expert layout, and architecture
+  registry entries.
+
+### Fixed
+
+- `get_layer_index_from_name` no longer claims a layer index for
+  parameters in non-LM-decoder components. The previous unanchored
+  `layers\.(\d+)\.` regex would match `mtp.layers.0.mlp.experts.*` and
+  return `0`, causing the streaming pipeline to apply the LM layer-0
+  ablation to the parallel multi-token prediction stack.
+- `resolve_ablation_for_tensor` short-circuits on non-LM-stack tensors
+  before any shape / direction matching, so the shape-mismatch guard
+  can no longer be coincidentally bypassed by vision/audio projections
+  that share an axis with the language-model hidden_size.
+- `is_residual_boundary_tensor` helper plus early-skip in
+  `resolve_ablation_for_tensor` for `lm_head.weight` and
+  `embed_tokens.weight`. These sit at the residual-stream boundary
+  (vocab × hidden projections) and cannot receive a hidden-space
+  orthogonal projection that's also dimensionally consistent with
+  the `vocab_size` axis. Previously `lm_head.weight` reached the
+  ablation kernel only to trip the noisy `"Direction shape ...
+  doesn't match weight shape ..."` warning, and `embed_tokens.weight`
+  was silently mutated along its input axis via the legacy fallback
+  path. Aligns with Arditi et al. (2024) which only ablates the
+  per-layer W_in / W_out matrices inside the residual stream.
+- `flash-linear-attention` and `causal-conv1d` promoted from the
+  optional `kernels` extra to default `project.dependencies`.
+  Without them `transformers` falls back to a pure-PyTorch
+  linear-attention path on Qwen3.5/3.6-MoE (and other Mamba-style
+  hybrids) and logs `"The fast path is not available"`; since every
+  supported architecture that exercises this code path benefits from
+  the CUDA kernels, installing them unconditionally avoids the
+  slow-path warning and the silent slowdown. `causal-conv1d` is
+  pinned to a prebuilt wheel URL from the `v1.6.1.post4` GitHub
+  release to skip its source build, which hard-codes a 10-arch
+  gencode matrix that OOM-kills `nvcc` on hosts with <30 GB RAM.
+  `accelerate` and `causal-conv1d` direct-URL references require
+  `[tool.hatch.metadata] allow-direct-references = true`.
+
 ## [2.2.0] - 2026-04-22
 
 ### Added

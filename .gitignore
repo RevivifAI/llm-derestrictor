@@ -224,6 +224,7 @@ __marimo__/
 # Abliterate runtime artifacts
 abliterate/
 abliterated_models/
+outputs/
 eval_results/
 calibration_results.json
 
