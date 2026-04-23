@@ -690,6 +690,64 @@ def get_abliteration_config() -> dict | None:
                 style=custom_style,
             ).ask()
 
+    # Streaming + MoE infra (always offered; auto-detect handles small models).
+    # We surface these unconditionally because the user benefits from knowing
+    # the streaming/MoE pipeline exists even on small dense models — the
+    # ``auto`` defaults are safe.
+    _moe_detected = False
+    try:
+        from transformers import AutoConfig
+
+        from derestrictor.models.utils import is_moe_model
+
+        cfg_obj = AutoConfig.from_pretrained(config["model_path"], trust_remote_code=True)
+        _moe_detected = is_moe_model(cfg_obj)
+    except Exception:
+        _moe_detected = False
+
+    if _moe_detected:
+        console.print(
+            f"\n[{THEME['warning']}]Mixture-of-Experts architecture detected.[/{THEME['warning']}]\n"
+            f"[{THEME['muted']}]Fused expert tensors (Mixtral [E,O,I] / Qwen2.5-MoE / GPT-OSS [E,I,O]) "
+            f"will be ablated per-expert. Pick the layout if auto-detection looks wrong.[/{THEME['muted']}]"
+        )
+
+    config["streaming"] = questionary.select(
+        "Streaming pipeline (auto picks sharded when the model exceeds ~0.6x VRAM):",
+        choices=[
+            questionary.Choice("Auto (recommended)", value="auto"),
+            questionary.Choice("In-memory (small models, full VRAM load)", value="in_memory"),
+            questionary.Choice("Sharded (one shard at a time, frontier-scale)", value="sharded"),
+        ],
+        default="auto",
+        style=custom_style,
+    ).ask()
+
+    if _moe_detected:
+        config["moe_fused_layout"] = questionary.select(
+            "MoE fused-expert layout:",
+            choices=[
+                questionary.Choice("Auto (shape + family inference)", value="auto"),
+                questionary.Choice("EOI [experts, output, input] (Mixtral)", value="eoi"),
+                questionary.Choice("EIO [experts, input, output] (Qwen2.5-MoE / GPT-OSS)", value="eio"),
+            ],
+            default="auto",
+            style=custom_style,
+        ).ask()
+    else:
+        config["moe_fused_layout"] = "auto"
+
+    config["measurement_quant"] = questionary.select(
+        "Measurement-only quantization (final ablation always runs at full precision):",
+        choices=[
+            questionary.Choice("None (full precision)", value="none"),
+            questionary.Choice("4-bit bitsandbytes (NF4) - implies sharded", value="4bit"),
+            questionary.Choice("8-bit bitsandbytes - implies sharded", value="8bit"),
+        ],
+        default="none",
+        style=custom_style,
+    ).ask()
+
     return config
 
 
@@ -795,6 +853,10 @@ def run_abliteration(config: dict) -> bool:
                 kl_threshold=config.get("kl_threshold", 0.5),
                 kl_search_min=config.get("kl_search_min", 0.1),
                 kl_search_max=config.get("kl_search_max", 2.0),
+                # Streaming + MoE infra
+                streaming=config.get("streaming", "auto"),
+                moe_fused_layout=config.get("moe_fused_layout", "auto"),
+                measurement_quant=config.get("measurement_quant", "none"),
             )
 
             # Filter prompts if enabled

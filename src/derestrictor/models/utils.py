@@ -13,7 +13,10 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -246,11 +249,38 @@ def detect_model_type(model_path: str) -> dict:
     }
 
 
+def _build_bnb_quantization_config(quantization: Literal["none", "4bit", "8bit"], dtype: torch.dtype):
+    """Build a ``BitsAndBytesConfig`` for measurement-only quant loads.
+
+    Returns ``None`` when ``quantization == "none"`` or bitsandbytes is not
+    importable (caller falls back to the normal full-precision path and
+    logs a warning).
+    """
+    if quantization == "none":
+        return None
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError:
+        logger.warning("bitsandbytes / transformers BitsAndBytesConfig unavailable; falling back to full precision")
+        return None
+    if quantization == "4bit":
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    if quantization == "8bit":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    return None
+
+
 def load_model_and_tokenizer(
     model_path: str,
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
     trust_remote_code: bool = True,
+    quantization: Literal["none", "4bit", "8bit"] = "none",
 ) -> tuple[torch.nn.Module, AutoTokenizer]:
     """Load model and tokenizer, automatically handling VL models.
 
@@ -262,11 +292,23 @@ def load_model_and_tokenizer(
         device: Device to load model on ("cuda", "cpu", or "auto")
         dtype: Torch dtype for model weights
         trust_remote_code: Whether to trust remote code in model files
+        quantization: Optional bitsandbytes quant for the activation
+            measurement phase. ``"4bit"`` / ``"8bit"`` enable the
+            corresponding ``BitsAndBytesConfig`` load; ``"none"`` (default)
+            keeps the full-precision behavior. Final weight ablation should
+            still happen on the unquantized weights via the streaming
+            pipeline.
 
     Returns:
         Tuple of (model, tokenizer)
     """
     model_info = detect_model_type(model_path)
+    quant_config = _build_bnb_quantization_config(quantization, dtype)
+    if quant_config is not None:
+        logger.info(
+            f"Loading model with bitsandbytes {quantization} quantization "
+            "(measurement-only path; ablation should stream the original weights)"
+        )
 
     # Load tokenizer (same for both VL and text models for abliteration purposes)
     logger.info(f"Loading tokenizer from {model_path}...")
@@ -457,6 +499,8 @@ def load_model_and_tokenizer(
     else:
         logger.info("Loading model with AutoModelForCausalLM...")
         if is_fp8:
+            if quant_config is not None:
+                logger.warning("FP8 model + bitsandbytes quantization is not supported; ignoring quantization")
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=dtype,
@@ -467,12 +511,247 @@ def load_model_and_tokenizer(
                 logger.info(f"Moving FP8 model to {device}...")
                 model = model.to(device)
         else:
+            extra_kwargs = {}
+            if quant_config is not None:
+                extra_kwargs["quantization_config"] = quant_config
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=dtype,
                 device_map=device,
                 trust_remote_code=trust_remote_code,
+                **extra_kwargs,
             )
 
     logger.info(f"Model loaded: {type(model).__name__}")
     return model, tokenizer
+
+
+# MoE expert detection
+#
+# Mixtral, Qwen2.5-MoE, and GPT-OSS store expert weights as fused 3-D
+# ``nn.Parameter`` tensors instead of per-expert ``nn.Linear`` modules.
+# The default ``get_linear_layer_names`` walker silently skips them, so the
+# MoE MLPs go un-ablated. These helpers expose enough metadata for the
+# streaming + in-memory ablation paths to dispatch through
+# :func:`derestrictor.core.abliterate.apply_kernel_to_expert_tensor`.
+
+# Compiled patterns for fused MoE expert parameter names. Matches the three
+# common conventions in the wild.
+_MOE_FUSED_NAME_RE = re.compile(
+    r"(?:experts\.(?:gate_up_proj|down_proj|w1|w2|w3))"
+    r"|(?:block_sparse_moe\.experts\.(?:w1|w2|w3))"
+    r"|(?:mlp\.experts\.(?:weight|gate_up_proj|down_proj|w1|w2|w3))",
+)
+
+# Module-tree markers that almost always indicate a MoE block.
+_MOE_MODULE_MARKERS = ("block_sparse_moe", "mlp.experts", ".experts.")
+
+# Known model-family layout hints, consumed when ``moe_fused_layout="auto"``
+# can't disambiguate from shape alone (e.g. when both axes equal hidden_size).
+MOE_FAMILY_LAYOUT: dict[str, Literal["eoi", "eio"]] = {
+    "mixtral": "eoi",
+    "qwen2_moe": "eio",
+    "qwen3_moe": "eio",
+    "qwen3_vl_moe": "eio",
+    "qwen2_vl_moe": "eio",
+    "gpt_oss": "eio",
+    "gptoss": "eio",
+}
+
+
+@dataclass
+class ExpertTensorInfo:
+    """Metadata describing one fused MoE expert ``nn.Parameter``.
+
+    Attributes:
+        name: Full dotted parameter name (e.g.
+            ``"model.layers.5.block_sparse_moe.experts.w2"``).
+        shape: Tensor shape, ``(num_experts, dim0, dim1)``.
+        layout: ``"eoi"`` for ``[E, O, I]`` (Mixtral) or ``"eio"`` for
+            ``[E, I, O]`` (Qwen2.5-MoE / GPT-OSS). ``"per_expert_2d"`` is
+            reserved for cases where each expert is a separate 2-D weight
+            (the in-memory walker already covers that path; included here
+            so callers don't have to handle ``None``).
+        expert_dim: Axis carrying the expert index. Always 0 for fused
+            tensors.
+        output_axis: Axis (within a per-expert 2-D slice) that maps to the
+            output features of the underlying linear layer.
+        input_axis: Axis (within a per-expert 2-D slice) that maps to the
+            input features.
+        layer_type: One of the canonical role names returned by
+            :func:`derestrictor.core.abliterate.get_layer_type_from_name`
+            (``"w1"`` / ``"w2"`` / ``"w3"`` / ``"gate_up_proj"`` /
+            ``"down_proj"``). Drives kernel direction-space inference.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    layout: Literal["eoi", "eio", "per_expert_2d"]
+    expert_dim: int
+    output_axis: int
+    input_axis: int
+    layer_type: str | None = None
+
+
+def _moe_count_from_config(config_or_dict) -> int:
+    """Pull a likely expert count from a HF config or its dict.
+
+    Returns 0 when no MoE-style field is present.
+    """
+    if config_or_dict is None:
+        return 0
+    fields = ("num_local_experts", "num_experts", "moe_num_experts", "n_routed_experts")
+    if isinstance(config_or_dict, dict):
+        for f in fields:
+            v = config_or_dict.get(f, 0) or 0
+            if int(v) > 0:
+                return int(v)
+        text_cfg = config_or_dict.get("text_config")
+        if isinstance(text_cfg, dict):
+            return _moe_count_from_config(text_cfg)
+        return 0
+    for f in fields:
+        v = getattr(config_or_dict, f, 0) or 0
+        if int(v) > 0:
+            return int(v)
+    text_cfg = getattr(config_or_dict, "text_config", None)
+    if text_cfg is not None and text_cfg is not config_or_dict:
+        return _moe_count_from_config(text_cfg)
+    return 0
+
+
+def is_moe_model(model_or_config) -> bool:
+    """Return True when the model (or config) declares MoE expert blocks.
+
+    Detection order:
+
+    1. ``num_local_experts`` / ``num_experts`` / ``moe_num_experts`` /
+       ``n_routed_experts`` on the config (or nested ``text_config``).
+    2. Module-tree walk for names matching ``block_sparse_moe``,
+       ``mlp.experts``, or ``.experts.<digit>``.
+
+    Args:
+        model_or_config: Either a ``transformers`` model instance or a
+            config object (or dict).
+
+    Returns:
+        True if the architecture has fused expert blocks.
+    """
+    cfg = getattr(model_or_config, "config", model_or_config)
+    if _moe_count_from_config(cfg) > 0:
+        return True
+
+    if isinstance(model_or_config, torch.nn.Module):
+        expert_idx_re = re.compile(r"\.experts\.\d+")
+        for name, _ in model_or_config.named_modules():
+            if any(marker in name for marker in _MOE_MODULE_MARKERS):
+                return True
+            if expert_idx_re.search(name):
+                return True
+
+    return False
+
+
+def _expert_layer_type(name: str) -> str | None:
+    """Resolve a fused expert parameter name to a canonical layer type.
+
+    Matches the role names returned by
+    :func:`derestrictor.core.abliterate.get_layer_type_from_name`.
+    """
+    name_l = name.lower()
+    for role in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+        if role in name_l:
+            return role
+    if "experts.weight" in name_l:
+        return None
+    return None
+
+
+def _resolve_expert_axes(
+    role: str | None,
+    shape: tuple[int, ...],
+    family_hint: Literal["eoi", "eio"] | None = None,
+) -> tuple[Literal["eoi", "eio"], int, int]:
+    """Pick ``(layout, output_axis, input_axis)`` for a fused expert tensor.
+
+    Conventions:
+
+    * Mixtral (``eoi``): ``[num_experts, out_features, in_features]``,
+      output_axis = 1, input_axis = 2.
+    * Qwen2.5-MoE / GPT-OSS (``eio``): ``[num_experts, in_features,
+      out_features]``, output_axis = 2, input_axis = 1.
+
+    For ``down_proj`` / ``w2`` (output-space), the axis equal to
+    ``hidden_size`` is the output axis. ``family_hint`` is consulted only
+    when shape inspection is ambiguous (both candidate axes equal).
+    """
+    if len(shape) != 3:
+        return ("eoi", 1, 2)
+    _, d0, d1 = shape
+    if family_hint:
+        if family_hint == "eoi":
+            return ("eoi", 1, 2)
+        return ("eio", 2, 1)
+
+    if role in ("down_proj", "w2"):
+        if d0 < d1:
+            return ("eoi", 1, 2)
+        if d1 < d0:
+            return ("eio", 2, 1)
+        return ("eoi", 1, 2)
+
+    if role in ("gate_up_proj",):
+        if d0 < d1:
+            return ("eoi", 1, 2)
+        if d1 < d0:
+            return ("eio", 2, 1)
+        return ("eio", 2, 1)
+
+    if d0 < d1:
+        return ("eio", 2, 1)
+    if d1 < d0:
+        return ("eoi", 1, 2)
+    return ("eoi", 1, 2)
+
+
+def iter_expert_tensors(
+    model: torch.nn.Module,
+    family_hint: Literal["eoi", "eio"] | None = None,
+) -> Iterator[ExpertTensorInfo]:
+    """Yield :class:`ExpertTensorInfo` for every fused MoE expert parameter.
+
+    Walks ``model.named_parameters()`` and matches against the fused-name
+    regex. Only 3-D parameters are returned; per-expert 2-D weights are
+    already handled by the standard linear-layer walker and are skipped
+    here to avoid double-counting.
+
+    Args:
+        model: The transformers model to scan.
+        family_hint: Optional ``"eoi"`` / ``"eio"`` override. When ``None``,
+            the family hint is derived from ``model.config.model_type``
+            via :data:`MOE_FAMILY_LAYOUT` (when present).
+
+    Yields:
+        One :class:`ExpertTensorInfo` per fused expert parameter found.
+    """
+    if family_hint is None:
+        cfg = getattr(model, "config", None)
+        model_type = (getattr(cfg, "model_type", "") or "").lower()
+        family_hint = MOE_FAMILY_LAYOUT.get(model_type)
+
+    for name, param in model.named_parameters():
+        if not _MOE_FUSED_NAME_RE.search(name):
+            continue
+        if param.ndim != 3:
+            continue
+        role = _expert_layer_type(name)
+        layout, output_axis, input_axis = _resolve_expert_axes(role, tuple(param.shape), family_hint=family_hint)
+        yield ExpertTensorInfo(
+            name=name,
+            shape=tuple(param.shape),
+            layout=layout,
+            expert_dim=0,
+            output_axis=output_axis,
+            input_axis=input_axis,
+            layer_type=role,
+        )

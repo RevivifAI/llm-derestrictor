@@ -5,9 +5,10 @@ import json
 import logging
 import random
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -178,6 +179,37 @@ def _needs_manual_save(model) -> bool:
     return "mistral3" in str(model_type).lower()
 
 
+def write_safetensors_index(
+    output_dir: Path,
+    weight_map: dict[str, str],
+    metadata: dict | None = None,
+) -> Path:
+    """Write a ``model.safetensors.index.json`` describing a sharded checkpoint.
+
+    Centralizes the index-construction logic that both the in-memory
+    :func:`_save_model_manual` and the streaming :mod:`sharded_ablate`
+    pipeline need to emit. The output schema matches what HuggingFace
+    ``transformers`` expects: ``{"metadata": {...}, "weight_map": {tensor:
+    shard_filename}}``.
+
+    Args:
+        output_dir: Directory in which to write ``model.safetensors.index.json``.
+        weight_map: Mapping of tensor name to shard filename (e.g.
+            ``"model-00001-of-00003.safetensors"``).
+        metadata: Optional metadata block. ``total_size`` is the only field
+            transformers reads; pass ``{"total_size": int}`` to record the
+            total byte count of the sharded weights.
+
+    Returns:
+        Path to the written index file.
+    """
+    index_path = Path(output_dir) / "model.safetensors.index.json"
+    index = {"metadata": metadata or {}, "weight_map": dict(weight_map)}
+    with index_path.open("w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2)
+    return index_path
+
+
 def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.dtype = torch.float16) -> None:
     """Manually save model using safetensors, bypassing transformers' weight conversion.
 
@@ -289,10 +321,7 @@ def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.
                     if v == f"model-{i:05d}-of-XXXXX.safetensors":
                         weight_map[k] = f"model-{i:05d}-of-{total_shards:05d}.safetensors"
 
-        # Save index file
-        index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
-        with (output_path / "model.safetensors.index.json").open("w", encoding="utf-8") as f:
-            json.dump(index, f, indent=2)
+        write_safetensors_index(output_path, weight_map, metadata={"total_size": total_size})
     else:
         # Single file save
         save_file(state_dict, output_path / "model.safetensors")
@@ -961,6 +990,33 @@ class AbliterationConfig:
     kl_search_max: float = 2.0
     kl_search_tolerance: float = 0.01
     kl_max_search_iterations: int = 15
+
+    # Streaming / sharded ablation pipeline
+    #
+    # ``streaming`` selects the ablation pipeline:
+    #   - ``"in_memory"`` — load the full model, mutate weights in place,
+    #     then ``save_pretrained``. Default for small/mid models.
+    #   - ``"sharded"`` — stream one safetensors shard at a time from
+    #     ``model_path`` to ``output_path`` via
+    #     :func:`derestrictor.core.sharded_ablate.sharded_ablate`. Memory
+    #     cap is one shard + scratch, which is the only way frontier-scale
+    #     MoE models fit on a consumer GPU.
+    #   - ``"auto"`` (default) — pick ``"sharded"`` when on-disk model size
+    #     exceeds 0.6x available GPU RAM (or 0.4x system RAM if CPU-only),
+    #     otherwise ``"in_memory"``.
+    streaming: Literal["auto", "in_memory", "sharded"] = "auto"
+
+    # Layout for fused 3-D MoE expert tensors. ``"auto"`` infers from the
+    # output-axis-equals-hidden-size heuristic; ``"eoi"`` forces Mixtral
+    # ``[E, O, I]`` and ``"eio"`` forces Qwen2.5-MoE / GPT-OSS ``[E, I, O]``.
+    moe_fused_layout: Literal["auto", "eoi", "eio"] = "auto"
+
+    # Measurement-phase quantization. ``"none"`` keeps the loaded dtype.
+    # ``"4bit"`` / ``"8bit"`` route through ``bitsandbytes`` (must be
+    # installed) so direction extraction can run on a much smaller VRAM
+    # footprint while the streaming ablation phase still sees full-precision
+    # weights via the on-disk shards.
+    measurement_quant: Literal["none", "4bit", "8bit"] = "none"
 
 
 @dataclass
@@ -2884,6 +2940,159 @@ def apply_directional_scaling(
 # Model Abliteration
 
 
+def select_ablation_kernel(config: "AbliterationConfig") -> str:
+    """Resolve ``config.ablation_kernel`` to a concrete kernel name.
+
+    Falls through to the legacy ``use_per_neuron_norm`` /
+    ``norm_preservation`` boolean dispatch when ``ablation_kernel`` is
+    ``None`` (preserves backward compatibility).
+    """
+    if config.ablation_kernel:
+        return config.ablation_kernel
+    if config.use_per_neuron_norm:
+        return "per_neuron"
+    return "frobenius"
+
+
+def dispatch_2d_kernel(
+    weight: torch.Tensor,
+    direction: torch.Tensor,
+    *,
+    kernel: str,
+    multiplier: float,
+    config: "AbliterationConfig",
+    direction_space: str | None = None,
+    harmless_dir: torch.Tensor | None = None,
+    null_space_V: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one of the four 2-D ablation kernels with a uniform signature.
+
+    Centralizes the kernel switch so both the in-memory loop in
+    :func:`abliterate_model` and the streaming loop in
+    :mod:`derestrictor.core.sharded_ablate` go through the same dispatch.
+
+    Args:
+        weight: ``[out_features, in_features]`` weight tensor.
+        direction: Refusal direction.
+        kernel: One of ``"per_neuron"``, ``"frobenius"``, ``"householder"``,
+            ``"directional"``.
+        multiplier: Effective scale factor (already includes
+            ``invert_ablation`` sign flip and per-layer weighting).
+        config: Active :class:`AbliterationConfig` (read for clamp ratios,
+            ``norm_preservation``, etc.).
+        direction_space: ``"input"`` / ``"output"`` override forwarded to
+            the kernel.
+        harmless_dir: Optional harmless direction for boundary clamping
+            (``per_neuron`` only).
+        null_space_V: Optional null-space basis (``per_neuron`` /
+            ``frobenius`` paths).
+
+    Returns:
+        Modified weight tensor.
+    """
+    if kernel == "householder":
+        return apply_householder_rotation(
+            weight,
+            direction,
+            tgt_dir=None,
+            scale_factor=multiplier,
+            direction_space=direction_space,
+        )
+    if kernel == "directional":
+        return apply_directional_scaling(
+            weight,
+            direction,
+            scale_factor=multiplier,
+            direction_space=direction_space,
+        )
+    if kernel == "per_neuron":
+        return apply_per_neuron_norm_preserving_projection(
+            weight,
+            direction,
+            scale_factor=multiplier,
+            harmless_dir=harmless_dir,
+            clamp_ratio=config.harmless_clamp_ratio,
+            null_space_V=null_space_V,
+            direction_space=direction_space,
+        )
+    if null_space_V is not None:
+        from derestrictor.core.null_space import apply_null_space_constrained_projection
+
+        return apply_null_space_constrained_projection(
+            weight,
+            direction,
+            null_space_V=null_space_V,
+            preserve_norm=config.norm_preservation,
+            multiplier=multiplier,
+        )
+    return apply_norm_preserving_projection(
+        weight,
+        direction,
+        preserve_norm=config.norm_preservation,
+        multiplier=multiplier,
+        direction_space=direction_space,
+    )
+
+
+def apply_kernel_to_expert_tensor(
+    weight_3d: torch.Tensor,
+    direction: torch.Tensor,
+    kernel_fn: Callable[..., torch.Tensor],
+    layout: Literal["eoi", "eio"],
+    *,
+    expert_dim: int = 0,
+    direction_space: str | None = None,
+    **kernel_kwargs,
+) -> torch.Tensor:
+    """Apply a 2-D ablation kernel to every expert in a fused MoE 3-D weight.
+
+    Mixtral stores experts as ``[num_experts, out_features, in_features]``
+    (``"eoi"``); Qwen2.5-MoE and GPT-OSS use ``[num_experts, in_features,
+    out_features]`` (``"eio"``). The 2-D kernels in this module operate on
+    PyTorch's ``[out_features, in_features]`` convention, so the ``"eio"``
+    layout requires a per-slice transpose before and after the kernel call.
+
+    Args:
+        weight_3d: Fused expert weight, ``[E, dim0, dim1]``.
+        direction: Refusal direction. Length must match either the
+            output-axis or input-axis of the underlying linear layer.
+        kernel_fn: One of :func:`apply_norm_preserving_projection`,
+            :func:`apply_per_neuron_norm_preserving_projection`,
+            :func:`apply_householder_rotation`, or
+            :func:`apply_directional_scaling`. Must accept ``(weight,
+            direction, ...)`` as its first two positional args and a
+            ``direction_space`` kwarg.
+        layout: ``"eoi"`` for ``[E, O, I]`` or ``"eio"`` for ``[E, I, O]``.
+        expert_dim: Axis carrying the expert index. Defaults to 0 (the
+            only convention currently observed in the wild).
+        direction_space: Forwarded to ``kernel_fn``.
+        **kernel_kwargs: Additional kwargs forwarded to ``kernel_fn``.
+
+    Returns:
+        New 3-D tensor, same shape and dtype as ``weight_3d``.
+    """
+    if expert_dim != 0:
+        raise NotImplementedError(f"Only expert_dim=0 is supported (got {expert_dim})")
+    if weight_3d.ndim != 3:
+        raise ValueError(f"Expected 3-D fused expert tensor, got shape {tuple(weight_3d.shape)}")
+    if layout not in ("eoi", "eio"):
+        raise ValueError(f"Unknown MoE fused layout {layout!r}; expected 'eoi' or 'eio'")
+
+    out = weight_3d.clone()
+    num_experts = weight_3d.shape[0]
+    for e in range(num_experts):
+        slab = weight_3d[e]
+        if layout == "eio":
+            # ``[I, O]`` -> ``[O, I]`` for the kernel, transpose back after.
+            slab2d = slab.transpose(0, 1).contiguous()
+            modified = kernel_fn(slab2d, direction, direction_space=direction_space, **kernel_kwargs)
+            out[e] = modified.transpose(0, 1).contiguous()
+        else:
+            modified = kernel_fn(slab, direction, direction_space=direction_space, **kernel_kwargs)
+            out[e] = modified
+    return out
+
+
 def _get_language_model_root(model: AutoModelForCausalLM) -> tuple[torch.nn.Module, str]:
     """Find the language model root module for VL and standard architectures.
 
@@ -2992,14 +3201,30 @@ def get_layer_type_from_name(name: str) -> str | None:
         - down_proj: MLP output projection
         - lm_head: final output projection
 
+    Also recognizes fused MoE expert parameter names:
+        - ``mlp.experts.gate_up_proj`` / ``experts.gate_up_proj``
+          (Qwen2.5-MoE / GPT-OSS): returned as ``"gate_up_proj"``.
+        - ``experts.down_proj`` (Qwen2.5-MoE / GPT-OSS): returned as
+          ``"down_proj"``.
+        - ``block_sparse_moe.experts.w1|w2|w3`` (Mixtral): returned as
+          ``"w1"`` / ``"w2"`` / ``"w3"``.
+
+    These names map to the same canonical layer-type strings the 2-D path
+    uses so the kernel-dispatch and direction-role logic is unchanged.
+
     Args:
         name: Full parameter name like 'model.layers.10.self_attn.o_proj.weight'
 
     Returns:
         Layer type string or None if not recognized
     """
-    # Common layer type patterns (order matters - check more specific first)
+    # Common layer type patterns (order matters - check more specific first).
+    # ``gate_up_proj`` precedes ``up_proj``/``gate_proj`` so the fused
+    # Qwen2.5-MoE / GPT-OSS fused name doesn't get split on the wrong
+    # substring; ``qkv_proj`` precedes ``q_proj`` for the same reason.
     layer_types = [
+        "gate_up_proj",  # Fused Qwen2.5-MoE / GPT-OSS expert input projection
+        "qkv_proj",  # Alternative naming (must precede q/k/v_proj)
         "q_proj",
         "k_proj",
         "v_proj",
@@ -3007,7 +3232,6 @@ def get_layer_type_from_name(name: str) -> str | None:
         "gate_proj",
         "up_proj",
         "down_proj",  # MLP
-        "qkv_proj",
         "out_proj",  # Alternative naming
         "in_proj_a",
         "in_proj_b",  # Hybrid linear attention (Qwen3.5 SSM)
@@ -3060,6 +3284,182 @@ def filter_layers_by_type(
     logger.info(f"Filtered {len(linear_names)} layers to {len(filtered)} targeting {target_types}")
 
     return filtered
+
+
+@dataclass
+class _ResolvedAblationContext:
+    """Per-tensor ablation parameters resolved by :func:`resolve_ablation_for_tensor`.
+
+    Fields capture every input the kernel dispatch needs so the caller can
+    run either the in-memory or streaming path without re-resolving the
+    biprojection / per-layer / hybrid dispatch.
+    """
+
+    direction: torch.Tensor
+    kernel: str
+    multiplier: float
+    direction_space: str | None
+    harmless_dir: torch.Tensor | None
+    null_space_V: torch.Tensor | None  # noqa: N815  matches the existing dispatch_2d_kernel kwarg / SVD V convention
+    layer_idx: int | None
+    layer_type: str | None
+    skip: bool = False
+    skip_reason: str = ""
+
+
+def resolve_ablation_for_tensor(
+    name: str,
+    weight_shape: tuple[int, ...] | torch.Size,
+    *,
+    directions: RefusalDirections,
+    config: AbliterationConfig,
+    null_space_projector: Optional["NullSpaceProjector"] = None,
+    primary_direction: torch.Tensor | None = None,
+    biprojection_layer_map: dict[int, int] | None = None,
+    intervention_layers: set[int] | None = None,
+    layer_weights: dict[int, float] | None = None,
+    hybrid_info: "HybridArchitectureInfo | None" = None,
+) -> _ResolvedAblationContext:
+    """Resolve direction, kernel, and multiplier for one named weight tensor.
+
+    Centralizes the per-layer dispatch logic so both the in-memory loop
+    and the streaming :mod:`sharded_ablate` path share the exact same
+    biprojection / per-layer / hybrid-aware policy.
+
+    Args:
+        name: Full parameter name.
+        weight_shape: Tensor shape. For fused MoE expert tensors this is
+            still the 2-D per-expert slice the caller will hand to the
+            kernel (the MoE wrapper handles the per-expert loop).
+        directions: Computed refusal directions.
+        config: Active abliteration config.
+        null_space_projector: Optional null-space projector.
+        primary_direction: Resolved global direction (mean / collapsed
+            biprojection), or ``None`` if per-layer.
+        biprojection_layer_map: Per-L → M mapping (empty for non-bi mode).
+        intervention_layers: Restricted set of layer indices to ablate
+            (``None`` means no restriction).
+        layer_weights: Per-layer multiplier overrides.
+        hybrid_info: Hybrid architecture metadata.
+
+    Returns:
+        :class:`_ResolvedAblationContext` with ``skip=True`` when the
+        tensor should be left untouched.
+    """
+    layer_idx = get_layer_index_from_name(name)
+    layer_type = get_layer_type_from_name(name)
+
+    skip_kwargs: dict = {
+        "direction": torch.zeros(0),
+        "kernel": "frobenius",
+        "multiplier": 0.0,
+        "direction_space": None,
+        "harmless_dir": None,
+        "null_space_V": None,
+        "layer_idx": layer_idx,
+        "layer_type": layer_type,
+        "skip": True,
+    }
+
+    if intervention_layers is not None and layer_idx is not None and layer_idx not in intervention_layers:
+        return _ResolvedAblationContext(**skip_kwargs, skip_reason="not in intervention_layers")
+    if config.target_layers is not None and layer_idx is not None and layer_idx not in config.target_layers:
+        return _ResolvedAblationContext(**skip_kwargs, skip_reason="not in target_layers")
+    if config.exclude_layers and layer_idx is not None and layer_idx in config.exclude_layers:
+        return _ResolvedAblationContext(**skip_kwargs, skip_reason="excluded by target map")
+
+    if hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto":
+        if config.hybrid_skip_recurrent_proj and layer_type in ("in_proj_a", "in_proj_b"):
+            return _ResolvedAblationContext(**skip_kwargs, skip_reason="hybrid recurrent proj")
+        if config.hybrid_skip_state_proj and layer_type in ("in_proj_qkv", "in_proj_z"):
+            return _ResolvedAblationContext(**skip_kwargs, skip_reason="hybrid state proj")
+
+    direction = None
+    if (
+        biprojection_layer_map
+        and layer_idx is not None
+        and layer_idx in biprojection_layer_map
+        and directions.harmless_directions
+    ):
+        source_M = biprojection_layer_map[layer_idx]
+        r_M = directions.directions.get(source_M)
+        h_L = directions.harmless_directions.get(layer_idx)
+        if r_M is not None and h_L is not None:
+            r_bi = compute_biprojected_direction(
+                r_M.to(config.device),
+                h_L.to(config.device),
+                two_pass=getattr(config, "two_pass_orthogonalization", True),
+            )
+            direction = r_bi.to(config.dtype)
+    if direction is None:
+        if primary_direction is not None:
+            direction = primary_direction
+        elif layer_idx is not None and layer_idx in directions.directions:
+            direction = directions.directions[layer_idx].to(config.device)
+        elif directions.mean_direction is not None:
+            direction = directions.mean_direction.to(config.device)
+        else:
+            return _ResolvedAblationContext(**skip_kwargs, skip_reason="no direction available")
+
+    if direction.shape[0] not in weight_shape:
+        return _ResolvedAblationContext(**skip_kwargs, skip_reason="shape mismatch")
+
+    harmless_dir = None
+    if config.use_harmless_boundary and directions.harmless_directions:
+        harmless_dir = directions.harmless_directions.get(layer_idx)
+        if harmless_dir is not None:
+            harmless_dir = harmless_dir.to(config.device)
+
+    effective_multiplier = config.direction_multiplier
+    use_target_map = config.per_layer_multipliers is not None
+    if layer_weights is not None and layer_idx is not None:
+        if use_target_map:
+            if layer_idx in layer_weights:
+                layer_weight = layer_weights[layer_idx]
+            elif config.unmapped_layer_behavior == "default":
+                layer_weight = config.unmapped_layer_multiplier
+            else:
+                layer_weight = 0.0
+        else:
+            layer_weight = layer_weights.get(layer_idx, 1.0)
+        effective_multiplier = config.direction_multiplier * layer_weight
+        if effective_multiplier == 0.0:
+            return _ResolvedAblationContext(**skip_kwargs, skip_reason="zero effective multiplier")
+
+    if hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto" and layer_idx is not None:
+        if layer_idx in hybrid_info.full_attention_indices:
+            effective_multiplier *= config.hybrid_full_attn_weight
+        elif layer_idx in hybrid_info.linear_attention_indices:
+            effective_multiplier *= config.hybrid_linear_attn_weight
+
+    direction_space = infer_direction_space(name)
+
+    sparsity = config.direction_sparsity
+    if config.per_layer_sparsity and layer_idx is not None and layer_idx in config.per_layer_sparsity:
+        sparsity = config.per_layer_sparsity[layer_idx]
+    if 0.0 < sparsity < 1.0:
+        direction = magnitude_sparsify(direction, sparsity)
+        if config.normalize_directions:
+            direction = F.normalize(direction.float(), dim=0).to(config.dtype)
+
+    kernel_multiplier = -effective_multiplier if config.invert_ablation else effective_multiplier
+    kernel = select_ablation_kernel(config)
+
+    null_V = None
+    if null_space_projector is not None:
+        null_V = null_space_projector.get_projector_for_layer(layer_idx)
+
+    return _ResolvedAblationContext(
+        direction=direction,
+        kernel=kernel,
+        multiplier=kernel_multiplier,
+        direction_space=direction_space,
+        harmless_dir=harmless_dir,
+        null_space_V=null_V,
+        layer_idx=layer_idx,
+        layer_type=layer_type,
+        skip=False,
+    )
 
 
 def abliterate_model(
@@ -3335,65 +3735,23 @@ def abliterate_model(
         # ``1.0`` = full removal, ``0.0`` = identity, ``-1.0`` = amplification.
         kernel_multiplier = -effective_multiplier if config.invert_ablation else effective_multiplier
 
-        # Resolve the kernel selector. ``ablation_kernel`` is authoritative
-        # when set; otherwise fall through to the legacy boolean dispatch
-        # so existing configs and the null-space combined path keep working.
-        if config.ablation_kernel:
-            kernel = config.ablation_kernel
-        elif config.use_per_neuron_norm:
-            kernel = "per_neuron"
-        else:
-            kernel = "frobenius"
+        kernel = select_ablation_kernel(config)
+
+        null_V = None
+        if null_space_projector is not None:
+            null_V = null_space_projector.get_projector_for_layer(layer_idx)
 
         try:
-            if kernel == "householder":
-                new_weight = apply_householder_rotation(
-                    weight,
-                    direction,
-                    tgt_dir=None,
-                    scale_factor=kernel_multiplier,
-                    direction_space=direction_space,
-                )
-            elif kernel == "directional":
-                new_weight = apply_directional_scaling(
-                    weight,
-                    direction,
-                    scale_factor=kernel_multiplier,
-                    direction_space=direction_space,
-                )
-            elif kernel == "per_neuron":
-                null_V = None
-                if null_space_projector is not None:
-                    null_V = null_space_projector.get_projector_for_layer(layer_idx)
-
-                new_weight = apply_per_neuron_norm_preserving_projection(
-                    weight,
-                    direction,
-                    scale_factor=kernel_multiplier,
-                    harmless_dir=harmless_dir,
-                    clamp_ratio=config.harmless_clamp_ratio,
-                    null_space_V=null_V,
-                    direction_space=direction_space,
-                )
-            elif null_space_projector is not None:
-                from derestrictor.core.null_space import apply_null_space_constrained_projection
-
-                null_V = null_space_projector.get_projector_for_layer(layer_idx)
-                new_weight = apply_null_space_constrained_projection(
-                    weight,
-                    direction,
-                    null_space_V=null_V,
-                    preserve_norm=config.norm_preservation,
-                    multiplier=kernel_multiplier,
-                )
-            else:
-                new_weight = apply_norm_preserving_projection(
-                    weight,
-                    direction,
-                    preserve_norm=config.norm_preservation,
-                    multiplier=kernel_multiplier,
-                    direction_space=direction_space,
-                )
+            new_weight = dispatch_2d_kernel(
+                weight,
+                direction,
+                kernel=kernel,
+                multiplier=kernel_multiplier,
+                config=config,
+                direction_space=direction_space,
+                harmless_dir=harmless_dir,
+                null_space_V=null_V,
+            )
 
             module.weight.data = new_weight
             modified_count += 1
@@ -3401,6 +3759,85 @@ def abliterate_model(
         except Exception as e:
             logger.warning(f"Failed to abliterate {name}: {e}")
             skipped_count += 1
+
+    # Fused MoE expert tensors (Mixtral, Qwen2.5-MoE, GPT-OSS). The standard
+    # ``nn.Linear`` walker above silently skips these since the experts are
+    # stored as a single 3-D ``nn.Parameter`` per layer. Walking them here
+    # plugs the correctness gap.
+    from derestrictor.models.utils import is_moe_model, iter_expert_tensors
+
+    moe_modified = 0
+    moe_skipped = 0
+    if is_moe_model(model):
+        family_hint = config.moe_fused_layout if config.moe_fused_layout in ("eoi", "eio") else None
+        expert_infos = list(iter_expert_tensors(model, family_hint=family_hint))
+        if expert_infos:
+            logger.info(f"Found {len(expert_infos)} fused MoE expert tensors")
+        for info in tqdm(expert_infos, desc="Abliterating MoE experts"):
+            parts = info.name.split(".")
+            owner = model
+            for part in parts[:-1]:
+                owner = getattr(owner, part)
+            param_name = parts[-1]
+            param = getattr(owner, param_name)
+            if config.target_layer_types and (
+                info.layer_type is None or info.layer_type.lower() not in [t.lower() for t in config.target_layer_types]
+            ):
+                moe_skipped += 1
+                continue
+            per_expert_shape = (param.shape[info.output_axis], param.shape[info.input_axis])
+            ctx = resolve_ablation_for_tensor(
+                info.name,
+                per_expert_shape,
+                directions=directions,
+                config=config,
+                null_space_projector=null_space_projector,
+                primary_direction=primary_direction,
+                biprojection_layer_map=biprojection_layer_map,
+                intervention_layers=intervention_layers,
+                layer_weights=layer_weights,
+                hybrid_info=hybrid_info,
+            )
+            if ctx.skip:
+                moe_skipped += 1
+                continue
+            try:
+
+                def kernel_call(
+                    weight_2d: torch.Tensor,
+                    direction_2d: torch.Tensor,
+                    *,
+                    direction_space: str | None = None,
+                    _ctx=ctx,
+                ) -> torch.Tensor:
+                    return dispatch_2d_kernel(
+                        weight_2d,
+                        direction_2d,
+                        kernel=_ctx.kernel,
+                        multiplier=_ctx.multiplier,
+                        config=config,
+                        direction_space=direction_space,
+                        harmless_dir=_ctx.harmless_dir,
+                        null_space_V=_ctx.null_space_V,
+                    )
+
+                new_param = apply_kernel_to_expert_tensor(
+                    param.data,
+                    ctx.direction,
+                    kernel_fn=kernel_call,
+                    layout=info.layout if info.layout != "per_expert_2d" else "eoi",
+                    expert_dim=info.expert_dim,
+                    direction_space=ctx.direction_space,
+                )
+                with torch.no_grad():
+                    param.data = new_param
+                moe_modified += 1
+            except Exception as e:
+                logger.warning(f"Failed to abliterate MoE expert {info.name}: {e}")
+                moe_skipped += 1
+
+    if moe_modified or moe_skipped:
+        logger.info(f"MoE experts: modified {moe_modified}, skipped {moe_skipped}")
 
     logger.info(f"Modified {modified_count} layers, skipped {skipped_count} layers")
 
@@ -3638,13 +4075,22 @@ def run_abliteration(config: AbliterationConfig):
     logger.info(f"Features: {', '.join(features)}")
     logger.info("=" * 60)
 
-    # Load model and tokenizer first (needed for refusal filtering)
-    logger.info(f"Loading model from {config.model_path}...")
+    # Load model and tokenizer first (needed for refusal filtering).
+    # When ``measurement_quant`` is set, the activation-extraction phase
+    # gets a bitsandbytes-quantized copy of the model (much smaller VRAM
+    # footprint); the streaming ablation pipeline below later operates on
+    # the unquantized shards on disk.
+    logger.info(
+        f"Loading model from {config.model_path}"
+        + (f" (measurement quant: {config.measurement_quant})" if config.measurement_quant != "none" else "")
+        + "..."
+    )
     model, tokenizer = load_model_and_tokenizer(
         config.model_path,
         device=config.device,
         dtype=config.dtype,
         trust_remote_code=True,
+        quantization=config.measurement_quant,
     )
 
     # Load prompts from the RevivifAI/derestriction dataset.
@@ -3757,6 +4203,28 @@ def run_abliteration(config: AbliterationConfig):
         kl_monitor = KLDivergenceMonitor(model, tokenizer, kl_mon_config, config.device)
         kl_monitor.cache_reference_logits(kl_reference_prompts)
 
+    # Resolve streaming mode early so we can pick the right pipeline.
+    from derestrictor.core.sharded_ablate import sharded_ablate, should_use_streaming
+
+    use_streaming = False
+    streaming_mode_used = "in_memory"
+    if not config.use_kl_auto_tune:
+        use_streaming = should_use_streaming(Path(config.model_path), config)
+        # If measurement was done on a quantized copy, the in-memory weights
+        # aren't usable for ablation — the only correct path is to release
+        # the quantized model and stream-ablate the original shards on disk.
+        if config.measurement_quant != "none" and not use_streaming:
+            logger.info(
+                f"measurement_quant={config.measurement_quant} forces sharded streaming "
+                "(quantized in-memory weights cannot be ablated directly)"
+            )
+            use_streaming = True
+        streaming_mode_used = "sharded" if use_streaming else "in_memory"
+        if config.streaming == "auto":
+            logger.info(f"Streaming auto-detect picked: {streaming_mode_used}")
+        else:
+            logger.info(f"Streaming mode (configured): {streaming_mode_used}")
+
     # Apply abliteration (or auto-tune)
     if config.use_kl_auto_tune and kl_monitor is not None:
         logger.info("Starting KL auto-tune binary search...")
@@ -3774,27 +4242,80 @@ def run_abliteration(config: AbliterationConfig):
             f"Auto-tune complete: best_multiplier={auto_tune_result.best_multiplier:.4f}, "
             f"KL={auto_tune_result.best_kl:.4f}, converged={auto_tune_result.converged}"
         )
+    elif use_streaming:
+        # Streaming pipeline: release the in-memory model BEFORE touching
+        # shards so VRAM goes back to the kernel for the read-modify-write
+        # loop. The output is written directly to the (versioned) output
+        # path; the in-memory ``save_model_safe`` block below short-circuits.
+        output_path = get_versioned_path(config.output_path)
+        if output_path != Path(config.output_path):
+            logger.info(f"Output path exists, using versioned path: {output_path}")
+        output_path.mkdir(parents=True, exist_ok=True)
+        directions.metadata["streaming_mode"] = "sharded"
+
+        logger.info("Releasing in-memory model before streaming ablation...")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+        model = None  # type: ignore[assignment]
+
+        logger.info("Streaming sharded ablation...")
+        sharded_ablate(
+            input_dir=Path(config.model_path),
+            output_dir=output_path,
+            directions=directions,
+            config=config,
+            null_space_projector=null_space_projector,
+        )
+
+        # Tell the in-memory save block below to skip; the streaming path
+        # has already written everything we need.
+        config._streamed_output_path = output_path  # type: ignore[attr-defined]
     else:
+        directions.metadata["streaming_mode"] = "in_memory"
         model = abliterate_model(model, directions, config, null_space_projector)
 
-    # KL monitoring (post-abliteration measurement for monitor-only mode)
-    if config.use_kl_monitoring and kl_monitor is not None and auto_tune_result is None:
+    # KL monitoring (post-abliteration measurement for monitor-only mode).
+    # Streaming releases the model before writing shards, so post-ablation
+    # KL is unavailable in that pipeline; warn and skip.
+    if config.use_kl_monitoring and kl_monitor is not None and auto_tune_result is None and not use_streaming:
         logger.info("Computing KL divergence on reference prompts...")
         kl_result = kl_monitor.compute_kl_divergence(kl_reference_prompts, config.direction_multiplier)
         logger.info(
             f"KL divergence: mean={kl_result.mean_kl:.4f}, median={kl_result.median_kl:.4f}, "
             f"max={kl_result.max_kl:.4f}, std={kl_result.std_kl:.4f}"
         )
+    elif config.use_kl_monitoring and use_streaming:
+        logger.warning(
+            "KL post-ablation monitoring is unavailable in the streaming pipeline; "
+            "the in-memory model was released before sharded ablation."
+        )
 
-    # Save the modified model (with version suffix if path already exists)
-    output_path = get_versioned_path(config.output_path)
-    if output_path != Path(config.output_path):
-        logger.info(f"Output path exists, using versioned path: {output_path}")
-    logger.info(f"Saving abliterated model to {output_path}...")
-    output_path.mkdir(parents=True, exist_ok=True)
+    # Save the modified model (with version suffix if path already exists).
+    # The streaming path already wrote shards + tokenizer files into the
+    # output directory above, so we skip the in-memory save and just record
+    # the resolved path for the metadata block below.
+    streamed_path = getattr(config, "_streamed_output_path", None)
+    if streamed_path is not None:
+        output_path = streamed_path
+        logger.info(f"Streaming pipeline already wrote shards to {output_path}; skipping in-memory save")
+        # Persist the tokenizer separately since the streaming path doesn't
+        # round-trip through transformers' save_pretrained.
+        try:
+            tokenizer.save_pretrained(output_path)
+        except Exception as e:
+            logger.warning(f"Could not save tokenizer to streaming output: {e}")
+    else:
+        output_path = get_versioned_path(config.output_path)
+        if output_path != Path(config.output_path):
+            logger.info(f"Output path exists, using versioned path: {output_path}")
+        logger.info(f"Saving abliterated model to {output_path}...")
+        output_path.mkdir(parents=True, exist_ok=True)
 
-    # Save model and tokenizer (handles FP8 dequantized models specially)
-    save_model_safe(model, tokenizer, output_path)
+        # Save model and tokenizer (handles FP8 dequantized models specially)
+        save_model_safe(model, tokenizer, output_path)
 
     # Preserve original model config fields that transformers might not save
     source_path = Path(config.model_path)
@@ -3826,6 +4347,11 @@ def run_abliteration(config: AbliterationConfig):
         # Core settings
         "model_path": config.model_path,
         "output_path": str(output_path),
+        # Streaming + MoE pipeline
+        "streaming_mode": directions.metadata.get("streaming_mode", streaming_mode_used),
+        "streaming_requested": config.streaming,
+        "moe_fused_layout": config.moe_fused_layout,
+        "measurement_quant": config.measurement_quant,
         "target_layers": config.target_layers,
         "extraction_layer_indices": config.extraction_layer_indices,
         "use_mean_direction": config.use_mean_direction,
@@ -4118,6 +4644,42 @@ Examples:
         help="Computation dtype",
     )
     parser.add_argument(
+        "--streaming",
+        type=str,
+        default="auto",
+        choices=["auto", "in_memory", "sharded"],
+        help=(
+            "Ablation pipeline. ``auto`` picks ``sharded`` when the on-disk "
+            "model footprint exceeds 0.6x VRAM (or 0.4x system RAM on CPU). "
+            "``sharded`` streams one safetensors shard at a time and never "
+            "materializes the full state_dict in memory."
+        ),
+    )
+    parser.add_argument(
+        "--moe_fused_layout",
+        type=str,
+        default="auto",
+        choices=["auto", "eoi", "eio"],
+        help=(
+            "Layout for fused 3-D MoE expert tensors. ``auto`` infers from "
+            "shape + model family (``mixtral`` -> ``eoi``, "
+            "``qwen2_moe``/``gpt_oss`` -> ``eio``). Override only if "
+            "auto-detection fails on a custom architecture."
+        ),
+    )
+    parser.add_argument(
+        "--measurement_quant",
+        type=str,
+        default="none",
+        choices=["none", "4bit", "8bit"],
+        help=(
+            "Optional bitsandbytes quantization for the activation "
+            "measurement phase only. The streaming ablation pipeline still "
+            "operates on the unquantized weights on disk. Implies "
+            "``--streaming sharded``."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -4165,6 +4727,9 @@ Examples:
         invert_ablation=args.invert_ablation,
         direction_sparsity=args.direction_sparsity,
         two_pass_orthogonalization=args.two_pass_orthogonalization,
+        streaming=args.streaming,
+        moe_fused_layout=args.moe_fused_layout,
+        measurement_quant=args.measurement_quant,
     )
 
     model, tokenizer = run_abliteration(config)

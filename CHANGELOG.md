@@ -5,6 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-04-22
+
+### Added
+
+- New `derestrictor.core.sharded_ablate` module implementing one-shard-at-a-
+  time streaming ablation. Reads each safetensors shard with
+  `safetensors.safe_open`, applies the kernel on the configured device,
+  and writes a modified output shard, never materializing the full
+  state_dict. Memory cap is one shard plus per-tensor scratch, which is
+  the only way frontier-scale (235B / 480B) MoE models fit on a consumer
+  GPU. Mirrors the `jim-plus/llm-abliteration/sharded_ablate.py` read ->
+  upcast -> modify -> downcast -> write loop and reuses the same kernel
+  dispatch as the in-memory path.
+- `AbliterationConfig.streaming` selector
+  (`"auto"` / `"in_memory"` / `"sharded"`, default `"auto"`). Auto mode
+  picks streaming when the on-disk model footprint exceeds 0.6x available
+  GPU RAM (or 0.4x system RAM on CPU-only runs). `run_abliteration`
+  releases the in-memory model and clears CUDA cache before invoking the
+  streaming pipeline so the read-modify-write loop has the full GPU
+  available.
+- First-class support for fused 3-D MoE expert tensors. New
+  `apply_kernel_to_expert_tensor` runs any 2-D ablation kernel across
+  every expert in a fused MoE weight (`[E, O, I]` Mixtral or `[E, I, O]`
+  Qwen2.5-MoE / GPT-OSS), with auto-detection of layout from shape and
+  model family.  `AbliterationConfig.moe_fused_layout` (`"auto"` /
+  `"eoi"` / `"eio"`) overrides the auto-detect when needed. Previously
+  these tensors were silently skipped by the linear-layer walker, leaving
+  MoE MLPs un-ablated.
+- `is_moe_model` and `iter_expert_tensors` helpers in
+  `derestrictor.models.utils` plus the `ExpertTensorInfo` dataclass.
+  Detects MoE via `num_local_experts` / `num_experts` /
+  `moe_num_experts` / `n_routed_experts` (descending into `text_config`
+  for VL configs) or via a module-tree walk for `block_sparse_moe` /
+  `mlp.experts` / `.experts.<digit>` markers.
+- `get_layer_type_from_name` now recognizes the fused MoE parameter
+  conventions (`block_sparse_moe.experts.w1/w2/w3`,
+  `experts.gate_up_proj`, `experts.down_proj`,
+  `mlp.experts.gate_up_proj`) so the kernel-dispatch and
+  direction-role logic reuses the existing canonical layer types.
+- `AbliterationConfig.measurement_quant`
+  (`"none"` / `"4bit"` / `"8bit"`, default `"none"`) loads the model with
+  bitsandbytes quantization for the activation-measurement phase only.
+  Final ablation is always performed on the unquantized weights via the
+  streaming pipeline (setting this implies sharded streaming). Matches
+  the "measurement on a 4-bit quant, assembly on the bf16 model" recipe
+  from the Norm-Preserving Biprojected Abliteration article comments.
+- `select_ablation_kernel`, `dispatch_2d_kernel`,
+  `resolve_ablation_for_tensor`, and `write_safetensors_index` helpers
+  refactored out of `abliterate_model` so the in-memory and streaming
+  paths share one kernel dispatch and one shard-index writer.
+- New CLI flags `--streaming`, `--moe_fused_layout`, and
+  `--measurement_quant`. The interactive wizard prompts for the
+  streaming pipeline, auto-explains MoE layout when the architecture is
+  detected, and offers measurement-only quantization. All three are
+  persisted into the abliteration metadata block.
+
 ## [2.1.0] - 2026-04-22
 
 ### Added
