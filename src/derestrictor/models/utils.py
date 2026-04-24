@@ -21,6 +21,7 @@ from typing import Literal
 
 import torch
 import transformers
+from huggingface_hub import try_to_load_from_cache
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 from transformers import BitsAndBytesConfig, FineGrainedFP8Config, Mistral3ForConditionalGeneration
 
@@ -292,6 +293,56 @@ def _build_bnb_quantization_config(quantization: Literal["none", "4bit", "8bit"]
     return None
 
 
+def _resolve_model_local_dir(model_path: str) -> Path | None:
+    """Return the local directory for *model_path*, or ``None`` if unavailable.
+
+    * For an existing local directory, returns ``Path(model_path)``.
+    * For a HuggingFace Hub model ID, returns the snapshot directory from the
+      local cache if the model has been downloaded; returns ``None`` otherwise.
+
+    Args:
+        model_path: Local directory path or Hub model ID.
+
+    Returns:
+        Resolved :class:`~pathlib.Path`, or ``None``.
+    """
+    p = Path(model_path)
+    if p.is_dir():
+        return p
+    try:
+        cached = try_to_load_from_cache(model_path, "config.json")
+        if isinstance(cached, str):
+            return Path(cached).parent
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_safetensors_disk_size(model_path: str) -> int:
+    """Return the total size (bytes) of ``.safetensors`` shards for *model_path*.
+
+    Handles both local directory paths and HuggingFace Hub model IDs.  For Hub
+    IDs the local snapshot cache is consulted via
+    :func:`huggingface_hub.try_to_load_from_cache`; returns ``0`` when no
+    local snapshot exists yet (the model has never been downloaded).
+
+    Args:
+        model_path: Local directory path or Hub model ID (e.g.
+            ``"meta-llama/Meta-Llama-3-8B"``).
+
+    Returns:
+        Combined byte size of all ``.safetensors`` files, or ``0`` on any
+        failure.
+    """
+    search_root = _resolve_model_local_dir(model_path)
+    if search_root is None:
+        return 0
+    try:
+        return sum(f.stat().st_size for f in search_root.iterdir() if f.suffix == ".safetensors")
+    except Exception:
+        return 0
+
+
 def load_model_and_tokenizer(
     model_path: str,
     device: str = "cuda",
@@ -351,10 +402,7 @@ def load_model_and_tokenizer(
             free_vram, _ = torch.cuda.mem_get_info()
         except Exception:
             free_vram = 0
-        try:
-            disk_size = sum(f.stat().st_size for f in Path(model_path).iterdir() if f.suffix == ".safetensors")
-        except Exception:
-            disk_size = 0
+        disk_size = _resolve_safetensors_disk_size(model_path)
         # 0.85 leaves headroom for activations, KV cache, and optimizer-style
         # bookkeeping accelerate keeps pinned on GPU.
         if disk_size > 0 and free_vram > 0 and disk_size > 0.85 * free_vram:
@@ -363,7 +411,10 @@ def load_model_and_tokenizer(
                 f"Model footprint ({disk_size / 1e9:.1f} GB) exceeds 0.85x free VRAM "
                 f"({free_vram / 1e9:.1f} GB); using device_map='auto' with disk offload"
             )
-            offload_folder = str(Path(model_path).parent / "_accelerate_offload")
+            # For Hub IDs use the resolved snapshot directory as the offload
+            # anchor so we don't accidentally create folders relative to CWD.
+            local_dir = _resolve_model_local_dir(model_path) or Path(model_path)
+            offload_folder = str(local_dir.parent / "_accelerate_offload")
             Path(offload_folder).mkdir(parents=True, exist_ok=True)
     quant_device_map = "auto" if (needs_auto_device_map and device != "cpu") else device
 
