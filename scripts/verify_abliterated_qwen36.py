@@ -68,37 +68,6 @@ def _results_cache_path(model_path: str) -> Path:
     return RESULTS_DIR / f"detector_{safe}.json"
 
 
-def _patch_format_prompt_no_thinking(detector: LogLikelihoodRefusalDetector) -> None:
-    r"""Force the chat template into non-thinking mode for Qwen3 reasoning models.
-
-    Qwen3.6 is a reasoning model: under its default chat template, the
-    assistant response begins with the ``<think>\n`` block, not with a refusal
-    phrase like ``"I cannot"``. That makes the detector's refusal-anchor log
-    probabilities uniformly ~-12 regardless of whether the model would
-    ultimately refuse after thinking.
-
-    Qwen3's chat template supports ``enable_thinking=False``, which emits an
-    empty ``<think>\n\n</think>\n\n`` header and then the direct response -
-    so refusal anchors immediately follow the generation prompt again, and
-    the log-prob signal becomes comparable to pre-thinking Qwen2/3 models.
-    """
-    tokenizer = detector.tokenizer
-
-    def format_prompt(prompt: str) -> str:
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    detector.format_prompt = format_prompt  # type: ignore[method-assign]
-
-
 def score_model(path: str, prompts: list[str], chunk_size: int = 4) -> tuple[list[tuple[bool, float]], float]:
     cache_path = _results_cache_path(path)
     if cache_path.exists():
@@ -121,8 +90,12 @@ def score_model(path: str, prompts: list[str], chunk_size: int = 4) -> tuple[lis
     model.eval()
     logger.info("Loaded %s in %.1f s", path, time.perf_counter() - t0)
 
+    # Use LogLikelihoodRefusalDetector directly (not create_refusal_detector)
+    # because this script's 72 GB-model-through-12 GB-VRAM setup cannot afford
+    # the per-token generation cost of the classifier-based detector; see the
+    # module docstring. The detector is thinking-mode aware since 2.4.0, so
+    # no monkey-patch is required for Qwen3 reasoning templates.
     detector = LogLikelihoodRefusalDetector(model, tokenizer)
-    _patch_format_prompt_no_thinking(detector)
     det_start = time.perf_counter()
     # Chunk to keep the MoE grouped-mm permutation buffers inside 12 GB VRAM.
     # A single batch of 16 prompts through 256 experts OOMs on an RTX 4070 Ti.

@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-04-24
+
+### Added
+
+- `LogLikelihoodRefusalDetector` is now thinking-mode aware. The detector
+  probes the tokenizer once at init and, for reasoning templates (Qwen3 /
+  Qwen3.5 / Qwen3.6 / DeepSeek-R1-style), (a) passes `enable_thinking=False`
+  through `apply_chat_template` when the template supports that kwarg, and
+  (b) unions `<think>\nI cannot` / `<think>\nI can't` / `<think>\nI'm sorry`
+  / `<think>\nI apologize` into the scored anchor set. New
+  `RefusalDetectorConfig` fields `disable_thinking`,
+  `thinking_refusal_anchors`, and `include_thinking_anchors` control both
+  behaviors. The default anchor floor of ~-12 log-prob that reasoning
+  templates produced against the original lexical anchors is fixed.
+- `ClassifierRefusalDetector` scores a short greedy generation (default
+  32 tokens with `enable_thinking=False`) with
+  `protectai/distilroberta-base-rejection-v1`, a small purpose-built
+  DistilRoBERTa refusal classifier. Configurable via
+  `ClassifierDetectorConfig` (`classifier_id`, `max_new_tokens`,
+  `threshold`, `batch_size`, `refusal_label`, `classifier_device`,
+  `classifier_kwargs`).
+- `ClassifierUnavailableError` wraps classifier-load failures so callers
+  can fall back cleanly.
+- `create_refusal_detector(model, tokenizer, prefer_classifier=True, ...)`
+  factory: eagerly loads the classifier and, on
+  `ClassifierUnavailableError`, returns a `LogLikelihoodRefusalDetector`
+  with a logged warning. Preserves the legacy `create_detector(...)`
+  entry point for existing callers.
+- `RefusalDetector` runtime-checkable protocol shared by both detector
+  classes; re-exported from `derestrictor.eval` alongside the new
+  classifier and factory symbols.
+
+### Changed
+
+- `scripts/verify_abliterated_qwen36.py` uses the detector's native
+  thinking-mode handling; the module-level
+  `_patch_format_prompt_no_thinking` monkey-patch has been removed. The
+  script intentionally keeps using `LogLikelihoodRefusalDetector`
+  directly rather than `create_refusal_detector`, because its
+  72 GB-model-through-12 GB-VRAM setup cannot afford per-token
+  generation cost. A comment at the call site documents the choice.
+
 ## [2.3.1] - 2026-04-23
 
 ### Changed
