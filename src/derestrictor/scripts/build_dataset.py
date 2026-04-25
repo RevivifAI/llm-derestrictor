@@ -2,28 +2,28 @@
 
 Three splits are produced:
 
-- ``restrict`` — prompts the model **should** refuse (child harm, targeted
+- ``restrict`` - prompts the model **should** refuse (child harm, targeted
   violence, weapons of mass destruction, graphic sexual content,
   self-harm encouragement). Populated by harm-filter hits moved out of
   ``derestrict``, WildGuardMix prompts whose ``subcategory`` maps to a
   restricted bucket, plus any safety violations flagged in ``allow``
   sources.
-- ``derestrict`` — prompts the model should learn to **answer**. Includes
+- ``derestrict`` - prompts the model should learn to **answer**. Includes
   AdvBench / JailbreakBench misuse-style behaviors (filtered to strip the
   genuinely harmful ones), the Chinese-sensitive-topic prompts from
   ``MultiverseComputingCAI/llm-refusal-evaluation``, and all of
   WildGuardMix whose ``subcategory`` is not routed to restrict (benign
   over-refusal prompts, cyberattack, fraud, copyright, privacy, etc.).
-- ``allow`` — benign instructions (Alpaca, JailbreakBench benign) plus
+- ``allow`` - benign instructions (Alpaca, JailbreakBench benign) plus
   capability-preservation prompts (MMLU, GSM8K, ARC, MATH-500, HumanEval).
 
-Every upstream source is the **original** publication — no AdvBench
+Every upstream source is the **original** publication - no AdvBench
 repackagings (``LLM-LAT/harmful-dataset``, ``mlabonne/harmful_behaviors``,
 ``Undi95/orthogonal-activation-steering-TOXIC``,
 ``wangzhang/abliterix-datasets``) and no Alpaca forks
 (``mlabonne/harmless_alpaca``, ``yahma/alpaca-cleaned``).
 
-The entire upstream is copied — no per-split row caps — so the output
+The entire upstream is copied - no per-split row caps - so the output
 parquet faithfully reflects each source.
 
 Run with::
@@ -85,9 +85,7 @@ PARQUET_SCHEMA = pa.schema(
 
 def normalize_prompt(text: str) -> str:
     """Return a user-facing prompt: single-spaced, trimmed, reasonable length."""
-    if text is None:
-        return ""
-    text = str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -150,7 +148,7 @@ def _alpaca_no_input(row: dict) -> bool:
 # set of misuse behaviors. JailbreakBench (Chao et al. 2024,
 # arXiv:2404.01318) layers 100 curated misuse behaviors + 100 benign
 # parallels on top. The Multiverse Computing refusal benchmark contributes
-# Chinese Sensitive Topics (CCP Sensitive + DeCCP) — non-harmful prompts
+# Chinese Sensitive Topics (CCP Sensitive + DeCCP) - non-harmful prompts
 # that China-aligned instruct models refuse, so they anchor the refusal
 # direction usefully.
 DERESTRICT_SOURCES: list[SourceSpec] = [
@@ -275,7 +273,7 @@ ALLOW_SOURCES: list[SourceSpec] = [
 #   cyberattack
 #   causing_material_harm_by_disseminating_misinformation
 #
-# The subcategory labels are *noisy* — inspection shows the same prompt
+# The subcategory labels are *noisy* - inspection shows the same prompt
 # occasionally tagged into several buckets because the adversarial prompt
 # templates are reused across risk themes. The ``HarmFilter`` pass later
 # in the pipeline acts as a belt-and-suspenders safety net: any WildGuardMix
@@ -316,7 +314,7 @@ def _iter_wildguardmix(token: str | None) -> _WildGuardMixRows:
 
     Args:
         token: Hugging Face token with accepted AI2 Responsible Use terms.
-            ``None`` (or a token without access) triggers a soft-skip — the
+            ``None`` (or a token without access) triggers a soft-skip - the
             returned partition is empty and a warning is printed so the rest
             of the build can proceed on open datasets only.
 
@@ -329,7 +327,7 @@ def _iter_wildguardmix(token: str | None) -> _WildGuardMixRows:
     """
     if not token:
         print(
-            f"  [{WILDGUARDMIX_DATASET_ID}] HF_TOKEN not set — skipping the gated "
+            f"  [{WILDGUARDMIX_DATASET_ID}] HF_TOKEN not set - skipping the gated "
             f"WildGuardMix source. Set HF_TOKEN (with AI2 Responsible Use "
             f"acceptance) to include it.",
             flush=True,
@@ -395,11 +393,11 @@ def _iter_wildguardmix(token: str | None) -> _WildGuardMixRows:
                 )
                 kept_r += 1
             elif subcategory:
-                # Every other labelled bucket — including ``benign``,
+                # Every other labelled bucket - including ``benign``,
                 # ``others``, ``cyberattack``, ``fraud_assisting_illegal_
                 # activities``, ``copyright_violations``, the privacy and
                 # defamation buckets, hate-speech and stereotype buckets,
-                # and the political-disinformation bucket — is a prompt
+                # and the political-disinformation bucket - is a prompt
                 # the user wants unlocked. The HarmFilter pass afterwards
                 # will still relocate any that trip its keyword / semantic
                 # stages (e.g. a prompt about minors slipping under
@@ -408,7 +406,7 @@ def _iter_wildguardmix(token: str | None) -> _WildGuardMixRows:
                 kept_d += 1
             elif harm_label == "harmful":
                 # No subcategory but GPT-4 / annotators flagged the prompt
-                # as harmful — conservatively send to derestrict and let
+                # as harmful - conservatively send to derestrict and let
                 # the HarmFilter have the final word.
                 derestrict.append({"Prompt": prompt, "Source": source})
                 kept_d += 1
@@ -567,7 +565,7 @@ def build() -> dict[str, list[dict]]:
     # Inside restrict, WildGuardMix-routed rows come first so their
     # fine-grained ``Restriction_Category`` wins over a coarser HarmFilter
     # tag on the same prompt.
-    print("\n[dedup] pass 1 — within-split …", flush=True)
+    print("\n[dedup] pass 1 - within-split …", flush=True)
     restrict_raw = wildguardmix_restrict_rows + derestrict_result.restricted + allow_violations
     restrict_unique = dedup_within_split(restrict_raw)
     derestrict_unique = dedup_within_split(derestrict_result.kept)
@@ -585,7 +583,7 @@ def build() -> dict[str, list[dict]]:
         f"(dropped {len(allow_result.kept) - len(allow_unique):>5d})"
     )
 
-    print("\n[dedup] pass 2 — cross-split (priority restrict → derestrict → allow) …", flush=True)
+    print("\n[dedup] pass 2 - cross-split (priority restrict → derestrict → allow) …", flush=True)
     seen: set[str] = set()
     restrict_rows = dedup(restrict_unique, seen)
     derestrict_rows = dedup(derestrict_unique, seen)

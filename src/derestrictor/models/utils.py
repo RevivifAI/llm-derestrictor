@@ -285,12 +285,10 @@ def _build_bnb_quantization_config(quantization: Literal["none", "4bit", "8bit"]
             # models on consumer GPUs).
             llm_int8_enable_fp32_cpu_offload=True,
         )
-    if quantization == "8bit":
-        return BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_enable_fp32_cpu_offload=True,
-        )
-    return None
+    return BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_enable_fp32_cpu_offload=True,
+    )
 
 
 def _resolve_model_local_dir(model_path: str) -> Path | None:

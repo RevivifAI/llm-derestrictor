@@ -895,14 +895,14 @@ class AbliterationConfig:
 
     # Ablation kernel selector (overrides ``norm_preservation`` and
     # ``use_per_neuron_norm`` when set). One of:
-    #   - ``"per_neuron"`` — per-row decomposition with per-output-neuron renorm
+    #   - ``"per_neuron"`` - per-row decomposition with per-output-neuron renorm
     #     (grimjim's norm-preserving biprojected abliteration).
-    #   - ``"frobenius"`` — orthogonal projection with optional Frobenius rescale.
-    #   - ``"householder"`` — geodesic rotation (Rodrigues), isometric by
+    #   - ``"frobenius"`` - orthogonal projection with optional Frobenius rescale.
+    #   - ``"householder"`` - geodesic rotation (Rodrigues), isometric by
     #     construction. With ``tgt = -src`` (the default), this is the
     #     Householder reflection that nullifies the refusal component
-    #     without touching row norms — no Frobenius / per-row renorm needed.
-    #   - ``"directional"`` — rank-1 directional scaling
+    #     without touching row norms - no Frobenius / per-row renorm needed.
+    #   - ``"directional"`` - rank-1 directional scaling
     #     ``W + (scale - 1) * (W * s) (x) s`` with double-tap cancellation and
     #     per-row renormalization. ``scale_factor`` semantics match jim-plus:
     #     ``1.0`` = full ablation, ``0.0`` = identity, ``-1.0`` = amplification.
@@ -948,7 +948,7 @@ class AbliterationConfig:
     # reproducing jim-plus YAML configs.
     biprojection_mapping: object = "nearest"
     # Legacy ensemble mode: collapse measurement layers into one mean direction
-    # before applying it (old behavior of this repo). Off by default — the new
+    # before applying it (old behavior of this repo). Off by default - the new
     # per-L biprojection is more faithful to grimjim's formulation.
     use_direction_ensemble: bool = False
 
@@ -1000,14 +1000,14 @@ class AbliterationConfig:
     # Streaming / sharded ablation pipeline
     #
     # ``streaming`` selects the ablation pipeline:
-    #   - ``"in_memory"`` — load the full model, mutate weights in place,
+    #   - ``"in_memory"`` - load the full model, mutate weights in place,
     #     then ``save_pretrained``. Default for small/mid models.
-    #   - ``"sharded"`` — stream one safetensors shard at a time from
+    #   - ``"sharded"`` - stream one safetensors shard at a time from
     #     ``model_path`` to ``output_path`` via
     #     :func:`derestrictor.core.sharded_ablate.sharded_ablate`. Memory
     #     cap is one shard + scratch, which is the only way frontier-scale
     #     MoE models fit on a consumer GPU.
-    #   - ``"auto"`` (default) — pick ``"sharded"`` when on-disk model size
+    #   - ``"auto"`` (default) - pick ``"sharded"`` when on-disk model size
     #     exceeds 0.6x available GPU RAM (or 0.4x system RAM if CPU-only),
     #     otherwise ``"in_memory"``.
     streaming: Literal["auto", "in_memory", "sharded"] = "auto"
@@ -1438,7 +1438,7 @@ class ActivationExtractor:
             prompts: Raw user prompts; chat template is applied if available.
 
         Returns:
-            Same shape as :meth:`extract_activations` — per-layer concatenated
+            Same shape as :meth:`extract_activations` - per-layer concatenated
             activations of shape ``[num_prompts, hidden_dim]``. Per-layer
             Welford accumulators are updated alongside.
         """
@@ -2588,7 +2588,7 @@ def _resolve_project_input(
 ) -> bool | None:
     """Pick the projection axis for a per-layer rank-1 ablation.
 
-    When ``direction_space`` is provided it is authoritative — this is how the
+    When ``direction_space`` is provided it is authoritative - this is how the
     H4 fix avoids the square-weight ambiguity for ``o_proj``-style attention
     output projections (where ``hidden_size == num_heads * head_dim``). When
     omitted, fall back to the legacy shape match.
@@ -2744,7 +2744,7 @@ def apply_householder_rotation(
     scale_factor: float = 1.0,
     direction_space: str | None = None,
 ) -> torch.Tensor:
-    """Geodesic Rodrigues rotation kernel — isometric by construction.
+    """Geodesic Rodrigues rotation kernel - isometric by construction.
 
     Faithful transcription of
     ``jim-plus/llm-abliteration/sharded_ablate.modify_tensor_householder``,
@@ -3075,8 +3075,6 @@ def apply_kernel_to_expert_tensor(
         raise NotImplementedError(f"Only expert_dim=0 is supported (got {expert_dim})")
     if weight_3d.ndim != 3:
         raise ValueError(f"Expected 3-D fused expert tensor, got shape {tuple(weight_3d.shape)}")
-    if layout not in ("eoi", "eio"):
-        raise ValueError(f"Unknown MoE fused layout {layout!r}; expected 'eoi' or 'eio'")
 
     out = weight_3d.clone()
     num_experts = weight_3d.shape[0]
@@ -3101,7 +3099,7 @@ def _get_language_model_root(model: AutoModelForCausalLM) -> tuple[torch.nn.Modu
     and root_module is the model itself.
     """
     # VL models: model.model.model.layers (Qwen2-VL, Qwen3-VL, LLaVA)
-    # Prefix is the dotted path as seen by model.named_modules() — NOT the
+    # Prefix is the dotted path as seen by model.named_modules() - NOT the
     # Python attribute chain. E.g., model.model is named "model" in the iterator.
     if hasattr(model, "model"):
         if hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
@@ -3177,14 +3175,14 @@ def get_linear_layer_names(model: AutoModelForCausalLM) -> list[str]:
 # language-model decoder stack and therefore must not receive refusal-direction
 # ablation:
 #
-# * ``model.visual.`` / ``visual.`` — vision encoders and the vision-to-text
+# * ``model.visual.`` / ``visual.`` - vision encoders and the vision-to-text
 #   merger (Qwen3-VL family). Their hidden states are not in the residual
 #   stream that mediates refusal.
-# * ``mtp.`` — Multi-Token Prediction heads (Qwen3.5-MoE / Qwen3.6-A3B).
+# * ``mtp.`` - Multi-Token Prediction heads (Qwen3.5-MoE / Qwen3.6-A3B).
 #   These are parallel prediction stacks with their own ``layers.N``
 #   numbering; without an explicit skip the unanchored ``layers\.(\d+)\.``
 #   regex below would silently re-use LM layer-N directions on them.
-# * ``audio_tower.`` / ``audio.`` — audio encoders on omni / audio-text
+# * ``audio_tower.`` / ``audio.`` - audio encoders on omni / audio-text
 #   variants.
 #
 # The list is matched with both ``startswith`` (to catch top-level prefixes
@@ -3216,13 +3214,13 @@ def is_non_lm_stack_tensor(name: str) -> bool:
 # of the language model proper but are not internal residual-stream layers, so
 # orthogonal-projection ablation does not apply cleanly:
 #
-# * ``lm_head.weight`` ``[vocab, hidden]`` — output projection. The refusal
+# * ``lm_head.weight`` ``[vocab, hidden]`` - output projection. The refusal
 #   direction lives in ``hidden``-space; projecting it out of the
 #   ``vocab``-space output axis is undefined. The kernel currently catches
 #   this via a shape-mismatch warning (see
 #   ``"Direction shape ... doesn't match weight shape ..."``); this skip
 #   makes the intent explicit and silences the warning.
-# * ``embed_tokens.weight`` ``[vocab, hidden]`` — input projection (lookup).
+# * ``embed_tokens.weight`` ``[vocab, hidden]`` - input projection (lookup).
 #   The reference Arditi et al. methodology only orthogonalizes the
 #   per-layer ``W_in`` (``q/k/v_proj``, ``gate/up_proj``) and ``W_out``
 #   (``o_proj``, ``down_proj``) inside the residual stream; embeddings are
@@ -4318,7 +4316,7 @@ def run_abliteration(config: AbliterationConfig):
     if not config.use_kl_auto_tune:
         use_streaming = should_use_streaming(Path(config.model_path), config)
         # If measurement was done on a quantized copy, the in-memory weights
-        # aren't usable for ablation — the only correct path is to release
+        # aren't usable for ablation - the only correct path is to release
         # the quantized model and stream-ablate the original shards on disk.
         if config.measurement_quant != "none" and not use_streaming:
             logger.info(

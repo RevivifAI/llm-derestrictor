@@ -97,3 +97,5 @@ rev = "1.39.2"
 
 [[repos.hooks]]
 id = "basedpyright"
+pass_filenames = false
+always_run = true
