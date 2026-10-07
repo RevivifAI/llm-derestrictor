@@ -21,6 +21,11 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from derestrictor.cli.components import get_versioned_path
+from derestrictor.core.heretic_kernel import (
+    WeightDistribution,
+    interpolate_direction,
+    resolve_component_weight,
+)
 from derestrictor.core.null_space import (
     NullSpaceConfig,
     apply_null_space_constrained_projection,
@@ -885,6 +890,21 @@ class AbliterationConfig:
     use_adaptive_weighting: bool = False  # Enable per-layer adaptive weighting
     adaptive_position_center: float = 0.6  # Center of Gaussian position weighting (0-1)
     adaptive_position_sigma: float = 0.2  # Width of Gaussian position weighting
+
+    # Advanced options: Heretic-style parametric kernel (WEB-1042 benign parity)
+    #
+    # ``heretic_weight_distributions`` enables a flexible per-component
+    # ablation weight distribution over layers, keyed by the heretic component
+    # names ``"attn.o_proj"`` and ``"mlp.down_proj"`` (see
+    # :mod:`derestrictor.core.heretic_kernel`). Each value is a
+    # :class:`~derestrictor.core.heretic_kernel.WeightDistribution`. When
+    # ``None`` the heretic kernel is disabled and the legacy weighting applies.
+    heretic_weight_distributions: dict[str, WeightDistribution] | None = None
+    # ``heretic_direction_index`` selects one global residual direction at a
+    # continuous layer position, linearly interpolating the two nearest layer
+    # directions (heretic's float ``direction_index``). ``None`` keeps the
+    # existing mean / per-layer direction selection.
+    heretic_direction_index: float | None = None
 
     # Advanced options: Projected abliteration
     use_projected_refusal: bool = True  # Orthogonalize refusal direction against harmless direction (recommended)
@@ -3540,6 +3560,14 @@ def resolve_ablation_for_tensor(
         elif layer_idx in hybrid_info.linear_attention_indices:
             effective_multiplier *= config.hybrid_linear_attn_weight
 
+    # Heretic-style per-component weight kernel (WEB-1042 benign parity).
+    if config.heretic_weight_distributions:
+        heretic_weight = resolve_component_weight(config.heretic_weight_distributions, layer_type, layer_idx)
+        if heretic_weight is not None:
+            effective_multiplier *= heretic_weight
+            if not effective_multiplier:
+                return _ResolvedAblationContext(**skip_kwargs, skip_reason="heretic kernel weight is zero")
+
     direction_space = infer_direction_space(name)
 
     sparsity = config.direction_sparsity
@@ -3668,7 +3696,13 @@ def abliterate_model(
             directions.metadata["biprojection_layer_map"] = {int(L): int(M) for L, M in biprojection_layer_map.items()}
             directions.metadata["biprojection_measurement_layers"] = list(biprojection_measurement_layers)
 
-    if config.use_biprojection and directions.biprojected_direction is not None:
+    if config.heretic_direction_index is not None and directions.directions:
+        # Heretic-style continuous direction index (WEB-1042 benign parity).
+        primary_direction = interpolate_direction(directions.directions, config.heretic_direction_index).to(
+            config.device
+        )
+        logger.info(f"Using interpolated heretic direction_index={config.heretic_direction_index:.3f}")
+    elif config.use_biprojection and directions.biprojected_direction is not None:
         # Legacy ``use_direction_ensemble`` path: one collapsed direction.
         primary_direction = directions.biprojected_direction.to(config.device)
         logger.info("Using ensemble (collapsed) biprojected direction across measurement layers")
@@ -3825,6 +3859,17 @@ def abliterate_model(
                 effective_multiplier *= config.hybrid_full_attn_weight
             elif layer_idx in hybrid_info.linear_attention_indices:
                 effective_multiplier *= config.hybrid_linear_attn_weight
+
+        # Heretic-style per-component weight kernel (WEB-1042 benign parity).
+        if config.heretic_weight_distributions:
+            heretic_weight = resolve_component_weight(
+                config.heretic_weight_distributions, get_layer_type_from_name(name), layer_idx
+            )
+            if heretic_weight is not None:
+                effective_multiplier *= heretic_weight
+                if not effective_multiplier:
+                    skipped_count += 1
+                    continue
 
         direction_space = infer_direction_space(name)
 

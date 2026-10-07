@@ -36,6 +36,7 @@ from derestrictor.core.abliterate import (
     resolve_ablation_for_tensor,
     write_safetensors_index,
 )
+from derestrictor.core.heretic_kernel import interpolate_direction
 from derestrictor.models.utils import (
     _MOE_FUSED_NAME_RE,
     MOE_FAMILY_LAYOUT,
@@ -355,7 +356,12 @@ def sharded_ablate(
     family_hint = _detect_family_hint(input_dir)
 
     primary_direction = None
-    if directions.biprojected_direction is not None and config.use_biprojection:
+    if config.heretic_direction_index is not None and directions.directions:
+        # Heretic-style continuous direction index (WEB-1042 benign parity).
+        primary_direction = interpolate_direction(directions.directions, config.heretic_direction_index).to(
+            config.device
+        )
+    elif directions.biprojected_direction is not None and config.use_biprojection:
         primary_direction = directions.biprojected_direction.to(config.device)
     elif config.use_mean_direction and directions.mean_direction is not None:
         primary_direction = directions.mean_direction.to(config.device)
