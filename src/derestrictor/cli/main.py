@@ -94,6 +94,7 @@ from derestrictor.core.abliterate import (
     preserve_model_config,
     save_model_safe,
 )
+from derestrictor.core.heretic_kernel import WeightDistribution
 from derestrictor.core.kl_monitor import (
     KLDivergenceMonitor,
     KLMonitorConfig,
@@ -838,6 +839,8 @@ def run_abliteration(config: dict) -> bool:
                 use_null_space=config.get("use_null_space", False),
                 null_space_rank_ratio=config.get("null_space_rank_ratio", 0.95),
                 use_adaptive_weighting=config.get("use_adaptive_weighting", False),
+                heretic_weight_distributions=config.get("heretic_weight_distributions"),
+                heretic_direction_index=config.get("heretic_direction_index"),
                 use_projected_refusal=config.get("use_projected_refusal", True),
                 use_biprojection=config.get("use_biprojection", False),
                 use_per_neuron_norm=config.get("use_per_neuron_norm", False),
@@ -2831,6 +2834,21 @@ def main_menu():
 @click.option("--null-space-rank-ratio", type=float, default=0.95, help="Null-space SVD rank ratio (0.9-0.99)")
 @click.option("--adaptive-weighting/--no-adaptive-weighting", default=False, help="Enable adaptive layer weighting")
 @click.option(
+    "--heretic-direction-index",
+    type=float,
+    default=None,
+    help="Heretic parity: one global direction at a continuous layer index (interpolated)",
+)
+@click.option(
+    "--heretic-weight-distributions",
+    type=str,
+    default=None,
+    help=(
+        "Heretic parity: JSON mapping component to {max_weight,max_weight_position,min_weight,min_weight_distance}. "
+        "Components: 'attn.o_proj', 'mlp.down_proj'."
+    ),
+)
+@click.option(
     "--projected/--no-projected", default=True, help="Orthogonalize refusal against harmless direction (recommended)"
 )
 @click.option("--biprojection/--no-biprojection", default=False, help="Enable biprojection mode")
@@ -2906,6 +2924,8 @@ def cli(
     null_space,
     null_space_rank_ratio,
     adaptive_weighting,
+    heretic_direction_index,
+    heretic_weight_distributions,
     projected,
     biprojection,
     per_neuron_norm,
@@ -3017,6 +3037,18 @@ def cli(
         elif adaptive_weighting:
             layer_targeting_mode = "adaptive"
 
+        # Parse heretic parity weight distributions if provided.
+        parsed_heretic_distributions = None
+        if heretic_weight_distributions:
+            try:
+                raw_distributions = json.loads(heretic_weight_distributions)
+                parsed_heretic_distributions = {
+                    component: WeightDistribution(**values) for component, values in raw_distributions.items()
+                }
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                console.print(f"[red]Error parsing --heretic-weight-distributions: {e}[/red]")
+                sys.exit(1)
+
         config = {
             "model_path": model_path,
             "output_path": effective_output_path,
@@ -3032,6 +3064,9 @@ def cli(
             "use_null_space": null_space,
             "null_space_rank_ratio": null_space_rank_ratio,
             "use_adaptive_weighting": adaptive_weighting and not layer_target_map,  # Disabled if target map provided
+            # Heretic parity (WEB-1042 benign set)
+            "heretic_weight_distributions": parsed_heretic_distributions,
+            "heretic_direction_index": heretic_direction_index,
             # Projected abliteration (orthogonalize against harmless)
             "use_projected_refusal": projected,
             # Biprojection options
